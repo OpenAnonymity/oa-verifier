@@ -22,3 +22,6 @@ Thumbs.db
 # Logs
 *.log
 
+# Persistent data
+banned_stations.json
+tickets.json

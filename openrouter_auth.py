@@ -11,12 +11,12 @@ Usage:
     cookie_str = auth.get_cookie_string()
     # "__client_uat=xxx; clerk_active_context=xxx; __session=xxx"
     
-    # Get next-action hash
-    action_hash = auth.get_action_hash()
-    # "00d6e8fb45f9a136d6470f2a49c8d0e2c843cabf92"
+    # Get next-action hash for specific page
+    hash = auth.get_action_hash("activity")
+    hash = auth.get_action_hash("provisioning_keys")
     
     # Get both
-    cookie_str, action_hash = auth.get_auth()
+    cookie_str, hashes = auth.get_auth()
 """
 
 import json
@@ -29,6 +29,14 @@ import requests
 CLERK_JS_URL = "https://clerk.openrouter.ai/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
 CLERK_API = "https://clerk.openrouter.ai/v1/client/sessions/{session_id}/tokens"
 BASE_URL = "https://openrouter.ai"
+
+# Supported pages and their paths
+PAGES = {
+    "activity": "/activity",
+    "provisioning_keys": "/settings/provisioning-keys",
+    "keys": "/settings/keys",
+    "broadcast": "/settings/broadcast",
+}
 
 
 class OpenRouterAuth:
@@ -49,7 +57,7 @@ class OpenRouterAuth:
         self._clerk_params = None
         self._state = None
         self._session_jwt = None
-        self._action_hashes = []
+        self._action_hashes = {}  # {page_name: hash}
         self._lock = threading.Lock()
         self._refresh_thread = None
         
@@ -64,26 +72,19 @@ class OpenRouterAuth:
             self._start_auto_refresh()
     
     @classmethod
-    def from_dict(cls, cookie_data, auto_refresh=False, refresh_interval=50):
-        """
-        Initialize from cookie dict (same structure as cookies.json content).
-        
-        Args:
-            cookie_data: Dict with "cookies" array (same format as cookies.json)
-            auto_refresh: Whether to auto-refresh tokens in background
-            refresh_interval: Seconds between token refreshes
-        """
+    def from_dict(cls, cookie_data: dict, auto_refresh: bool = False):
+        """Create auth instance from cookie dict (same format as cookies.json content)."""
         instance = object.__new__(cls)
         instance.cookies_file = None
-        instance.refresh_interval = refresh_interval
+        instance.refresh_interval = 50
         instance._clerk_params = None
         instance._state = None
         instance._session_jwt = None
-        instance._action_hashes = []
+        instance._action_hashes = {}
         instance._lock = threading.Lock()
         instance._refresh_thread = None
         
-        # Parse cookie data directly
+        # Parse cookie data
         state = {}
         for c in cookie_data.get("cookies", []):
             name, value = c["name"], c["value"]
@@ -109,7 +110,6 @@ class OpenRouterAuth:
         
         if auto_refresh:
             instance._start_auto_refresh()
-        
         return instance
     
     def _load_state(self):
@@ -158,7 +158,6 @@ class OpenRouterAuth:
         except Exception:
             pass
         
-        # Fallback
         self._clerk_params = {"__clerk_api_version": "2025-11-10", "_clerk_js_version": "5.111.0"}
     
     def _refresh_token(self):
@@ -193,32 +192,61 @@ class OpenRouterAuth:
         return False
     
     def _fetch_action_hashes(self):
-        """Fetch next-action hashes from JS bundles."""
-        try:
-            cookies = self._get_cookies_dict()
-            resp = requests.get(f"{BASE_URL}/activity", cookies=cookies, timeout=15)
-            
-            if resp.status_code != 200:
-                return
-            
-            js_chunks = list(set(re.findall(r'/_next/static/chunks/([^"\']+\.js)', resp.text)))
-            all_hashes = set()
-            
-            for chunk in js_chunks:
-                try:
-                    r = requests.get(f"{BASE_URL}/_next/static/chunks/{chunk}", 
-                                   cookies=cookies, timeout=10)
-                    if r.status_code == 200:
-                        hashes = re.findall(r'"(00[0-9a-f]{40})"', r.text)
-                        all_hashes.update(hashes)
-                except Exception:
-                    pass
-            
-            with self._lock:
-                self._action_hashes = sorted(list(all_hashes))
+        """Fetch next-action hashes from JS bundles for all pages."""
+        cookies = self._get_cookies_dict()
+        page_hashes = {}
+        
+        for page_name, page_path in PAGES.items():
+            try:
+                resp = requests.get(f"{BASE_URL}{page_path}", cookies=cookies, timeout=15)
+                if resp.status_code != 200:
+                    continue
                 
-        except Exception as e:
-            print(f"Hash fetch failed: {e}")
+                js_chunks = list(set(re.findall(r'/_next/static/chunks/([^"\']+\.js)', resp.text)))
+                page_hash = None
+                
+                # Find page-specific chunk (e.g., app/(user)/activity/page-*.js)
+                page_key = page_path.strip('/').split('/')[-1]  # "activity" or "provisioning-keys"
+                for chunk in js_chunks:
+                    if f"/{page_key}/page-" in chunk:
+                        try:
+                            r = requests.get(f"{BASE_URL}/_next/static/chunks/{chunk}", 
+                                           cookies=cookies, timeout=10)
+                            if r.status_code == 200:
+                                hashes = re.findall(r'"([0-9a-f]{42})"', r.text)
+                                # Prefer 00-prefix hash if available
+                                prefix_00 = [h for h in hashes if h.startswith('00')]
+                                if prefix_00:
+                                    page_hash = prefix_00[0]
+                                elif hashes:
+                                    page_hash = hashes[0]
+                                break
+                        except Exception:
+                            pass
+                
+                # Fallback: search all chunks for 00-prefix hashes
+                if not page_hash:
+                    all_hashes = set()
+                    for chunk in js_chunks:
+                        try:
+                            r = requests.get(f"{BASE_URL}/_next/static/chunks/{chunk}", 
+                                           cookies=cookies, timeout=10)
+                            if r.status_code == 200:
+                                hashes = re.findall(r'"(00[0-9a-f]{40})"', r.text)
+                                all_hashes.update(hashes)
+                        except Exception:
+                            pass
+                    if all_hashes:
+                        page_hash = sorted(list(all_hashes))[0]
+                
+                if page_hash:
+                    page_hashes[page_name] = page_hash
+                    
+            except Exception:
+                pass
+        
+        with self._lock:
+            self._action_hashes = page_hashes
     
     def _get_cookies_dict(self):
         """Get cookies as dict for requests library."""
@@ -266,34 +294,40 @@ class OpenRouterAuth:
         """
         return self._get_cookies_dict()
     
-    def get_action_hash(self):
+    def get_action_hash(self, page="activity"):
         """
-        Get the primary next-action hash.
+        Get the next-action hash for a specific page.
+        
+        Args:
+            page: Page name (activity, provisioning_keys, keys, broadcast)
         
         Returns:
-            str: Action hash like "00d6e8fb45f9a136d6470f2a49c8d0e2c843cabf92"
+            str: Action hash like "409cb4b7890ec13be27525a5ec301c1d4852000762"
         """
         with self._lock:
-            return self._action_hashes[0] if self._action_hashes else None
+            return self._action_hashes.get(page)
     
     def get_all_action_hashes(self):
         """
-        Get all available next-action hashes.
+        Get all available next-action hashes by page.
         
         Returns:
-            list: List of action hashes
+            dict: {page_name: hash, ...}
         """
         with self._lock:
-            return list(self._action_hashes)
+            return dict(self._action_hashes)
     
-    def get_auth(self):
+    def get_auth(self, page="activity"):
         """
-        Get both cookie string and action hash.
+        Get cookie string and action hash for a specific page.
+        
+        Args:
+            page: Page name (activity, provisioning_keys, keys, broadcast)
         
         Returns:
             tuple: (cookie_string, action_hash)
         """
-        return self.get_cookie_string(), self.get_action_hash()
+        return self.get_cookie_string(), self.get_action_hash(page)
     
     def refresh(self):
         """Manually refresh token and hashes."""
@@ -307,6 +341,11 @@ class OpenRouterAuth:
     def get_org_id(self):
         """Get the current organization ID (if any)."""
         return self._state.get("org_id")
+    
+    @staticmethod
+    def get_available_pages():
+        """Get list of supported pages."""
+        return list(PAGES.keys())
 
 
 # Convenience functions for simple usage
@@ -328,37 +367,43 @@ def get_cookie_string():
     return _default_auth.get_cookie_string()
 
 
-def get_action_hash():
+def get_action_hash(page="activity"):
     """Get action hash from default auth instance."""
     if not _default_auth:
         raise RuntimeError("Call init() first")
-    return _default_auth.get_action_hash()
+    return _default_auth.get_action_hash(page)
 
 
-def get_auth():
+def get_auth(page="activity"):
     """Get both cookie string and action hash from default auth instance."""
     if not _default_auth:
         raise RuntimeError("Call init() first")
-    return _default_auth.get_auth()
+    return _default_auth.get_auth(page)
 
 
 if __name__ == "__main__":
-    # Demo usage
     print("OpenRouter Auth Module Demo")
-    print("=" * 40)
+    print("=" * 50)
     
     auth = OpenRouterAuth("cookies.json")
     
     print(f"\nSession ID: {auth.get_session_id()}")
     print(f"Org ID: {auth.get_org_id()}")
     
-    print(f"\nAction Hash: {auth.get_action_hash()}")
+    print(f"\nAvailable pages: {auth.get_available_pages()}")
+    
+    print("\nAction Hashes by page:")
+    for page, hash in auth.get_all_action_hashes().items():
+        print(f"  {page}: {hash}")
+    
     print(f"\nCookie String:\n{auth.get_cookie_string()}")
     
-    print("\n\nExample curl command:")
-    cookie_str, action_hash = auth.get_auth()
-    print(f"""
-curl 'https://openrouter.ai/activity' \\
+    # Example for provisioning_keys
+    cookie_str, action_hash = auth.get_auth("provisioning_keys")
+    if action_hash:
+        print(f"\n\nExample curl for /settings/provisioning-keys:")
+        print(f"""
+curl 'https://openrouter.ai/settings/provisioning-keys' \\
   -X POST \\
   -H 'content-type: text/plain;charset=UTF-8' \\
   -H 'accept: text/x-component' \\
@@ -366,6 +411,3 @@ curl 'https://openrouter.ai/activity' \\
   -H 'cookie: {cookie_str}' \\
   --data-raw '[]'
 """)
-
-
-
