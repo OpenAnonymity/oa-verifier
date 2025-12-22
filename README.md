@@ -2,18 +2,14 @@
 
 Lightweight verification service for OpenRouter stations. Designed for enclave deployment with in-memory-only storage.
 
-## Install
+## Build & Run
 
 ```bash
-pip install -r requirements.txt
-```
+go build -o verifier ./cmd/verifier
+./verifier
 
-## Run
-
-```bash
-python verifier.py
-# or
-uvicorn verifier:app --host 0.0.0.0 --port 8000
+# Or directly
+go run ./cmd/verifier
 ```
 
 ## API Endpoints
@@ -21,26 +17,24 @@ uvicorn verifier:app --host 0.0.0.0 --port 8000
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/register` | POST | Register station with Ed25519 public key and cookie |
+| `/submit_key` | POST | Submit double-signed API key for ownership verification |
 | `/station/{public_key}` | GET | Get station info |
 | `/broadcast` | GET | Get all verified stations and banned list |
-| `/add-invitation` | POST | Add invitation code for Privacy Pass tickets |
-| `/tickets` | GET | Get ticket usage statistics |
 | `/banned-stations` | GET | Get list of banned stations |
 | `/reload-config` | POST | Hot-reload config from .env (requires auth) |
 
 ## Module Structure
 
-| File | Purpose |
+| Path | Purpose |
 |------|---------|
-| `verifier.py` | FastAPI routes, main entry point |
-| `config.py` | Hot-reloadable configuration (reads from .env on each access) |
-| `models.py` | Pydantic/dataclass models |
-| `openrouter_api.py` | OpenRouter auth & API interactions |
-| `tickets.py` | Privacy Pass ticket management |
-| `banned.py` | Banned station tracking |
-| `challenge.py` | Station verification challenges |
-| `registry.py` | Station registry fetch |
-| `logging_config.py` | Loguru setup |
+| `cmd/verifier/main.go` | Entry point |
+| `internal/server/` | HTTP server, handlers, verification loop |
+| `internal/config/` | Hot-reloadable configuration |
+| `internal/models/` | Data models |
+| `internal/openrouter/` | OpenRouter auth & API interactions |
+| `internal/banned/` | Banned station tracking |
+| `internal/challenge/` | Privacy toggle verification |
+| `internal/registry/` | Station registry fetch |
 
 ## Security
 

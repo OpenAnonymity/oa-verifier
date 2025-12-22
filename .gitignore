@@ -1,11 +1,6 @@
-# Python
-__pycache__/
-*.py[cod]
-*.so
-.Python
-env/
-venv/
-.venv/
+# Go
+verifier
+*.exe
 
 # Cookies (sensitive)
 cookies.json
@@ -24,10 +19,5 @@ Thumbs.db
 
 # Persistent data
 banned_stations.json
-tickets.json
 
 .env
-
-
-
-
