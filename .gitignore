@@ -25,3 +25,9 @@ Thumbs.db
 # Persistent data
 banned_stations.json
 tickets.json
+
+.env
+
+
+
+

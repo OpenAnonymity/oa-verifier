@@ -20,48 +20,31 @@ uvicorn verifier:app --host 0.0.0.0 --port 8000
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/station/register` | POST | Register station with cookie data |
-| `/challenge` | POST | Verify privacy toggles off + generation exists |
-| `/station/{station_id}` | GET | Check registration status |
-| `/broadcast` | GET | Get all verified stations |
+| `/register` | POST | Register station with Ed25519 public key and cookie |
+| `/station/{public_key}` | GET | Get station info |
+| `/broadcast` | GET | Get all verified stations and banned list |
+| `/add-invitation` | POST | Add invitation code for Privacy Pass tickets |
+| `/tickets` | GET | Get ticket usage statistics |
+| `/banned-stations` | GET | Get list of banned stations |
+| `/reload-config` | POST | Hot-reload config from .env (requires auth) |
 
-### Register Station
+## Module Structure
 
-```bash
-curl -X POST http://localhost:8000/station/register \
-  -H "Content-Type: application/json" \
-  -d '{"station_id": "my-station", "cookie_data": {"cookies": [...]}}'
-```
-
-### Challenge Station
-
-```bash
-curl -X POST http://localhost:8000/challenge \
-  -H "Content-Type: application/json" \
-  -d '{"station_id": "my-station", "generation_id": "gen-xxx"}'
-```
-
-### Check Registration
-
-```bash
-curl http://localhost:8000/station/my-station
-```
-
-### Broadcast
-
-```bash
-curl http://localhost:8000/broadcast
-```
+| File | Purpose |
+|------|---------|
+| `verifier.py` | FastAPI routes, main entry point |
+| `config.py` | Hot-reloadable configuration (reads from .env on each access) |
+| `models.py` | Pydantic/dataclass models |
+| `openrouter_api.py` | OpenRouter auth & API interactions |
+| `tickets.py` | Privacy Pass ticket management |
+| `banned.py` | Banned station tracking |
+| `challenge.py` | Station verification challenges |
+| `registry.py` | Station registry fetch |
+| `logging_config.py` | Loguru setup |
 
 ## Security
 
-- All cookie data stored in memory only (never persisted)
-- Failed challenges mark stations as untrustworthy
+- Three-way binding: station_id (registry) <-> email (cookie) <-> public_key (station)
+- Cookie data stored in memory only (never persisted)
+- Background verification loop randomly challenges stations
 - Designed for TEE/enclave deployment
-
-
-
-
-
-
-
