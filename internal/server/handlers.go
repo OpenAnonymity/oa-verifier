@@ -360,21 +360,27 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getOrgPublicKey() (string, error) {
 	s.orgPKMu.RLock()
-	if s.orgPKCached {
+	if s.orgPK != "" && time.Since(s.orgPKFetched) < orgPKTTL {
 		pk := s.orgPK
 		s.orgPKMu.RUnlock()
 		return pk, nil
 	}
+	cachedPK := s.orgPK
 	s.orgPKMu.RUnlock()
 
 	pk, err := openrouter.FetchOrgPublicKey()
 	if err != nil {
+		// Fallback to cached key if fetch fails
+		if cachedPK != "" {
+			slog.Warn("org public key fetch failed, using cached", "error", err)
+			return cachedPK, nil
+		}
 		return "", err
 	}
 
 	s.orgPKMu.Lock()
 	s.orgPK = pk
-	s.orgPKCached = true
+	s.orgPKFetched = time.Now()
 	s.orgPKMu.Unlock()
 
 	return pk, nil

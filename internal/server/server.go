@@ -30,11 +30,13 @@ type Server struct {
 
 	banned *banned.Manager
 
-	// Cached org public key
-	orgPKMu     sync.RWMutex
-	orgPK       string
-	orgPKCached bool
+	// Cached org public key (TTL-based)
+	orgPKMu      sync.RWMutex
+	orgPK        string
+	orgPKFetched time.Time
 }
+
+const orgPKTTL = 10 * time.Minute
 
 // New creates a new Server.
 func New() *Server {
