@@ -44,6 +44,19 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Early return if already registered with same public key
+	s.mu.RLock()
+	if existing, ok := s.stations[req.PublicKey]; ok {
+		s.mu.RUnlock()
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":     "already_registered",
+			"station_id": existing.StationID,
+			"public_key": req.PublicKey,
+		})
+		return
+	}
+	s.mu.RUnlock()
+
 	// Check if already banned by public key
 	if s.banned.IsBanned("", req.PublicKey) {
 		bannedID := s.banned.GetStationIDByPK(req.PublicKey)
