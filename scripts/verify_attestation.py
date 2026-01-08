@@ -633,23 +633,32 @@ def print_raw_verification(service_url: str):
     print("\n" + "=" * 70)
 
 
+def compute_hash_from_file(filepath: str) -> str:
+    """Compute SHA256 hash of a policy file."""
+    with open(filepath, 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Verify oa-verifier attestation",
+        description="Verify oa-verifier attestation (Zero Trust)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Verify with defaults
-  python verify_attestation.py
+  # ZERO TRUST: Compute hash from your own policy file
+  python verify_attestation.py --policy-file /tmp/my-policy.rego
 
-  # Verify against a specific service
-  python verify_attestation.py --url http://localhost:8000
+  # ZERO TRUST: Use the derive_and_verify.sh script
+  ./derive_and_verify.sh
+
+  # Trust repo default (NOT zero trust)
+  python verify_attestation.py
 
   # Verify with a specific expected policy hash
   python verify_attestation.py --policy-hash abc123...
 
-  # Verbose output
-  python verify_attestation.py --verbose
+  # Show how to derive hash yourself
+  python verify_attestation.py --show-how-to-derive
 """
     )
     parser.add_argument(
@@ -659,8 +668,13 @@ Examples:
     )
     parser.add_argument(
         "--policy-hash",
-        default=DEFAULT_POLICY_HASH,
-        help="Expected CCE policy hash"
+        default=None,
+        help="Expected CCE policy hash (use --policy-file for zero trust)"
+    )
+    parser.add_argument(
+        "--policy-file",
+        default=None,
+        help="Path to CCE policy file (computes hash automatically - ZERO TRUST)"
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -688,9 +702,46 @@ Examples:
         print_raw_verification(args.url)
         sys.exit(0)
 
+    # Determine policy hash
+    if args.policy_file:
+        # ZERO TRUST: Compute hash from user's policy file
+        try:
+            policy_hash = compute_hash_from_file(args.policy_file)
+            print(f"\n{'=' * 60}")
+            print("  ZERO TRUST MODE")
+            print(f"{'=' * 60}")
+            print(f"  Computing hash from: {args.policy_file}")
+            print(f"  Computed hash: {policy_hash}")
+            print(f"{'=' * 60}")
+        except FileNotFoundError:
+            print(f"Error: Policy file not found: {args.policy_file}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error reading policy file: {e}")
+            sys.exit(1)
+    elif args.policy_hash:
+        # User provided explicit hash
+        policy_hash = args.policy_hash
+    else:
+        # Using default - warn user this is not zero trust
+        policy_hash = DEFAULT_POLICY_HASH
+        print(f"\n{'=' * 60}")
+        print("  ⚠️  WARNING: Using hardcoded default policy hash")
+        print(f"{'=' * 60}")
+        print("  This is NOT zero trust verification.")
+        print("  You are trusting the script author's hash.")
+        print("")
+        print("  For true zero trust, either:")
+        print("  1. Run: ./derive_and_verify.sh")
+        print("  2. Use: --policy-file <your-policy.rego>")
+        print("  3. Use: --policy-hash <your-computed-hash>")
+        print("")
+        print("  See: --show-how-to-derive for manual steps")
+        print(f"{'=' * 60}\n")
+
     verifier = AttestationVerifier(
         service_url=args.url,
-        expected_policy_hash=args.policy_hash,
+        expected_policy_hash=policy_hash,
         verbose=args.verbose
     )
 
