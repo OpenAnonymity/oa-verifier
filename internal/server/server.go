@@ -15,7 +15,6 @@ import (
 	"log/slog"
 	"math/big"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
@@ -135,8 +134,7 @@ func (s *Server) RunTLS(ctx context.Context) error {
 
 	// Store TLS public key hash for channel binding in attestation
 	s.tlsPubKeyHash = pubKeyHash
-	customDomain := os.Getenv("TLS_DOMAIN")
-	slog.Info("TLS certificate generated", "pubkey_hash", pubKeyHash, "custom_domain", customDomain)
+	slog.Info("TLS certificate generated", "pubkey_hash", pubKeyHash)
 
 	tlsSrv := &http.Server{
 		Addr:    ":8443",
@@ -173,27 +171,17 @@ func generateSelfSignedCert() (tls.Certificate, string, error) {
 		return tls.Certificate{}, "", err
 	}
 
-	// Get custom domain from environment, or use defaults
-	dnsNames := []string{
-		"localhost",
-		"*.azurecontainer.io",
-	}
-	if customDomain := os.Getenv("TLS_DOMAIN"); customDomain != "" {
-		dnsNames = append(dnsNames, customDomain)
-	}
-
 	template := x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			Organization: []string{"OA Verifier Enclave"},
-			CommonName:   "Confidential Enclave",
 		},
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		DNSNames:              dnsNames,
+		DNSNames:              []string{"localhost", "*.azurecontainer.io"},
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
