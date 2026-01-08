@@ -22,6 +22,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
@@ -32,13 +33,17 @@ import (
 )
 
 func main() {
+	// Parse command-line flags
+	attestation := flag.Bool("attestation", true, "Enable attestation endpoints (requires Azure CC sidecar)")
+	flag.Parse()
+
 	// Setup structured logging
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	})))
 
 	// Create server
-	srv := server.New()
+	srv := server.New(*attestation)
 
 	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -53,14 +58,12 @@ func main() {
 		cancel()
 	}()
 
-	// Run server
-	addr := ":8000"
-	if port := os.Getenv("PORT"); port != "" {
-		addr = ":" + port
-	}
+	// Run server with self-signed TLS on port 8443
+	// TLS terminates inside the enclave (not at Azure)
+	slog.Info("starting Enclave Verifier with self-signed TLS", "port", 8443, "attestation", *attestation)
+	err := srv.RunTLS(ctx)
 
-	slog.Info("starting Enclave Verifier", "addr", addr)
-	if err := srv.Run(ctx, addr); err != nil && err != http.ErrServerClosed {
+	if err != nil && err != http.ErrServerClosed {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}

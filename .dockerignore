@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Python (not needed in container)
+.venv
+__pycache__
+*.py
+*.pyc
+
+# Build artifacts
+verifier
+*.exe
+
+# Config files (secrets should be env vars)
+.env
+.env.*
+banned_stations.json
+tickets.json
+
+# Documentation
+*.md
+!README.md
+
+# Test files
+*_test.go
+

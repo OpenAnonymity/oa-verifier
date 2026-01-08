@@ -1,10 +1,15 @@
 package server
 
 import (
+	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -15,6 +20,12 @@ import (
 	"github.com/oa-verifier/internal/models"
 	"github.com/oa-verifier/internal/openrouter"
 	"github.com/oa-verifier/internal/registry"
+)
+
+// ACI Confidential Containers attestation endpoint (SKR sidecar)
+const (
+	defaultMAAEndpoint    = "http://localhost:8080/attest/maa"
+	defaultMAAProviderURL = "sharedeus.eus.attest.azure.net"
 )
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -448,6 +459,52 @@ func (s *Server) handleBannedStations(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleUnbanStation(w http.ResponseWriter, r *http.Request) {
+	// Require admin auth
+	if !s.checkAdminAuth(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	stationID := chi.URLParam(r, "station_id")
+	if stationID == "" {
+		writeError(w, http.StatusBadRequest, "station_id required")
+		return
+	}
+
+	if s.banned.Unban(stationID) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":     "unbanned",
+			"station_id": stationID,
+		})
+	} else {
+		writeError(w, http.StatusNotFound, "Station not found in banned list")
+	}
+}
+
+func (s *Server) handleClearBanned(w http.ResponseWriter, r *http.Request) {
+	// Require admin auth
+	if !s.checkAdminAuth(r) {
+		writeError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	count := s.banned.Clear()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "cleared",
+		"removed": count,
+	})
+}
+
+func (s *Server) checkAdminAuth(r *http.Request) bool {
+	registrySecret := config.RegistrySecret()
+	if registrySecret == "" {
+		return false
+	}
+	auth := r.Header.Get("Authorization")
+	return auth == "Bearer "+registrySecret
+}
+
 func (s *Server) handleReloadConfig(w http.ResponseWriter, r *http.Request) {
 	registrySecret := config.RegistrySecret()
 	if registrySecret == "" {
@@ -472,6 +529,218 @@ func (s *Server) handleReloadConfig(w http.ResponseWriter, r *http.Request) {
 			"max_seconds": config.ChallengeMaxInterval(),
 		},
 	})
+}
+
+// decodeJWTPayload decodes JWT payload without verification (for display only).
+func decodeJWTPayload(token string) map[string]any {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil
+	}
+	payload := parts[1]
+	// Add padding if needed
+	if pad := len(payload) % 4; pad != 0 {
+		payload += strings.Repeat("=", 4-pad)
+	}
+	decoded, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		return nil
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return nil
+	}
+	return claims
+}
+
+// maaAttestRequest is the request payload for the SKR sidecar /attest/maa endpoint.
+type maaAttestRequest struct {
+	MAAEndpoint string `json:"maa_endpoint"`
+	RuntimeData string `json:"runtime_data"` // base64-encoded nonce data
+}
+
+// getAttestationToken calls the ACI MAA sidecar to get an attestation token.
+// tlsHash is the SHA256 hash of the TLS public key for channel binding.
+func getAttestationToken(nonce, tlsHash string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Get MAA endpoint from env or use default
+	maaEndpoint := os.Getenv("MAA_ENDPOINT")
+	if maaEndpoint == "" {
+		maaEndpoint = defaultMAAEndpoint
+	}
+
+	maaProvider := os.Getenv("MAA_PROVIDER_URL")
+	if maaProvider == "" {
+		maaProvider = defaultMAAProviderURL
+	}
+
+	// Ensure nonce is not empty - required by the sidecar
+	if nonce == "" {
+		nonce = "default-nonce"
+	}
+
+	// runtime_data must be valid JSON for MAA
+	// Include both nonce (freshness) and tls_hash (channel binding)
+	runtimeJSON := map[string]string{"nonce": nonce}
+	if tlsHash != "" {
+		runtimeJSON["tls_hash"] = tlsHash
+	}
+	runtimeBytes, _ := json.Marshal(runtimeJSON)
+	runtimeData := base64.StdEncoding.EncodeToString(runtimeBytes)
+
+	reqBody := maaAttestRequest{
+		MAAEndpoint: maaProvider,
+		RuntimeData: runtimeData,
+	}
+
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", maaEndpoint, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to call MAA sidecar: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("MAA sidecar returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Response contains the JWT token
+	var result struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		// Try reading as plain text token
+		resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		token := strings.TrimSpace(string(body))
+		if token != "" && strings.Contains(token, ".") {
+			return token, nil
+		}
+		return "", fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if result.Token == "" {
+		return "", fmt.Errorf("empty token in response")
+	}
+
+	return result.Token, nil
+}
+
+func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
+	nonce := r.URL.Query().Get("nonce")
+
+	// Pass TLS public key hash for channel binding
+	token, err := getAttestationToken(nonce, s.tlsPubKeyHash)
+	if err != nil {
+		slog.Error("attestation failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "Attestation failed: "+err.Error())
+		return
+	}
+
+	claims := decodeJWTPayload(token)
+	if claims == nil {
+		writeError(w, http.StatusInternalServerError, "Failed to decode attestation token")
+		return
+	}
+
+	// Build summary for SEV-SNP (ACI Confidential Containers)
+	summary := map[string]any{
+		"issuer": claims["iss"],
+	}
+
+	// SEV-SNP specific claims
+	if attestationType, ok := claims["x-ms-attestation-type"].(string); ok {
+		summary["attestation_type"] = attestationType
+	}
+	if complianceStatus, ok := claims["x-ms-compliance-status"].(string); ok {
+		summary["compliance_status"] = complianceStatus
+	}
+
+	// HOST_DATA contains the CCE policy hash - this is the critical field
+	// It proves which container image is running
+	if hostData, ok := claims["x-ms-sevsnpvm-hostdata"].(string); ok {
+		summary["host_data"] = hostData
+		summary["cce_policy_hash"] = hostData // alias for clarity
+	}
+
+	// Runtime data contains the nonce we provided
+	if runtimeData, ok := claims["x-ms-runtime"].(map[string]any); ok {
+		if clientPayload, ok := runtimeData["client-payload"].(map[string]any); ok {
+			summary["runtime_data"] = clientPayload
+		}
+	}
+
+	// Debug/security status
+	if isDebuggable, ok := claims["x-ms-sevsnpvm-is-debuggable"].(bool); ok {
+		summary["debug_disabled"] = !isDebuggable
+	}
+
+	// VM ID if available
+	if vmID, ok := claims["x-ms-sevsnpvm-vmpl"].(float64); ok {
+		summary["vmpl"] = int(vmID)
+	}
+
+	issuer, _ := claims["iss"].(string)
+
+	// Get expected container digest from env (set during deployment)
+	expectedDigest := os.Getenv("CONTAINER_DIGEST")
+	if expectedDigest == "" {
+		expectedDigest = "sha256:<build-and-record-digest>"
+	}
+
+	// Include TLS hash in summary for channel binding verification
+	if s.tlsPubKeyHash != "" {
+		summary["tls_pubkey_hash"] = s.tlsPubKeyHash
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token":     token,
+		"timestamp": utcNow(),
+		"nonce":     nonce,
+		"summary":   summary,
+		"verify_at": issuer + "/certs",
+		"verification": map[string]any{
+			"how_to_verify": []string{
+				"1. Verify JWT signature using keys from verify_at URL (must be *.attest.azure.net)",
+				"2. Check tls_hash in JWT matches SHA256 of server's TLS public key (channel binding)",
+				"3. Get the CCE policy from our GitHub repo",
+				"4. Compute sha256(policy) and compare to summary.cce_policy_hash",
+				"5. Check the policy specifies the expected container digest",
+				"6. Build container from source and verify digest matches policy",
+			},
+			"what_host_data_proves":     "SHA256 hash of CCE policy - proves which container is allowed to run",
+			"what_tls_hash_proves":      "SHA256 hash of TLS public key - proves you're talking directly to the enclave (not a proxy)",
+			"expected_container_digest": expectedDigest,
+			"policy_source":             "https://github.com/openanonymity/oa-verifier",
+		},
+	})
+}
+
+func (s *Server) handleAttestationRaw(w http.ResponseWriter, r *http.Request) {
+	nonce := r.URL.Query().Get("nonce")
+
+	// Pass TLS public key hash for channel binding
+	token, err := getAttestationToken(nonce, s.tlsPubKeyHash)
+	if err != nil {
+		slog.Error("attestation failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "Attestation failed")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"token": token})
 }
 
 
