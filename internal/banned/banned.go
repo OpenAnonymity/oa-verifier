@@ -133,6 +133,34 @@ func (m *Manager) GetStationIDByPK(publicKey string) string {
 	return ""
 }
 
+// Unban removes a station from the banned list.
+func (m *Manager) Unban(stationID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for i, s := range m.stations {
+		if s.StationID == stationID {
+			m.stations = append(m.stations[:i], m.stations[i+1:]...)
+			m.save()
+			slog.Info("unbanned station", "station_id", stationID)
+			return true
+		}
+	}
+	return false
+}
+
+// Clear removes all banned stations.
+func (m *Manager) Clear() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	count := len(m.stations)
+	m.stations = make([]models.BannedStation, 0)
+	m.save()
+	slog.Info("cleared all banned stations", "count", count)
+	return count
+}
+
 
 
 
