@@ -15,9 +15,9 @@ on:
   workflow_dispatch:
     inputs:
       service_url:
-        description: 'Service URL to verify'
-        required: true
-        default: 'https://oa-verifier.eastus.azurecontainer.io'
+        description: 'Service URL to verify (leave empty to use TLS_DOMAIN or default)'
+        required: false
+        default: ''
   
   # Daily verification
   schedule:
@@ -74,14 +74,33 @@ jobs:
           # Cleanup
           docker stop registry && docker rm registry
 
+      - name: Determine service URL
+        id: url
+        run: |
+          # Priority: 1) Manual input, 2) TLS_DOMAIN secret, 3) Azure FQDN default
+          if [ -n "${{ github.event.inputs.service_url }}" ]; then
+            echo "url=${{ github.event.inputs.service_url }}" >> $GITHUB_OUTPUT
+            echo "curl_flags=-sfk" >> $GITHUB_OUTPUT
+            echo "Using manual input: ${{ github.event.inputs.service_url }}"
+          elif [ -n "${{ secrets.TLS_DOMAIN }}" ]; then
+            echo "url=https://${{ secrets.TLS_DOMAIN }}" >> $GITHUB_OUTPUT
+            echo "curl_flags=-sf" >> $GITHUB_OUTPUT
+            echo "Using TLS_DOMAIN: ${{ secrets.TLS_DOMAIN }}"
+          else
+            echo "url=https://oa-verifier.eastus.azurecontainer.io" >> $GITHUB_OUTPUT
+            echo "curl_flags=-sfk" >> $GITHUB_OUTPUT
+            echo "Using default Azure FQDN"
+          fi
+
       - name: Fetch attestation from deployed service
         id: attestation
         env:
-          SERVICE_URL: ${{ github.event.inputs.service_url || 'https://oa-verifier.eastus.azurecontainer.io' }}
+          SERVICE_URL: ${{ steps.url.outputs.url }}
+          CURL_FLAGS: ${{ steps.url.outputs.curl_flags }}
         run: |
           echo "Fetching attestation from: $SERVICE_URL"
           
-          ATTESTATION=$(curl -sfk "$SERVICE_URL/attestation?nonce=verify-$(date +%s)" 2>/dev/null)
+          ATTESTATION=$(curl $CURL_FLAGS "$SERVICE_URL/attestation?nonce=verify-$(date +%s)" 2>/dev/null)
           
           if [ -z "$ATTESTATION" ]; then
             echo "❌ Could not fetch attestation from service"
@@ -179,12 +198,15 @@ jobs:
       - name: Generate verification summary
         if: always()
         env:
+          SERVICE_URL: ${{ steps.url.outputs.url }}
           SOURCE_DIGEST: ${{ steps.digest.outputs.digest }}
           REMOTE_DIGEST: ${{ steps.attestation.outputs.remote_digest }}
           SOURCE_IMAGE_ID: ${{ steps.build.outputs.image_id }}
           REMOTE_POLICY_HASH: ${{ steps.attestation.outputs.policy_hash }}
         run: |
           echo "## Zero-Trust Verification Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Service URL:** $SERVICE_URL" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Source Build (from this repository)" >> $GITHUB_STEP_SUMMARY
           echo "- **Manifest Digest:** \`$SOURCE_DIGEST\`" >> $GITHUB_STEP_SUMMARY

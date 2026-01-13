@@ -203,14 +203,33 @@ jobs:
           # Save to file for artifact
           echo "$IP" > deployment-ip.txt
 
+      - name: Determine service URL
+        id: url
+        run: |
+          # Use custom domain if configured, otherwise Azure FQDN
+          if [ -n "${{ secrets.TLS_DOMAIN }}" ]; then
+            echo "url=https://${{ secrets.TLS_DOMAIN }}" >> $GITHUB_OUTPUT
+            echo "curl_flags=-sf" >> $GITHUB_OUTPUT
+            echo "Using custom domain: ${{ secrets.TLS_DOMAIN }}"
+          else
+            echo "url=https://${{ steps.info.outputs.fqdn }}" >> $GITHUB_OUTPUT
+            echo "curl_flags=-sfk" >> $GITHUB_OUTPUT
+            echo "Using Azure FQDN: ${{ steps.info.outputs.fqdn }}"
+          fi
+
       - name: Wait for container to be ready
         run: |
           echo "Waiting for container to start..."
           sleep 60
           
+          SERVICE_URL="${{ steps.url.outputs.url }}"
+          CURL_FLAGS="${{ steps.url.outputs.curl_flags }}"
+          
+          echo "Testing: $SERVICE_URL/broadcast"
+          
           # Test health endpoint
           for i in {1..10}; do
-            if curl -sfk "https://${{ steps.info.outputs.fqdn }}/broadcast" >/dev/null 2>&1; then
+            if curl $CURL_FLAGS "$SERVICE_URL/broadcast" >/dev/null 2>&1; then
               echo "Container is healthy!"
               exit 0
             fi
@@ -223,9 +242,11 @@ jobs:
         id: verify
         env:
           EXPECTED_HASH: ${{ steps.policy.outputs.policy_hash }}
+          SERVICE_URL: ${{ steps.url.outputs.url }}
+          CURL_FLAGS: ${{ steps.url.outputs.curl_flags }}
         run: |
-          echo "Fetching attestation from deployed service..."
-          ATTESTATION=$(curl -sfk "https://${{ steps.info.outputs.fqdn }}/attestation" 2>/dev/null || echo "{}")
+          echo "Fetching attestation from: $SERVICE_URL"
+          ATTESTATION=$(curl $CURL_FLAGS "$SERVICE_URL/attestation" 2>/dev/null || echo "{}")
           
           if [ -z "$ATTESTATION" ] || [ "$ATTESTATION" = "{}" ]; then
             echo "⚠️ Could not fetch attestation - container may still be starting"
@@ -251,11 +272,14 @@ jobs:
           fi
 
       - name: Deployment summary
+        env:
+          SERVICE_URL: ${{ steps.url.outputs.url }}
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Service URL:** https://${{ steps.info.outputs.fqdn }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Service URL:** $SERVICE_URL" >> $GITHUB_STEP_SUMMARY
+          echo "**Azure FQDN:** https://${{ steps.info.outputs.fqdn }}" >> $GITHUB_STEP_SUMMARY
           echo "**IP Address:** \`${{ steps.info.outputs.ip }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Image Digest:** \`${{ steps.digest.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -264,9 +288,9 @@ jobs:
           if [ -n "${{ secrets.TLS_DOMAIN }}" ] && [ -n "${{ secrets.ACME_EMAIL }}" ]; then
             echo "### TLS Certificate" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "✅ **ACME configured** - Let's Encrypt certificate will be obtained for: \`${{ secrets.TLS_DOMAIN }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **ACME configured** - Let's Encrypt certificate for: \`${{ secrets.TLS_DOMAIN }}\`" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Make sure your DNS A record points \`${{ secrets.TLS_DOMAIN }}\` to: \`${{ steps.info.outputs.ip }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "DNS setup: CNAME \`${{ secrets.TLS_DOMAIN }}\` → \`${{ steps.info.outputs.fqdn }}\`" >> $GITHUB_STEP_SUMMARY
           else
             echo "### DNS Setup (for custom domain with CA certificate)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
@@ -276,7 +300,7 @@ jobs:
             echo "- \`ACME_DNS_PROVIDER\`: DNS provider (e.g., cloudflare)" >> $GITHUB_STEP_SUMMARY
             echo "- \`CF_API_TOKEN\`: Cloudflare API token (if using Cloudflare)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Then create an **A record** pointing your domain to: \`${{ steps.info.outputs.ip }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "Then create a CNAME: \`yourdomain.com\` → \`${{ steps.info.outputs.fqdn }}\`" >> $GITHUB_STEP_SUMMARY
           fi
           
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -285,7 +309,7 @@ jobs:
           echo "To verify the deployment:" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
           echo "# Using the Rust verifier (once available)" >> $GITHUB_STEP_SUMMARY
-          echo "oa-verify --url https://${{ steps.info.outputs.fqdn }}" >> $GITHUB_STEP_SUMMARY
+          echo "oa-verify --url $SERVICE_URL" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "# Verify Sigstore signature" >> $GITHUB_STEP_SUMMARY
           echo "cosign verify ${{ env.GHCR_REGISTRY }}/${OWNER}/oa-verifier@${{ steps.digest.outputs.digest }} \\" >> $GITHUB_STEP_SUMMARY

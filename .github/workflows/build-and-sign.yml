@@ -585,7 +585,16 @@ jobs:
         env:
           SOURCE_HASH: ${{ steps.policy.outputs.source_hash }}
         run: |
-          ATTESTATION=$(curl -sfk "https://oa-verifier.eastus.azurecontainer.io/attestation?nonce=verify-$(date +%s)" 2>/dev/null || echo "{}")
+          # Use custom domain if configured, otherwise Azure FQDN
+          if [ -n "${{ secrets.TLS_DOMAIN }}" ]; then
+            SERVICE_URL="https://${{ secrets.TLS_DOMAIN }}"
+            CURL_FLAGS="-sf"
+          else
+            SERVICE_URL="https://oa-verifier.eastus.azurecontainer.io"
+            CURL_FLAGS="-sfk"
+          fi
+          echo "Fetching attestation from: $SERVICE_URL"
+          ATTESTATION=$(curl $CURL_FLAGS "$SERVICE_URL/attestation?nonce=verify-$(date +%s)" 2>/dev/null || echo "{}")
           
           if [ -z "$ATTESTATION" ] || [ "$ATTESTATION" = "{}" ]; then
             echo "⚠️ Could not fetch attestation"
