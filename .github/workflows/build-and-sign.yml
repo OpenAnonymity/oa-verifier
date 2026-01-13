@@ -67,22 +67,26 @@ jobs:
         id: push-ghcr
         continue-on-error: true  # May fail on private repos
         run: |
+          # Lowercase the owner (Docker registries require lowercase)
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          
           # Tag and push to GHCR
-          docker tag oa-verifier:latest ${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
-          docker tag oa-verifier:latest ${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker tag oa-verifier:latest ${{ env.GHCR_REGISTRY }}/${OWNER}/${{ env.IMAGE_NAME }}:latest
+          docker tag oa-verifier:latest ${{ env.GHCR_REGISTRY }}/${OWNER}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           
-          docker push ${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
-          docker push ${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.GHCR_REGISTRY }}/${OWNER}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.GHCR_REGISTRY }}/${OWNER}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest | cut -d'@' -f2)
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.GHCR_REGISTRY }}/${OWNER}/${{ env.IMAGE_NAME }}:latest | cut -d'@' -f2)
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
-          echo "registry=${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}" >> $GITHUB_OUTPUT
+          echo "registry=${{ env.GHCR_REGISTRY }}/${OWNER}" >> $GITHUB_OUTPUT
           echo "✅ Pushed to GHCR with digest: $DIGEST"
 
       - name: Sign GHCR image with Cosign
         if: github.event_name != 'pull_request' && steps.push-ghcr.outcome == 'success'
         run: |
-          IMAGE="${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}@${{ steps.push-ghcr.outputs.digest }}"
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE="${{ env.GHCR_REGISTRY }}/${OWNER}/${{ env.IMAGE_NAME }}@${{ steps.push-ghcr.outputs.digest }}"
           echo "Signing: $IMAGE"
           cosign sign --yes "$IMAGE"
 
@@ -116,9 +120,10 @@ jobs:
         if: github.event_name != 'pull_request'
         id: registry
         run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           if [ "${{ steps.push-ghcr.outcome }}" = "success" ]; then
             echo "Using GHCR for deployment (public repo)"
-            echo "registry=${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}" >> $GITHUB_OUTPUT
+            echo "registry=${{ env.GHCR_REGISTRY }}/${OWNER}" >> $GITHUB_OUTPUT
             echo "digest=${{ steps.push-ghcr.outputs.digest }}" >> $GITHUB_OUTPUT
             echo "use_ghcr=true" >> $GITHUB_OUTPUT
           else
@@ -434,8 +439,11 @@ jobs:
           LOCAL_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}')
           echo "Local Nix build: $LOCAL_ID"
           
+          # Lowercase the owner (Docker registries require lowercase)
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          
           # Try GHCR first
-          GHCR_IMAGE="${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
+          GHCR_IMAGE="${{ env.GHCR_REGISTRY }}/${OWNER}/${{ env.IMAGE_NAME }}:latest"
           if docker pull "$GHCR_IMAGE" 2>/dev/null; then
             REMOTE_ID=$(docker inspect "$GHCR_IMAGE" --format='{{.Id}}')
             echo "GHCR image: $REMOTE_ID"
@@ -443,7 +451,7 @@ jobs:
             if [ "$LOCAL_ID" = "$REMOTE_ID" ]; then
               echo "✅ Source build matches GHCR image!"
               DIGEST=$(docker inspect "$GHCR_IMAGE" --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
-              echo "registry=${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}" >> $GITHUB_OUTPUT
+              echo "registry=${{ env.GHCR_REGISTRY }}/${OWNER}" >> $GITHUB_OUTPUT
               echo "digest=$DIGEST" >> $GITHUB_OUTPUT
               echo "use_ghcr=true" >> $GITHUB_OUTPUT
               exit 0

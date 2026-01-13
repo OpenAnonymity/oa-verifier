@@ -70,8 +70,9 @@ jobs:
           
           # Option 3: Query GHCR API
           echo "Fetching latest digest from GHCR..."
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           DIGEST=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://ghcr.io/v2/${{ github.repository_owner }}/oa-verifier/manifests/latest" \
+            "https://ghcr.io/v2/${OWNER}/oa-verifier/manifests/latest" \
             -H "Accept: application/vnd.docker.distribution.manifest.v2+json" 2>/dev/null \
             | jq -r '.config.digest' || echo "")
           
@@ -106,16 +107,20 @@ jobs:
 
       - name: Pull image for policy generation
         run: |
-          docker pull ${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/oa-verifier@${{ steps.digest.outputs.digest }}
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          docker pull ${{ env.GHCR_REGISTRY }}/${OWNER}/oa-verifier@${{ steps.digest.outputs.digest }}
 
       - name: Prepare deployment template
         run: |
           # Create deployment template from base template
           cp deploy/aci-template.json deploy/aci-deploy.json
           
+          # Lowercase the owner (Docker registries require lowercase)
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          
           # Update with actual values using jq
           jq --arg digest "${{ steps.digest.outputs.digest }}" \
-             --arg registry "${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}" \
+             --arg registry "${{ env.GHCR_REGISTRY }}/${OWNER}" \
              --arg reg_url "${{ secrets.STATION_REGISTRY_URL }}" \
              --arg reg_secret "${{ secrets.STATION_REGISTRY_SECRET }}" \
              --arg min_interval "${{ secrets.CHALLENGE_MIN_INTERVAL || '300' }}" \
@@ -221,6 +226,7 @@ jobs:
 
       - name: Deployment summary
         run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Service URL:** https://${{ steps.info.outputs.fqdn }}:8443" >> $GITHUB_STEP_SUMMARY
@@ -235,7 +241,7 @@ jobs:
           echo "oa-verify --url https://${{ steps.info.outputs.fqdn }}:8443" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "# Verify Sigstore signature" >> $GITHUB_STEP_SUMMARY
-          echo "cosign verify ${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/oa-verifier@${{ steps.digest.outputs.digest }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "cosign verify ${{ env.GHCR_REGISTRY }}/${OWNER}/oa-verifier@${{ steps.digest.outputs.digest }} \\" >> $GITHUB_STEP_SUMMARY
           echo "  --certificate-identity-regexp='https://github.com/${{ github.repository }}/.*' \\" >> $GITHUB_STEP_SUMMARY
           echo "  --certificate-oidc-issuer='https://token.actions.githubusercontent.com'" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

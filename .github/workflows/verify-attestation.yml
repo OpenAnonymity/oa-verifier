@@ -79,9 +79,13 @@ jobs:
         id: policy
         env:
           LOCAL_DIGEST: ${{ steps.local_registry.outputs.digest }}
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
           echo "Generating CCE policy from local Nix build..."
           echo "Using local digest: $LOCAL_DIGEST"
+          
+          # Lowercase the owner (Docker registries require lowercase)
+          OWNER=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
           
           # Create template using GHCR image reference (matches deployment)
           # The digest from local build should match GHCR since Nix builds are reproducible
@@ -99,7 +103,7 @@ jobs:
                 "containers": [{
                   "name": "oa-verifier",
                   "properties": {
-                    "image": "ghcr.io/${{ github.repository_owner }}/oa-verifier@${LOCAL_DIGEST}",
+                    "image": "ghcr.io/${OWNER}/oa-verifier@${LOCAL_DIGEST}",
                     "ports": [{"port": 8443, "protocol": "TCP"}],
                     "environmentVariables": [
                       {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
