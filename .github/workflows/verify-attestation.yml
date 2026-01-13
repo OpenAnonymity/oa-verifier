@@ -5,24 +5,30 @@ name: Verify Attestation (Source → Deployed)
 # GHCR if Nix builds are reproducible.
 
 on:
-  push:
+  # Run after Build, Sign, and Deploy completes
+  workflow_run:
+    workflows: ["Build, Sign, and Deploy"]
+    types: [completed]
     branches: [main, attestation]
-  pull_request:
-    branches: [main, attestation]
+  
+  # Manual trigger
   workflow_dispatch:
     inputs:
       service_url:
         description: 'Service URL to verify'
         required: true
         default: 'https://oa-verifier.eastus.azurecontainer.io:8443'
+  
+  # Daily verification
   schedule:
-    # Run daily to ensure deployed code still matches source
     - cron: '0 0 * * *'
 
 jobs:
   verify:
     name: Verify Source Matches Deployment
     runs-on: ubuntu-latest
+    # Only run if triggered manually, scheduled, or if the build workflow succeeded
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     
     steps:
       - name: Checkout repository
