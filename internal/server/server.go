@@ -23,6 +23,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"golang.org/x/crypto/ed25519"
 
+	"github.com/oa-verifier/internal/acme"
 	"github.com/oa-verifier/internal/banned"
 	"github.com/oa-verifier/internal/challenge"
 	"github.com/oa-verifier/internal/config"
@@ -124,19 +125,55 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 	return srv.ListenAndServe()
 }
 
-// RunTLS starts HTTPS with a self-signed certificate on port 8443.
+// RunTLS starts HTTPS on port 8443.
+// If ACME is configured (TLS_DOMAIN, ACME_EMAIL, ACME_DNS_PROVIDER), obtains a Let's Encrypt certificate.
+// Otherwise, generates a self-signed certificate.
 // TLS terminates at this server (inside the enclave), not at Azure.
 // Uses port 8443 because ACI confidential containers cannot bind to port 443.
 func (s *Server) RunTLS(ctx context.Context) error {
-	cert, pubKeyHash, err := generateSelfSignedCert()
-	if err != nil {
-		return err
+	var cert tls.Certificate
+	var pubKeyHash string
+	var err error
+	var certType string
+
+	// Try ACME first if configured
+	acmeCfg := acme.LoadConfig()
+	if acmeCfg.IsEnabled() {
+		slog.Info("ACME configured, obtaining Let's Encrypt certificate",
+			"domain", acmeCfg.Domain,
+			"provider", acmeCfg.Provider)
+
+		cert, pubKeyHash, err = acme.ObtainCertificate(ctx, acmeCfg)
+		if err != nil {
+			slog.Error("ACME certificate failed, falling back to self-signed", "error", err)
+			cert, pubKeyHash, err = generateSelfSignedCert()
+			if err != nil {
+				return err
+			}
+			certType = "self-signed (ACME fallback)"
+		} else {
+			certType = "Let's Encrypt"
+			// Start renewal loop for ACME certs
+			acme.StartRenewalLoop(ctx, acmeCfg, func(newCert tls.Certificate, newHash string) {
+				// TODO: implement hot-reload of certificate
+				slog.Info("certificate renewed", "hash", newHash)
+			})
+		}
+	} else {
+		cert, pubKeyHash, err = generateSelfSignedCert()
+		if err != nil {
+			return err
+		}
+		certType = "self-signed"
 	}
 
 	// Store TLS public key hash for channel binding in attestation
 	s.tlsPubKeyHash = pubKeyHash
 	customDomain := os.Getenv("TLS_DOMAIN")
-	slog.Info("TLS certificate generated", "pubkey_hash", pubKeyHash, "custom_domain", customDomain)
+	slog.Info("TLS certificate ready",
+		"type", certType,
+		"pubkey_hash", pubKeyHash,
+		"domain", customDomain)
 
 	tlsSrv := &http.Server{
 		Addr:    ":8443",
@@ -156,7 +193,7 @@ func (s *Server) RunTLS(ctx context.Context) error {
 		_ = tlsSrv.Shutdown(shutdownCtx)
 	}()
 
-	slog.Info("starting HTTPS server with self-signed cert", "addr", ":8443")
+	slog.Info("starting HTTPS server", "addr", ":8443", "cert_type", certType)
 	return tlsSrv.ListenAndServeTLS("", "")
 }
 

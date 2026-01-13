@@ -60,6 +60,22 @@
                 {
                   "name": "CHALLENGE_MAX_INTERVAL",
                   "value": "PLACEHOLDER_WILL_BE_REPLACED"
+                },
+                {
+                  "name": "TLS_DOMAIN",
+                  "value": ""
+                },
+                {
+                  "name": "ACME_EMAIL",
+                  "value": ""
+                },
+                {
+                  "name": "ACME_DNS_PROVIDER",
+                  "value": ""
+                },
+                {
+                  "name": "CF_API_TOKEN",
+                  "secureValue": ""
                 }
               ],
               "resources": {
