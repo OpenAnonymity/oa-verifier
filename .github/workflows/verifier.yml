@@ -2,11 +2,11 @@ name: Build Verifier
 
 on:
   push:
-    branches: [main]
+    branches: [main, attestation]
     paths:
       - 'verifier/**'
   pull_request:
-    branches: [main]
+    branches: [main, attestation]
     paths:
       - 'verifier/**'
   workflow_dispatch:

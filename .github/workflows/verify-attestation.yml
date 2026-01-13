@@ -4,6 +4,10 @@ name: Verify Attestation (Source → Deployed)
 # This is the "paranoid" zero-trust verification path.
 
 on:
+  push:
+    branches: [main, attestation]
+  pull_request:
+    branches: [main, attestation]
   workflow_dispatch:
     inputs:
       service_url:

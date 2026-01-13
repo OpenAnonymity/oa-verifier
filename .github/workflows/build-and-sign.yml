@@ -2,10 +2,10 @@ name: Build, Sign, and Deploy
 
 on:
   push:
-    branches: [main]
+    branches: [main, attestation]
     tags: ['v*']
   pull_request:
-    branches: [main]
+    branches: [main, attestation]
   workflow_dispatch:
 
 env:

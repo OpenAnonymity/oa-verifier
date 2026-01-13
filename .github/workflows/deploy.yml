@@ -19,7 +19,7 @@ on:
   workflow_run:
     workflows: ["Build, Sign, and Push Container"]
     types: [completed]
-    branches: [main]
+    branches: [main, attestation]
 
 env:
   RESOURCE_GROUP: oa-verifier
