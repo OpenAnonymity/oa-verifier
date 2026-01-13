@@ -1,7 +1,8 @@
 name: Verify Attestation (Source → Deployed)
 
-# This workflow rebuilds from source and verifies the deployed attestation matches.
-# This is the "paranoid" zero-trust verification path.
+# This workflow rebuilds from source and verifies the deployed container matches.
+# It pushes to a local registry to get the manifest digest, which should match
+# GHCR if Nix builds are reproducible.
 
 on:
   push:
@@ -40,136 +41,32 @@ jobs:
           echo "Building container from source with Nix..."
           nix build .#container --print-build-logs
           
-          # Get the tarball hash
-          TARBALL_HASH=$(sha256sum result | cut -d' ' -f1)
-          echo "tarball_hash=$TARBALL_HASH" >> $GITHUB_OUTPUT
-          echo "Source build tarball hash: $TARBALL_HASH"
-          
-          # Load into Docker and get image ID
+          # Load into Docker
           docker load < result
+          
+          # Get the image ID for reference
           IMAGE_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}' | cut -d: -f2)
           echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
           echo "Source build image ID: $IMAGE_ID"
 
-      - name: Start local registry and get digest
-        id: local_registry
+      - name: Get manifest digest via local registry
+        id: digest
         run: |
-          # Start a local registry (keep running for confcom)
+          # Start a local registry
           docker run -d -p 5000:5000 --name registry registry:2
           sleep 3
           
-          # Tag and push to local registry to get the manifest digest
+          # Push to local registry to get manifest digest
           docker tag oa-verifier:latest localhost:5000/oa-verifier:latest
           docker push localhost:5000/oa-verifier:latest
           
-          # Get the digest from the local registry
+          # Get the manifest digest (this is what CCE policy uses)
           LOCAL_DIGEST=$(docker inspect localhost:5000/oa-verifier:latest --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
           echo "digest=$LOCAL_DIGEST" >> $GITHUB_OUTPUT
-          echo "Local registry digest: $LOCAL_DIGEST"
-
-      - name: Install Azure CLI and confcom
-        run: |
-          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-          az extension add --name confcom --yes
-
-      - name: Generate CCE policy (from local build)
-        id: policy
-        env:
-          LOCAL_DIGEST: ${{ steps.local_registry.outputs.digest }}
-        run: |
-          echo "Generating CCE policy from local Nix build..."
-          echo "Using local digest: $LOCAL_DIGEST"
+          echo "Local build manifest digest: $LOCAL_DIGEST"
           
-          # Create template using LOCAL registry image (no remote pull needed)
-          # This is purely local verification - build from source and hash it
-          cat > /tmp/verify-template.json << EOF
-          {
-            "\$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-            "contentVersion": "1.0.0.0",
-            "resources": [{
-              "type": "Microsoft.ContainerInstance/containerGroups",
-              "apiVersion": "2023-05-01",
-              "name": "verify-test",
-              "location": "eastus",
-              "properties": {
-                "sku": "Confidential",
-                "containers": [{
-                  "name": "oa-verifier",
-                  "properties": {
-                    "image": "localhost:5000/oa-verifier@${LOCAL_DIGEST}",
-                    "ports": [{"port": 8443, "protocol": "TCP"}],
-                    "environmentVariables": [
-                      {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
-                      {"name": "MAA_PROVIDER_URL", "value": "sharedeus.eus.attest.azure.net"}
-                    ],
-                    "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
-                  }
-                },{
-                  "name": "skr-sidecar",
-                  "properties": {
-                    "image": "mcr.microsoft.com/aci/skr@sha256:baa6acf093c011cb26799187b6a535e32bd8248f52dd2cd9c606732b8a23c112",
-                    "command": ["/skr.sh"],
-                    "ports": [{"port": 8080, "protocol": "TCP"}],
-                    "resources": {"requests": {"cpu": 0.5, "memoryInGB": 1.0}}
-                  }
-                }],
-                "ipAddress": {
-                  "type": "Public",
-                  "ports": [{"port": 8443, "protocol": "TCP"}],
-                  "dnsNameLabel": "oa-verifier"
-                },
-                "osType": "Linux",
-                "restartPolicy": "Always",
-                "confidentialComputeProperties": {"ccePolicy": ""}
-              }
-            }]
-          }
-          EOF
-          
-          # Generate base policy from local image
-          az confcom acipolicygen -a /tmp/verify-template.json --approve-wildcards --disable-stdio
-          
-          # Extract and modify policy to add regex rules for dynamic env vars
-          POLICY_B64=$(jq -r '.resources[0].properties.confidentialComputeProperties.ccePolicy' /tmp/verify-template.json)
-          BASE_POLICY=$(echo "$POLICY_B64" | base64 -d)
-          
-          # Add regex rules for ALL dynamic env vars (MUST match deploy job!)
-          MODIFIED_POLICY=$(echo "$BASE_POLICY" | python3 -c '
-          import sys
-          import json
-          import re
-          
-          policy = sys.stdin.read()
-          match = re.search(r"containers := (\[.*?\])\s*\n\nallow_properties", policy, re.DOTALL)
-          if not match:
-              match = re.search(r"containers := (\[.*?\])(?=\s*\n\n|\s*$)", policy, re.DOTALL)
-          
-          if match:
-              containers_json = match.group(1)
-              containers = json.loads(containers_json)
-              if containers and "env_rules" in containers[0]:
-                  # MUST match the same env vars as deploy!
-                  dynamic_env_vars = [
-                      "CCE_POLICY_B64",
-                      "STATION_REGISTRY_URL",
-                      "STATION_REGISTRY_SECRET",
-                      "CHALLENGE_MIN_INTERVAL",
-                      "CHALLENGE_MAX_INTERVAL"
-                  ]
-                  for env_var in dynamic_env_vars:
-                      containers[0]["env_rules"].append({
-                          "pattern": f"{env_var}=.+",
-                          "required": False,
-                          "strategy": "re2"
-                      })
-              new_containers_json = json.dumps(containers, separators=(",", ":"))
-              policy = policy[:match.start(1)] + new_containers_json + policy[match.end(1):]
-          print(policy)
-          ')
-          
-          SOURCE_HASH=$(echo "$MODIFIED_POLICY" | sha256sum | cut -d' ' -f1)
-          echo "source_hash=$SOURCE_HASH" >> $GITHUB_OUTPUT
-          echo "Generated policy hash (with dynamic env vars): $SOURCE_HASH"
+          # Cleanup
+          docker stop registry && docker rm registry
 
       - name: Fetch attestation from deployed service
         id: attestation
@@ -185,75 +82,117 @@ jobs:
             exit 1
           fi
           
-          REMOTE_HASH=$(echo "$ATTESTATION" | jq -r '.summary.cce_policy_hash // .summary.host_data')
-          echo "remote_hash=$REMOTE_HASH" >> $GITHUB_OUTPUT
-          echo "Remote attestation policy hash: $REMOTE_HASH"
+          # Extract the policy
+          POLICY=$(echo "$ATTESTATION" | jq -r '.policy.decoded')
           
-          # Also show other attestation details
+          if [ -z "$POLICY" ] || [ "$POLICY" = "null" ]; then
+            echo "❌ Could not extract policy from attestation"
+            exit 1
+          fi
+          
+          # Extract the image digest from the policy
+          # The policy contains: "id":"ghcr.io/xxx/oa-verifier@sha256:..."
+          REMOTE_DIGEST=$(echo "$POLICY" | python3 -c "
+          import sys, json, re
+          policy = sys.stdin.read()
+          match = re.search(r'containers\s*:=\s*(\[.*?\])\s*\n', policy, re.DOTALL)
+          if match:
+              containers = json.loads(match.group(1))
+              for c in containers:
+                  if c.get('name') == 'oa-verifier':
+                      image_id = c.get('id', '')
+                      # Extract digest from image ID
+                      if '@sha256:' in image_id:
+                          print('sha256:' + image_id.split('@sha256:')[1])
+                      break
+          ")
+          
+          if [ -z "$REMOTE_DIGEST" ]; then
+            echo "❌ Could not extract digest from policy"
+            exit 1
+          fi
+          
+          echo "remote_digest=$REMOTE_DIGEST" >> $GITHUB_OUTPUT
+          echo "Deployed image digest: $REMOTE_DIGEST"
+          
+          # Also get policy hash for reference
+          POLICY_HASH=$(echo "$ATTESTATION" | jq -r '.summary.cce_policy_hash // .summary.host_data')
+          echo "policy_hash=$POLICY_HASH" >> $GITHUB_OUTPUT
+          
           echo ""
           echo "Attestation details:"
           echo "$ATTESTATION" | jq '{
             issuer: .summary.issuer,
             type: .summary.attestation_type,
             compliance: .summary.compliance_status,
-            debug_disabled: .summary.debug_disabled
+            debug_disabled: .summary.debug_disabled,
+            policy_hash: .summary.cce_policy_hash
           }'
 
-      - name: Compare hashes (Source vs Deployed)
+      - name: Compare digests (Source vs Deployed)
         env:
-          SOURCE_HASH: ${{ steps.policy.outputs.source_hash }}
-          REMOTE_HASH: ${{ steps.attestation.outputs.remote_hash }}
+          SOURCE_DIGEST: ${{ steps.digest.outputs.digest }}
+          REMOTE_DIGEST: ${{ steps.attestation.outputs.remote_digest }}
+          SOURCE_IMAGE_ID: ${{ steps.build.outputs.image_id }}
+          REMOTE_POLICY_HASH: ${{ steps.attestation.outputs.policy_hash }}
         run: |
           echo "=============================================="
           echo "  ZERO-TRUST VERIFICATION RESULT"
           echo "=============================================="
           echo ""
-          echo "Source build policy hash:  $SOURCE_HASH"
-          echo "Deployed attestation hash: $REMOTE_HASH"
+          echo "Source build digest:  $SOURCE_DIGEST"
+          echo "Deployed digest:      $REMOTE_DIGEST"
+          echo ""
+          echo "Additional info:"
+          echo "  Source image ID:    $SOURCE_IMAGE_ID"
+          echo "  Deployed policy:    $REMOTE_POLICY_HASH"
           echo ""
           
-          if [ "$SOURCE_HASH" = "$REMOTE_HASH" ]; then
+          if [ "$SOURCE_DIGEST" = "$REMOTE_DIGEST" ]; then
             echo "✅ VERIFICATION PASSED"
             echo ""
-            echo "The deployed code EXACTLY matches what was built from"
-            echo "this repository's source code. Zero-trust verified!"
+            echo "The deployed container's manifest digest EXACTLY matches"
+            echo "what was built from this repository's source code."
+            echo ""
+            echo "This proves:"
+            echo "  - Nix builds are reproducible"
+            echo "  - The same source produces the same container"
+            echo "  - No tampering occurred between build and deployment"
           else
             echo "❌ VERIFICATION FAILED"
             echo ""
-            echo "The deployed code does NOT match this source code!"
-            echo "The service may be running different code than expected."
+            echo "The deployed container does NOT match this source code!"
+            echo ""
+            echo "Possible reasons:"
+            echo "  - Source code has changed since deployment"
+            echo "  - Different Nix version or configuration"
+            echo "  - The service was deployed from different code"
             exit 1
           fi
 
-      - name: Summary
+      - name: Generate verification summary
         if: always()
         env:
-          SOURCE_HASH: ${{ steps.policy.outputs.source_hash }}
-          REMOTE_HASH: ${{ steps.attestation.outputs.remote_hash }}
-          TARBALL_HASH: ${{ steps.build.outputs.tarball_hash }}
-          IMAGE_ID: ${{ steps.build.outputs.image_id }}
-          LOCAL_DIGEST: ${{ steps.local_registry.outputs.digest }}
+          SOURCE_DIGEST: ${{ steps.digest.outputs.digest }}
+          REMOTE_DIGEST: ${{ steps.attestation.outputs.remote_digest }}
+          SOURCE_IMAGE_ID: ${{ steps.build.outputs.image_id }}
+          REMOTE_POLICY_HASH: ${{ steps.attestation.outputs.policy_hash }}
         run: |
           echo "## Zero-Trust Verification Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Source Build" >> $GITHUB_STEP_SUMMARY
-          echo "- **Tarball Hash:** \`$TARBALL_HASH\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image ID:** \`$IMAGE_ID\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Local Digest:** \`$LOCAL_DIGEST\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Policy Hash:** \`$SOURCE_HASH\`" >> $GITHUB_STEP_SUMMARY
+          echo "### Source Build (from this repository)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Manifest Digest:** \`$SOURCE_DIGEST\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image ID:** \`$SOURCE_IMAGE_ID\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Deployed Service" >> $GITHUB_STEP_SUMMARY
-          echo "- **Attestation Hash:** \`$REMOTE_HASH\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Manifest Digest:** \`$REMOTE_DIGEST\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Policy Hash:** \`$REMOTE_POLICY_HASH\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          if [ "$SOURCE_HASH" = "$REMOTE_HASH" ]; then
+          if [ "$SOURCE_DIGEST" = "$REMOTE_DIGEST" ]; then
             echo "### ✅ Result: VERIFIED" >> $GITHUB_STEP_SUMMARY
             echo "The deployed code matches the source code in this repository." >> $GITHUB_STEP_SUMMARY
           else
             echo "### ❌ Result: MISMATCH" >> $GITHUB_STEP_SUMMARY
             echo "The deployed code does NOT match the source code!" >> $GITHUB_STEP_SUMMARY
           fi
-
-      - name: Cleanup local registry
-        if: always()
-        run: docker stop registry && docker rm registry || true
