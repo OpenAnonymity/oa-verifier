@@ -51,59 +51,40 @@ jobs:
           echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
           echo "Source build image ID: $IMAGE_ID"
 
+      - name: Start local registry and get digest
+        id: local_registry
+        run: |
+          # Start a local registry
+          docker run -d -p 5000:5000 --name registry registry:2
+          sleep 3
+          
+          # Tag and push to local registry to get the manifest digest
+          docker tag oa-verifier:latest localhost:5000/oa-verifier:latest
+          docker push localhost:5000/oa-verifier:latest
+          
+          # Get the digest from the local registry
+          LOCAL_DIGEST=$(docker inspect localhost:5000/oa-verifier:latest --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
+          echo "digest=$LOCAL_DIGEST" >> $GITHUB_OUTPUT
+          echo "Local registry digest: $LOCAL_DIGEST"
+          
+          # Stop registry
+          docker stop registry && docker rm registry
+
       - name: Install Azure CLI and confcom
         run: |
           curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
           az extension add --name confcom --yes
 
-      - name: Log in to ACR
-        run: |
-          echo "${{ secrets.ACR_PASSWORD }}" | docker login oaverifieracr.azurecr.io -u "${{ secrets.ACR_USERNAME }}" --password-stdin
-
-      - name: Pull ACR image and verify against local build
-        id: verify
-        run: |
-          # Pull the deployed image from ACR
-          docker pull oaverifieracr.azurecr.io/oa-verifier:latest
-          
-          # Get both image IDs
-          LOCAL_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}')
-          ACR_ID=$(docker inspect oaverifieracr.azurecr.io/oa-verifier:latest --format='{{.Id}}')
-          
-          echo "Local Nix build ID: $LOCAL_ID"
-          echo "ACR image ID:       $ACR_ID"
-          
-          if [ "$LOCAL_ID" = "$ACR_ID" ]; then
-            echo "✅ Local Nix build matches ACR image EXACTLY!"
-            echo "This cryptographically proves ACR has the same image as our local build."
-          else
-            echo "❌ VERIFICATION FAILED: Image IDs differ!"
-            echo ""
-            echo "Local Nix build: $LOCAL_ID"
-            echo "ACR image:       $ACR_ID"
-            echo ""
-            echo "This means the deployed image is NOT built from this source code!"
-            echo "Either:"
-            echo "  1. ACR has a different/tampered image, or"
-            echo "  2. The source code has changed since deployment"
-            exit 1
-          fi
-          
-          # Get the ACR digest for policy generation
-          ACR_DIGEST=$(docker inspect oaverifieracr.azurecr.io/oa-verifier:latest --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
-          echo "digest=$ACR_DIGEST" >> $GITHUB_OUTPUT
-          echo "ACR image digest: $ACR_DIGEST"
-
-      - name: Generate CCE policy (from verified ACR image)
+      - name: Generate CCE policy (from local build)
         id: policy
         env:
-          ACR_DIGEST: ${{ steps.verify.outputs.digest }}
+          LOCAL_DIGEST: ${{ steps.local_registry.outputs.digest }}
         run: |
-          echo "Generating CCE policy from ACR image..."
-          echo "(We've already verified ACR image = local Nix build)"
+          echo "Generating CCE policy from local Nix build..."
+          echo "Using local digest: $LOCAL_DIGEST"
           
-          # Create template matching the deployed configuration
-          # Using the EXACT same image reference as deployment
+          # Create template using GHCR image reference (matches deployment)
+          # The digest from local build should match GHCR since Nix builds are reproducible
           cat > /tmp/verify-template.json << EOF
           {
             "\$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
@@ -118,7 +99,7 @@ jobs:
                 "containers": [{
                   "name": "oa-verifier",
                   "properties": {
-                    "image": "oaverifieracr.azurecr.io/oa-verifier@${ACR_DIGEST}",
+                    "image": "ghcr.io/${{ github.repository_owner }}/oa-verifier@${LOCAL_DIGEST}",
                     "ports": [{"port": 8443, "protocol": "TCP"}],
                     "environmentVariables": [
                       {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
@@ -135,11 +116,6 @@ jobs:
                     "resources": {"requests": {"cpu": 0.5, "memoryInGB": 1.0}}
                   }
                 }],
-                "imageRegistryCredentials": [{
-                  "server": "oaverifieracr.azurecr.io",
-                  "username": "${{ secrets.ACR_USERNAME }}",
-                  "password": "${{ secrets.ACR_PASSWORD }}"
-                }],
                 "ipAddress": {
                   "type": "Public",
                   "ports": [{"port": 8443, "protocol": "TCP"}],
@@ -153,7 +129,7 @@ jobs:
           }
           EOF
           
-          # Generate base policy - az confcom will pull from ACR (we've already verified it matches local)
+          # Generate base policy from local image
           az confcom acipolicygen -a /tmp/verify-template.json --approve-wildcards --disable-stdio
           
           # Extract and modify policy to add regex rules for dynamic env vars
@@ -259,12 +235,14 @@ jobs:
           REMOTE_HASH: ${{ steps.attestation.outputs.remote_hash }}
           TARBALL_HASH: ${{ steps.build.outputs.tarball_hash }}
           IMAGE_ID: ${{ steps.build.outputs.image_id }}
+          LOCAL_DIGEST: ${{ steps.local_registry.outputs.digest }}
         run: |
           echo "## Zero-Trust Verification Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Source Build" >> $GITHUB_STEP_SUMMARY
           echo "- **Tarball Hash:** \`$TARBALL_HASH\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Image ID:** \`$IMAGE_ID\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Local Digest:** \`$LOCAL_DIGEST\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Policy Hash:** \`$SOURCE_HASH\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Deployed Service" >> $GITHUB_STEP_SUMMARY
