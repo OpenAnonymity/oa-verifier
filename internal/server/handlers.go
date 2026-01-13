@@ -695,15 +695,28 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 
 	issuer, _ := claims["iss"].(string)
 
-	// Get expected container digest from env (set during deployment)
-	expectedDigest := os.Getenv("CONTAINER_DIGEST")
-	if expectedDigest == "" {
-		expectedDigest = "sha256:<build-and-record-digest>"
-	}
-
 	// Include TLS hash in summary for channel binding verification
 	if s.tlsPubKeyHash != "" {
 		summary["tls_pubkey_hash"] = s.tlsPubKeyHash
+	}
+
+	// Get CCE policy from environment (set at deployment time)
+	// This allows users to verify: sha256(policy) == summary.cce_policy_hash
+	policyB64 := os.Getenv("CCE_POLICY_B64")
+	var policyDecoded string
+	if policyB64 != "" {
+		if decoded, err := base64.StdEncoding.DecodeString(policyB64); err == nil {
+			policyDecoded = string(decoded)
+		}
+	}
+
+	// Build policy response - enables zero-trust verification without registry access
+	policyResponse := map[string]any{
+		"available": policyB64 != "",
+	}
+	if policyB64 != "" {
+		policyResponse["base64"] = policyB64
+		policyResponse["decoded"] = policyDecoded
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -711,20 +724,19 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 		"timestamp": utcNow(),
 		"nonce":     nonce,
 		"summary":   summary,
+		"policy":    policyResponse,
 		"verify_at": issuer + "/certs",
 		"verification": map[string]any{
 			"how_to_verify": []string{
 				"1. Verify JWT signature using keys from verify_at URL (must be *.attest.azure.net)",
-				"2. Check tls_hash in JWT matches SHA256 of server's TLS public key (channel binding)",
-				"3. Get the CCE policy from our GitHub repo",
-				"4. Compute sha256(policy) and compare to summary.cce_policy_hash",
-				"5. Check the policy specifies the expected container digest",
-				"6. Build container from source and verify digest matches policy",
+				"2. Compute sha256(policy.decoded) - must equal summary.cce_policy_hash",
+				"3. Policy is now VERIFIED by hardware - audit it to see what's running",
+				"4. (Optional) Check tls_pubkey_hash matches server's TLS cert for channel binding",
 			},
-			"what_host_data_proves":     "SHA256 hash of CCE policy - proves which container is allowed to run",
-			"what_tls_hash_proves":      "SHA256 hash of TLS public key - proves you're talking directly to the enclave (not a proxy)",
-			"expected_container_digest": expectedDigest,
-			"policy_source":             "https://github.com/openanonymity/oa-verifier",
+			"what_policy_proves": "The exact CCE policy enforced by Azure hardware - contains layers, command, env vars, capabilities",
+			"what_host_data_proves":    "SHA256 hash of CCE policy - proves which container is allowed to run",
+			"what_tls_hash_proves":     "SHA256 hash of TLS public key - proves you're talking directly to the enclave",
+			"zero_trust_verification":  "sha256(policy.decoded) == summary.cce_policy_hash proves policy authenticity",
 		},
 	})
 }

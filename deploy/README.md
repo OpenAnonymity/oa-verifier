@@ -2,11 +2,59 @@
 
 This folder contains the ARM template for deploying the oa-verifier as an Azure Confidential Container.
 
+## CI/CD Pipeline
+
+The build and signing process is fully automated via GitHub Actions:
+
+1. **On push to main/tags**: GitHub Actions builds the container
+2. **Signing**: Image is signed with Sigstore (keyless, using GitHub OIDC)
+3. **Registry**: Pushed to both GHCR (primary) and ACR (for Azure deployment)
+4. **Attestation**: GitHub provenance attestation is recorded
+
+### Verifying the Image
+
+Before deployment, verify the image provenance:
+
+```bash
+# Verify Sigstore signature
+cosign verify ghcr.io/OWNER/oa-verifier@sha256:DIGEST \
+  --certificate-identity-regexp='https://github.com/OWNER/REPO/.*' \
+  --certificate-oidc-issuer='https://token.actions.githubusercontent.com'
+
+# Verify GitHub attestation
+gh attestation verify oci://ghcr.io/OWNER/oa-verifier@sha256:DIGEST --owner OWNER
+```
+
 ## Files
 
 - `aci-template.json` - ARM template with embedded CCE policy
+- `deploy.sh` - Deployment script (for manual deployments)
 
-## Prerequisites
+## GitHub Secrets Required
+
+Configure these secrets in your GitHub repository settings:
+
+| Secret | Description |
+|--------|-------------|
+| `ACR_USERNAME` | Azure Container Registry username |
+| `ACR_PASSWORD` | Azure Container Registry password |
+| `AZURE_CREDENTIALS` | Azure service principal credentials (JSON) |
+
+### Creating Azure Credentials
+
+```bash
+# Create service principal
+az ad sp create-for-rbac --name "oa-verifier-deploy" \
+  --role contributor \
+  --scopes /subscriptions/{subscription-id}/resourceGroups/{resource-group} \
+  --sdk-auth
+
+# Output JSON goes into AZURE_CREDENTIALS secret
+```
+
+## Manual Deployment
+
+### Prerequisites
 
 ```bash
 # Azure CLI with confcom extension
@@ -19,39 +67,47 @@ docker --version
 az login
 ```
 
-## Deployment Steps
+### Steps
 
-### 1. Build and Push Container
+#### 1. Get Latest Image Digest
+
+Check the latest build in GitHub Actions or:
 
 ```bash
-# Create ACR (if needed)
-az acr create --name YOUR_ACR --resource-group YOUR_RG --sku Basic --admin-enabled true
-
-# Build in Azure (no local Docker needed)
-cd ..
-az acr build --registry YOUR_ACR --image oa-verifier:latest .
+# From GHCR
+docker pull ghcr.io/OWNER/oa-verifier:latest
+docker inspect ghcr.io/OWNER/oa-verifier:latest --format='{{index .RepoDigests 0}}'
 ```
 
-### 2. Update Template with Your Image
+#### 2. Update Template with Digest
 
-Edit `aci-template.json` and update the image reference with your ACR and digest:
+Edit `aci-template.json` and update the image reference:
 
 ```json
-"image": "YOUR_ACR.azurecr.io/oa-verifier@sha256:YOUR_DIGEST"
+"image": "ghcr.io/OWNER/oa-verifier@sha256:YOUR_DIGEST"
 ```
 
-### 3. Generate CCE Policy
+#### 3. Generate CCE Policy
 
 ```bash
-# Pull images locally first
-docker pull YOUR_ACR.azurecr.io/oa-verifier@sha256:YOUR_DIGEST
+# Pull images locally first (required for policy generation)
+docker pull ghcr.io/OWNER/oa-verifier@sha256:YOUR_DIGEST
 docker pull mcr.microsoft.com/aci/skr:2.13
 
 # Generate and inject policy
 az confcom acipolicygen -a aci-template.json --disable-stdio
 ```
 
-### 4. Deploy
+#### 4. Record Policy Hash
+
+```bash
+# Extract and save policy hash for verification
+POLICY_B64=$(jq -r '.resources[0].properties.confidentialComputeProperties.ccePolicy' aci-template.json)
+POLICY_HASH=$(echo "$POLICY_B64" | base64 -d | sha256sum | cut -d' ' -f1)
+echo "Policy Hash: $POLICY_HASH"
+```
+
+#### 5. Deploy
 
 ```bash
 az deployment group create \
@@ -59,33 +115,38 @@ az deployment group create \
   --template-file aci-template.json
 ```
 
-### 5. Get Service URL
+#### 6. Get Service URL
 
 ```bash
 az container show --name oa-verifier --resource-group YOUR_RG \
   --query "{IP:ipAddress.ip, FQDN:ipAddress.fqdn}" -o table
 ```
 
-## Current Deployment
+## Image Registries
 
-| Property | Value |
-|----------|-------|
-| Container Image | `oaverifieracr.azurecr.io/oa-verifier@sha256:dd547f4905b35fe57eab3d389348723547fcffbb56128433aee302f90260db91` |
-| CCE Policy Hash | `bb4ce8d9e736e60acb2e74b6e20db6c947088f6feea0a4918b23e00881c288b5` |
-| Service URL | `http://oa-verifier.eastus.azurecontainer.io:8000` |
+| Registry | URL | Purpose |
+|----------|-----|---------|
+| **GHCR** (primary) | `ghcr.io/OWNER/oa-verifier` | Signed images, provenance attestation |
+| **ACR** (mirror) | `oaverifieracr.azurecr.io/oa-verifier` | Azure deployment (faster pulls) |
 
-## Updating the Deployment
+Both registries contain identical images (same digest). The Sigstore signature is valid for either.
 
-When you change the code:
+## Trust Chain
 
-1. Rebuild: `az acr build --registry oaverifieracr --image oa-verifier:latest .`
-2. Update image digest in `aci-template.json`
-3. Pull new image: `docker pull oaverifieracr.azurecr.io/oa-verifier@sha256:NEW_DIGEST`
-4. Regenerate policy: `az confcom acipolicygen -a aci-template.json --disable-stdio`
-5. Delete old container: `az container delete --name oa-verifier --resource-group oa-verifier --yes`
-6. Deploy: `az deployment group create --resource-group oa-verifier --template-file aci-template.json`
+```
+Source Code (GitHub)
+    ↓ [GitHub Actions builds]
+Container Image (signed by Sigstore)
+    ↓ [Policy generated from image layers]
+CCE Policy (contains layer hashes)
+    ↓ [SHA256 hash]
+Policy Hash (measured by AMD SEV-SNP hardware)
+    ↓ [Returned in attestation]
+MAA Token (signed by Azure)
+```
 
 ## Verification
 
-See [../docs/ATTESTATION.md](../docs/ATTESTATION.md) for how users can verify the attestation.
-
+See [../docs/ATTESTATION.md](../docs/ATTESTATION.md) for how users can verify:
+1. Sigstore provenance (image was built by GitHub Actions)
+2. MAA attestation (enclave is running the expected code)

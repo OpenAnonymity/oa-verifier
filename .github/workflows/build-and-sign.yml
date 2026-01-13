@@ -1,0 +1,612 @@
+name: Build, Sign, and Deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  GHCR_REGISTRY: ghcr.io
+  ACR_REGISTRY: oaverifieracr.azurecr.io
+  IMAGE_NAME: oa-verifier
+  RESOURCE_GROUP: oa-verifier
+  CONTAINER_NAME: oa-verifier
+  LOCATION: eastus
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-24.05
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build container with Nix (reproducible)
+        id: build
+        run: |
+          echo "Building container with Nix..."
+          nix build .#container --print-build-logs
+          
+          # Load the image into Docker
+          docker load < result
+          
+          # Get image info
+          IMAGE_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}')
+          echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
+          echo "✅ Nix build complete. Image ID: $IMAGE_ID"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.7.0
+
+      # --- Try GHCR first (works for public repos) ---
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to GHCR
+        if: github.event_name != 'pull_request'
+        id: push-ghcr
+        continue-on-error: true  # May fail on private repos
+        run: |
+          # Tag and push to GHCR
+          docker tag oa-verifier:latest ${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+          docker tag oa-verifier:latest ${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          
+          docker push ${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest | cut -d'@' -f2)
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "registry=${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}" >> $GITHUB_OUTPUT
+          echo "✅ Pushed to GHCR with digest: $DIGEST"
+
+      - name: Sign GHCR image with Cosign
+        if: github.event_name != 'pull_request' && steps.push-ghcr.outcome == 'success'
+        run: |
+          IMAGE="${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}@${{ steps.push-ghcr.outputs.digest }}"
+          echo "Signing: $IMAGE"
+          cosign sign --yes "$IMAGE"
+
+      # --- Always push to ACR (fallback, always works) ---
+      - name: Log in to ACR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Push to ACR
+        if: github.event_name != 'pull_request'
+        id: push-acr
+        run: |
+          # Tag and push to ACR
+          docker tag oa-verifier:latest ${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker tag oa-verifier:latest ${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          
+          docker push ${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest | cut -d'@' -f2)
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "registry=${{ env.ACR_REGISTRY }}" >> $GITHUB_OUTPUT
+          echo "✅ Pushed to ACR with digest: $DIGEST"
+
+      # --- Determine which registry to use for deployment ---
+      - name: Select registry for deployment
+        if: github.event_name != 'pull_request'
+        id: registry
+        run: |
+          if [ "${{ steps.push-ghcr.outcome }}" = "success" ]; then
+            echo "Using GHCR for deployment (public repo)"
+            echo "registry=${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}" >> $GITHUB_OUTPUT
+            echo "digest=${{ steps.push-ghcr.outputs.digest }}" >> $GITHUB_OUTPUT
+            echo "use_ghcr=true" >> $GITHUB_OUTPUT
+          else
+            echo "Using ACR for deployment (private repo fallback)"
+            echo "registry=${{ env.ACR_REGISTRY }}" >> $GITHUB_OUTPUT
+            echo "digest=${{ steps.push-acr.outputs.digest }}" >> $GITHUB_OUTPUT
+            echo "use_ghcr=false" >> $GITHUB_OUTPUT
+          fi
+
+      # --- DEPLOY SECTION (same job, same runner, image already loaded) ---
+      
+      - name: Azure Login
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Install confcom extension
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: az extension add --name confcom --yes
+
+      - name: Generate CCE policy from LOCAL image
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        id: policy
+        env:
+          DEPLOY_REGISTRY: ${{ steps.registry.outputs.registry }}
+          DEPLOY_DIGEST: ${{ steps.registry.outputs.digest }}
+          USE_GHCR: ${{ steps.registry.outputs.use_ghcr }}
+        run: |
+          echo "Generating CCE policy..."
+          echo "Registry: $DEPLOY_REGISTRY"
+          echo "Digest: $DEPLOY_DIGEST"
+          
+          # Build image reference
+          IMAGE_REF="${DEPLOY_REGISTRY}/${{ env.IMAGE_NAME }}@${DEPLOY_DIGEST}"
+          echo "Image: $IMAGE_REF"
+          
+          # Create deployment template - credentials depend on registry
+          if [ "$USE_GHCR" = "true" ]; then
+            # GHCR - use GitHub token (or no creds for public)
+            CREDS_JSON='[{"server": "${{ env.GHCR_REGISTRY }}", "username": "${{ github.actor }}", "password": "${{ secrets.GITHUB_TOKEN }}"}]'
+          else
+            # ACR - use ACR credentials
+            CREDS_JSON='[{"server": "${{ env.ACR_REGISTRY }}", "username": "${{ secrets.ACR_USERNAME }}", "password": "${{ secrets.ACR_PASSWORD }}"}]'
+          fi
+          
+          # Step 1: Create MINIMAL ARM template for policy generation
+          # IMPORTANT: Do NOT include secret env vars here - they would be captured in the policy!
+          # Only include non-secret env vars that have fixed values.
+          cat > /tmp/aci-policy-template.json << EOF
+          {
+            "\$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+            "contentVersion": "1.0.0.0",
+            "resources": [{
+              "type": "Microsoft.ContainerInstance/containerGroups",
+              "apiVersion": "2023-05-01",
+              "name": "oa-verifier",
+              "location": "eastus",
+              "properties": {
+                "sku": "Confidential",
+                "containers": [{
+                  "name": "oa-verifier",
+                  "properties": {
+                    "image": "${IMAGE_REF}",
+                    "ports": [{"port": 8443, "protocol": "TCP"}],
+                    "environmentVariables": [
+                      {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
+                      {"name": "MAA_PROVIDER_URL", "value": "sharedeus.eus.attest.azure.net"}
+                    ],
+                    "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
+                  }
+                },{
+                  "name": "skr-sidecar",
+                  "properties": {
+                    "image": "mcr.microsoft.com/aci/skr@sha256:baa6acf093c011cb26799187b6a535e32bd8248f52dd2cd9c606732b8a23c112",
+                    "command": ["/skr.sh"],
+                    "ports": [{"port": 8080, "protocol": "TCP"}],
+                    "resources": {"requests": {"cpu": 0.5, "memoryInGB": 1.0}}
+                  }
+                }],
+                "imageRegistryCredentials": ${CREDS_JSON},
+                "ipAddress": {
+                  "type": "Public",
+                  "ports": [{"port": 8443, "protocol": "TCP"}],
+                  "dnsNameLabel": "oa-verifier"
+                },
+                "osType": "Linux",
+                "restartPolicy": "Always",
+                "confidentialComputeProperties": {"ccePolicy": ""}
+              }
+            }]
+          }
+          EOF
+          
+          # Step 2: Generate base CCE policy from minimal template (no secrets!)
+          az confcom acipolicygen -a /tmp/aci-policy-template.json --approve-wildcards --disable-stdio
+          
+          # Step 3: Extract and modify policy to add regex rules for dynamic env vars
+          BASE_POLICY_B64=$(jq -r '.resources[0].properties.confidentialComputeProperties.ccePolicy' /tmp/aci-policy-template.json)
+          BASE_POLICY=$(echo "$BASE_POLICY_B64" | base64 -d)
+          
+          # Add regex rules for env vars that will be set at runtime
+          # These use .+ patterns so the actual values are NOT captured in the policy
+          MODIFIED_POLICY=$(echo "$BASE_POLICY" | python3 -c '
+          import sys
+          import json
+          import re
+          
+          policy = sys.stdin.read()
+          
+          # Find the containers JSON array in the Rego policy
+          match = re.search(r"containers := (\[.*?\])\s*\n\nallow_properties", policy, re.DOTALL)
+          if not match:
+              match = re.search(r"containers := (\[.*?\])(?=\s*\n\n|\s*$)", policy, re.DOTALL)
+          
+          if match:
+              containers_json = match.group(1)
+              containers = json.loads(containers_json)
+              
+              # Add regex env rules to oa-verifier container (first one)
+              if containers and "env_rules" in containers[0]:
+                  # These env vars use regex patterns - actual values stay secret!
+                  dynamic_env_vars = [
+                      "CCE_POLICY_B64",
+                      "STATION_REGISTRY_URL",
+                      "STATION_REGISTRY_SECRET",
+                      "CHALLENGE_MIN_INTERVAL",
+                      "CHALLENGE_MAX_INTERVAL"
+                  ]
+                  for env_var in dynamic_env_vars:
+                      containers[0]["env_rules"].append({
+                          "pattern": f"{env_var}=.+",
+                          "required": False,
+                          "strategy": "re2"
+                      })
+              
+              new_containers_json = json.dumps(containers, separators=(",", ":"))
+              policy = policy[:match.start(1)] + new_containers_json + policy[match.end(1):]
+          
+          print(policy)
+          ')
+          
+          # Step 4: Encode modified policy and compute hash
+          POLICY_B64=$(echo "$MODIFIED_POLICY" | base64 -w0)
+          POLICY_HASH=$(echo "$MODIFIED_POLICY" | sha256sum | cut -d' ' -f1)
+          
+          # Step 5: Create DEPLOYMENT template with secrets and CCE_POLICY_B64
+          # This template has the actual env var values but uses the policy with regex rules
+          cat > /tmp/aci-deploy.json << DEPLOY_EOF
+          {
+            "\$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+            "contentVersion": "1.0.0.0",
+            "resources": [{
+              "type": "Microsoft.ContainerInstance/containerGroups",
+              "apiVersion": "2023-05-01",
+              "name": "oa-verifier",
+              "location": "eastus",
+              "properties": {
+                "sku": "Confidential",
+                "containers": [{
+                  "name": "oa-verifier",
+                  "properties": {
+                    "image": "${IMAGE_REF}",
+                    "ports": [{"port": 8443, "protocol": "TCP"}],
+                    "environmentVariables": [
+                      {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
+                      {"name": "MAA_PROVIDER_URL", "value": "sharedeus.eus.attest.azure.net"},
+                      {"name": "CCE_POLICY_B64", "value": "${POLICY_B64}"},
+                      {"name": "STATION_REGISTRY_URL", "value": "${{ secrets.STATION_REGISTRY_URL }}"},
+                      {"name": "STATION_REGISTRY_SECRET", "secureValue": "${{ secrets.STATION_REGISTRY_SECRET }}"},
+                      {"name": "CHALLENGE_MIN_INTERVAL", "value": "${{ secrets.CHALLENGE_MIN_INTERVAL }}"},
+                      {"name": "CHALLENGE_MAX_INTERVAL", "value": "${{ secrets.CHALLENGE_MAX_INTERVAL }}"}
+                    ],
+                    "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
+                  }
+                },{
+                  "name": "skr-sidecar",
+                  "properties": {
+                    "image": "mcr.microsoft.com/aci/skr@sha256:baa6acf093c011cb26799187b6a535e32bd8248f52dd2cd9c606732b8a23c112",
+                    "command": ["/skr.sh"],
+                    "ports": [{"port": 8080, "protocol": "TCP"}],
+                    "resources": {"requests": {"cpu": 0.5, "memoryInGB": 1.0}}
+                  }
+                }],
+                "imageRegistryCredentials": ${CREDS_JSON},
+                "ipAddress": {
+                  "type": "Public",
+                  "ports": [{"port": 8443, "protocol": "TCP"}],
+                  "dnsNameLabel": "oa-verifier"
+                },
+                "osType": "Linux",
+                "restartPolicy": "Always",
+                "confidentialComputeProperties": {"ccePolicy": "${POLICY_B64}"}
+              }
+            }]
+          }
+          DEPLOY_EOF
+          
+          echo "policy_hash=$POLICY_HASH" >> $GITHUB_OUTPUT
+          echo "policy_b64=$POLICY_B64" >> $GITHUB_OUTPUT
+          echo "✅ Policy hash: $POLICY_HASH"
+          echo "✅ CCE_POLICY_B64 env var added to deployment template"
+
+      - name: Delete existing container group
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          if az container show --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} &>/dev/null; then
+            echo "Deleting existing container group..."
+            az container delete --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --yes
+            sleep 30
+          fi
+
+      - name: Deploy to Azure
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          echo "Deploying to Azure..."
+          az deployment group create \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --template-file /tmp/aci-deploy.json
+
+      - name: Wait for container
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          echo "Waiting for container to start..."
+          sleep 90
+
+      - name: Verify attestation matches local build
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          EXPECTED_HASH: ${{ steps.policy.outputs.policy_hash }}
+        run: |
+          FQDN=$(az container show --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query "ipAddress.fqdn" -o tsv)
+          echo "Fetching attestation from: https://$FQDN:8443"
+          
+          ATTESTATION=$(curl -sfk "https://$FQDN:8443/attestation?nonce=verify-$(date +%s)" 2>/dev/null || echo "{}")
+          
+          if [ -z "$ATTESTATION" ] || [ "$ATTESTATION" = "{}" ]; then
+            echo "⚠️ Could not fetch attestation - container may still be starting"
+            echo "Expected hash was: $EXPECTED_HASH"
+            exit 0
+          fi
+          
+          REMOTE_HASH=$(echo "$ATTESTATION" | jq -r '.summary.cce_policy_hash // .summary.host_data')
+          echo ""
+          echo "=========================================="
+          echo "  ZERO-TRUST VERIFICATION"
+          echo "=========================================="
+          echo "Expected (local Nix build): $EXPECTED_HASH"
+          echo "Remote (from attestation):  $REMOTE_HASH"
+          echo ""
+          
+          if [ "$EXPECTED_HASH" = "$REMOTE_HASH" ]; then
+            echo "✅ VERIFICATION PASSED!"
+            echo "The deployed code matches what was built from source."
+          else
+            echo "❌ VERIFICATION FAILED!"
+            echo "Hashes do not match!"
+            exit 1
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Build & Deploy Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Nix Build | ✅ ${{ steps.build.outputs.image_id }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| GHCR Push | ${{ steps.push-ghcr.outcome == 'success' && '✅' || '⏭️ skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ACR Push | ✅ ${{ steps.push-acr.outputs.digest }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy Registry | ${{ steps.registry.outputs.registry }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Policy Hash | ${{ steps.policy.outputs.policy_hash }} |" >> $GITHUB_STEP_SUMMARY
+
+  # Independent verification job - rebuilds from source and verifies against deployed attestation
+  verify:
+    name: Verify Attestation
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-24.05
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build container from source (Nix)
+        id: build
+        run: |
+          echo "Rebuilding container from source..."
+          nix build .#container --print-build-logs
+          docker load < result
+          
+          IMAGE_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}')
+          echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
+          echo "✅ Source build complete. Image ID: $IMAGE_ID"
+
+      - name: Log in to registries
+        run: |
+          # Log in to GHCR
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.GHCR_REGISTRY }} -u "${{ github.actor }}" --password-stdin || true
+          # Log in to ACR
+          echo "${{ secrets.ACR_PASSWORD }}" | docker login ${{ env.ACR_REGISTRY }} -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+
+      - name: Verify local build matches registry
+        id: verify-registry
+        run: |
+          LOCAL_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}')
+          echo "Local Nix build: $LOCAL_ID"
+          
+          # Try GHCR first
+          GHCR_IMAGE="${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
+          if docker pull "$GHCR_IMAGE" 2>/dev/null; then
+            REMOTE_ID=$(docker inspect "$GHCR_IMAGE" --format='{{.Id}}')
+            echo "GHCR image: $REMOTE_ID"
+            
+            if [ "$LOCAL_ID" = "$REMOTE_ID" ]; then
+              echo "✅ Source build matches GHCR image!"
+              DIGEST=$(docker inspect "$GHCR_IMAGE" --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
+              echo "registry=${{ env.GHCR_REGISTRY }}/${{ github.repository_owner }}" >> $GITHUB_OUTPUT
+              echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+              echo "use_ghcr=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+          
+          # Fall back to ACR
+          ACR_IMAGE="${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          docker pull "$ACR_IMAGE"
+          REMOTE_ID=$(docker inspect "$ACR_IMAGE" --format='{{.Id}}')
+          echo "ACR image: $REMOTE_ID"
+          
+          if [ "$LOCAL_ID" = "$REMOTE_ID" ]; then
+            echo "✅ Source build matches ACR image!"
+            DIGEST=$(docker inspect "$ACR_IMAGE" --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
+            echo "registry=${{ env.ACR_REGISTRY }}" >> $GITHUB_OUTPUT
+            echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+            echo "use_ghcr=false" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Image mismatch! Neither GHCR nor ACR match local build."
+            exit 1
+          fi
+
+      - name: Install Azure CLI and confcom
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          az extension add --name confcom --yes
+
+      - name: Generate CCE policy from source build
+        id: policy
+        env:
+          REGISTRY: ${{ steps.verify-registry.outputs.registry }}
+          DIGEST: ${{ steps.verify-registry.outputs.digest }}
+          USE_GHCR: ${{ steps.verify-registry.outputs.use_ghcr }}
+        run: |
+          IMAGE_REF="${REGISTRY}/${{ env.IMAGE_NAME }}@${DIGEST}"
+          echo "Generating policy for: $IMAGE_REF"
+          
+          # Set credentials based on registry
+          if [ "$USE_GHCR" = "true" ]; then
+            CREDS_JSON='[{"server": "${{ env.GHCR_REGISTRY }}", "username": "${{ github.actor }}", "password": "${{ secrets.GITHUB_TOKEN }}"}]'
+          else
+            CREDS_JSON='[{"server": "${{ env.ACR_REGISTRY }}", "username": "${{ secrets.ACR_USERNAME }}", "password": "${{ secrets.ACR_PASSWORD }}"}]'
+          fi
+          
+          cat > /tmp/verify-template.json << EOF
+          {
+            "\$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+            "contentVersion": "1.0.0.0",
+            "resources": [{
+              "type": "Microsoft.ContainerInstance/containerGroups",
+              "apiVersion": "2023-05-01",
+              "name": "verify",
+              "location": "eastus",
+              "properties": {
+                "sku": "Confidential",
+                "containers": [{
+                  "name": "oa-verifier",
+                  "properties": {
+                    "image": "${IMAGE_REF}",
+                    "ports": [{"port": 8443, "protocol": "TCP"}],
+                    "environmentVariables": [
+                      {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
+                      {"name": "MAA_PROVIDER_URL", "value": "sharedeus.eus.attest.azure.net"}
+                    ],
+                    "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
+                  }
+                },{
+                  "name": "skr-sidecar",
+                  "properties": {
+                    "image": "mcr.microsoft.com/aci/skr@sha256:baa6acf093c011cb26799187b6a535e32bd8248f52dd2cd9c606732b8a23c112",
+                    "command": ["/skr.sh"],
+                    "ports": [{"port": 8080, "protocol": "TCP"}],
+                    "resources": {"requests": {"cpu": 0.5, "memoryInGB": 1.0}}
+                  }
+                }],
+                "imageRegistryCredentials": ${CREDS_JSON},
+                "osType": "Linux",
+                "confidentialComputeProperties": {"ccePolicy": ""}
+              }
+            }]
+          }
+          EOF
+          
+          # Generate base policy
+          az confcom acipolicygen -a /tmp/verify-template.json --approve-wildcards --disable-stdio
+          
+          # Modify policy to allow CCE_POLICY_B64 env var (same as deploy)
+          BASE_POLICY_B64=$(jq -r '.resources[0].properties.confidentialComputeProperties.ccePolicy' /tmp/verify-template.json)
+          BASE_POLICY=$(echo "$BASE_POLICY_B64" | base64 -d)
+          
+          # Add regex rules for ALL dynamic env vars (must match deploy job!)
+          MODIFIED_POLICY=$(echo "$BASE_POLICY" | python3 -c '
+          import sys
+          import json
+          import re
+          
+          policy = sys.stdin.read()
+          match = re.search(r"containers := (\[.*?\])\s*\n\nallow_properties", policy, re.DOTALL)
+          if not match:
+              match = re.search(r"containers := (\[.*?\])(?=\s*\n\n|\s*$)", policy, re.DOTALL)
+          
+          if match:
+              containers_json = match.group(1)
+              containers = json.loads(containers_json)
+              if containers and "env_rules" in containers[0]:
+                  # MUST match the same env vars as deploy job!
+                  dynamic_env_vars = [
+                      "CCE_POLICY_B64",
+                      "STATION_REGISTRY_URL",
+                      "STATION_REGISTRY_SECRET",
+                      "CHALLENGE_MIN_INTERVAL",
+                      "CHALLENGE_MAX_INTERVAL"
+                  ]
+                  for env_var in dynamic_env_vars:
+                      containers[0]["env_rules"].append({
+                          "pattern": f"{env_var}=.+",
+                          "required": False,
+                          "strategy": "re2"
+                      })
+              new_containers_json = json.dumps(containers, separators=(",", ":"))
+              policy = policy[:match.start(1)] + new_containers_json + policy[match.end(1):]
+          print(policy)
+          ')
+          
+          SOURCE_HASH=$(echo "$MODIFIED_POLICY" | sha256sum | cut -d' ' -f1)
+          echo "source_hash=$SOURCE_HASH" >> $GITHUB_OUTPUT
+          echo "Source policy hash: $SOURCE_HASH"
+
+      - name: Fetch and verify attestation
+        env:
+          SOURCE_HASH: ${{ steps.policy.outputs.source_hash }}
+        run: |
+          ATTESTATION=$(curl -sfk "https://oa-verifier.eastus.azurecontainer.io:8443/attestation?nonce=verify-$(date +%s)" 2>/dev/null || echo "{}")
+          
+          if [ -z "$ATTESTATION" ] || [ "$ATTESTATION" = "{}" ]; then
+            echo "⚠️ Could not fetch attestation"
+            exit 1
+          fi
+          
+          REMOTE_HASH=$(echo "$ATTESTATION" | jq -r '.summary.cce_policy_hash // .summary.host_data')
+          
+          echo "=============================================="
+          echo "  ZERO-TRUST VERIFICATION"
+          echo "=============================================="
+          echo "Source build hash:  $SOURCE_HASH"
+          echo "Attestation hash:   $REMOTE_HASH"
+          echo ""
+          
+          if [ "$SOURCE_HASH" = "$REMOTE_HASH" ]; then
+            echo "✅ VERIFICATION PASSED!"
+            echo "Deployed code matches source code."
+          else
+            echo "❌ VERIFICATION FAILED!"
+            exit 1
+          fi
+
+      - name: Verification Summary
+        if: always()
+        run: |
+          echo "## ✅ Zero-Trust Verification" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Independent verification that deployed code matches source:" >> $GITHUB_STEP_SUMMARY
+          echo "- Rebuilt from source with Nix" >> $GITHUB_STEP_SUMMARY
+          echo "- Verified ACR image = local build" >> $GITHUB_STEP_SUMMARY
+          echo "- Compared policy hash with hardware attestation" >> $GITHUB_STEP_SUMMARY

@@ -2,6 +2,9 @@
 verifier
 *.exe
 
+# Rust
+target/
+
 # Cookies (sensitive)
 cookies.json
 
@@ -20,10 +23,6 @@ Thumbs.db
 # Persistent data
 banned_stations.json
 
-# Environment variables (secrets)
 .env
-deploy/.env
-
-# Deployment artifacts (generated, may contain secrets)
-deploy/aci-deploy.json
-deploy/policy-hash.txt
+result
+*.tar.gz
