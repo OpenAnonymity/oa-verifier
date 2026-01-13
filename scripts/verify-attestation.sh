@@ -19,7 +19,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Default endpoint
-ENDPOINT="${1:-https://oa-verifier.eastus.azurecontainer.io:8443}"
+ENDPOINT="${1:-https://oa-verifier.eastus.azurecontainer.io}"
 
 echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
 echo -e "${BLUE}       ZERO-TRUST ATTESTATION VERIFICATION${NC}"
@@ -62,7 +62,7 @@ echo -e "${BLUE}[2/6] Verifying TLS certificate binding...${NC}"
 # Extract host and port from endpoint
 HOST=$(echo "$ENDPOINT" | sed -E 's|https?://||' | cut -d':' -f1 | cut -d'/' -f1)
 PORT=$(echo "$ENDPOINT" | sed -E 's|https?://[^:]+:?||' | cut -d'/' -f1)
-PORT=${PORT:-8443}
+PORT=${PORT:-443}
 
 # Get TLS certificate and compute public key hash
 # Note: The hash must match how the server computes it (SHA256 of DER-encoded public key)

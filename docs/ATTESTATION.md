@@ -183,7 +183,7 @@ docker stop registry && docker rm registry
 NONCE=$(date +%s)
 
 # Fetch attestation from the service
-curl -sk "https://oa-verifier.eastus.azurecontainer.io:8443/attestation?nonce=$NONCE" > attestation.json
+curl -sk "https://oa-verifier.eastus.azurecontainer.io/attestation?nonce=$NONCE" > attestation.json
 
 # Pretty print to inspect
 cat attestation.json | jq
@@ -247,7 +247,7 @@ echo "=== Zero-Trust Verification ==="
 
 # Step 1: Fetch attestation
 NONCE=$(date +%s)
-curl -sk "https://oa-verifier.eastus.azurecontainer.io:8443/attestation?nonce=$NONCE" > attestation.json
+curl -sk "https://oa-verifier.eastus.azurecontainer.io/attestation?nonce=$NONCE" > attestation.json
 
 # Step 2: Verify policy hash (hardware verification)
 COMPUTED=$(jq -r '.policy.base64' attestation.json | base64 -d | sha256sum | cut -d' ' -f1)
@@ -299,7 +299,7 @@ If you trust GitHub Actions built the image correctly (don't need full zero-trus
 
 ```bash
 # Fetch and verify policy hash only
-curl -sk "https://oa-verifier.eastus.azurecontainer.io:8443/attestation?nonce=$(date +%s)" | \
+curl -sk "https://oa-verifier.eastus.azurecontainer.io/attestation?nonce=$(date +%s)" | \
   jq '{
     policy_verified: (.summary.host_data == (.policy.base64 | @base64d | @text | gsub("[\\n]"; "") | .)),
     image: (.policy.decoded | capture("\"id\":\"(?<img>[^\"]+)\"") | .img),
@@ -404,6 +404,6 @@ If verification passes:
 
 ## Reference
 
-- **Attestation Endpoint**: `https://oa-verifier.eastus.azurecontainer.io:8443/attestation?nonce=<your-nonce>`
+- **Attestation Endpoint**: `https://oa-verifier.eastus.azurecontainer.io/attestation?nonce=<your-nonce>`
 - **Azure Keys**: `https://sharedeus.eus.attest.azure.net/certs`
 - **Source Code**: `https://github.com/openanonymity/oa-verifier`

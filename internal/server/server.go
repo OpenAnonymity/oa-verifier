@@ -125,11 +125,10 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 	return srv.ListenAndServe()
 }
 
-// RunTLS starts HTTPS on port 8443.
+// RunTLS starts HTTPS on port 443.
 // If ACME is configured (TLS_DOMAIN, ACME_EMAIL, ACME_DNS_PROVIDER), obtains a Let's Encrypt certificate.
 // Otherwise, generates a self-signed certificate.
 // TLS terminates at this server (inside the enclave), not at Azure.
-// Uses port 8443 because ACI confidential containers cannot bind to port 443.
 func (s *Server) RunTLS(ctx context.Context) error {
 	var cert tls.Certificate
 	var pubKeyHash string
@@ -176,7 +175,7 @@ func (s *Server) RunTLS(ctx context.Context) error {
 		"domain", customDomain)
 
 	tlsSrv := &http.Server{
-		Addr:    ":8443",
+		Addr:    ":443",
 		Handler: s.Router(),
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
@@ -193,7 +192,7 @@ func (s *Server) RunTLS(ctx context.Context) error {
 		_ = tlsSrv.Shutdown(shutdownCtx)
 	}()
 
-	slog.Info("starting HTTPS server", "addr", ":8443", "cert_type", certType)
+	slog.Info("starting HTTPS server", "addr", ":443", "cert_type", certType)
 	return tlsSrv.ListenAndServeTLS("", "")
 }
 

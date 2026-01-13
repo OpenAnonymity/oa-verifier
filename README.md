@@ -22,8 +22,7 @@ For users who trust GitHub Actions:
 cargo install --git https://github.com/openanonymity/oa-verifier oa-verify
 
 # Verify the service
-oa-verify --url https://oa-verifier.eastus.azurecontainer.io:8443
-
+oa-verify --url https://oa-verifier.eastus.azurecontainer.io
 # Or use the web interface
 # https://openanonymity.github.io/oa-verifier/
 ```

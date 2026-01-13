@@ -17,7 +17,7 @@ on:
       service_url:
         description: 'Service URL to verify'
         required: true
-        default: 'https://oa-verifier.eastus.azurecontainer.io:8443'
+        default: 'https://oa-verifier.eastus.azurecontainer.io'
   
   # Daily verification
   schedule:
@@ -77,7 +77,7 @@ jobs:
       - name: Fetch attestation from deployed service
         id: attestation
         env:
-          SERVICE_URL: ${{ github.event.inputs.service_url || 'https://oa-verifier.eastus.azurecontainer.io:8443' }}
+          SERVICE_URL: ${{ github.event.inputs.service_url || 'https://oa-verifier.eastus.azurecontainer.io' }}
         run: |
           echo "Fetching attestation from: $SERVICE_URL"
           

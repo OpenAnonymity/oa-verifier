@@ -62,7 +62,7 @@
             
             config = {
               Entrypoint = [ "/bin/oa-verifier" ];
-              ExposedPorts."8443/tcp" = {};
+              ExposedPorts."443/tcp" = {};
               Env = [ "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" ];
               WorkingDir = "/app";
             };

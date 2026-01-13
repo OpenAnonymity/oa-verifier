@@ -34,8 +34,7 @@ jobs:
     
     environment:
       name: ${{ github.event.inputs.environment || 'production' }}
-      url: https://oa-verifier.eastus.azurecontainer.io:8443
-    
+      url: https://oa-verifier.eastus.azurecontainer.io    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -211,7 +210,7 @@ jobs:
           
           # Test health endpoint
           for i in {1..10}; do
-            if curl -sfk "https://${{ steps.info.outputs.fqdn }}:8443/broadcast" >/dev/null 2>&1; then
+            if curl -sfk "https://${{ steps.info.outputs.fqdn }}/broadcast" >/dev/null 2>&1; then
               echo "Container is healthy!"
               exit 0
             fi
@@ -226,7 +225,7 @@ jobs:
           EXPECTED_HASH: ${{ steps.policy.outputs.policy_hash }}
         run: |
           echo "Fetching attestation from deployed service..."
-          ATTESTATION=$(curl -sfk "https://${{ steps.info.outputs.fqdn }}:8443/attestation" 2>/dev/null || echo "{}")
+          ATTESTATION=$(curl -sfk "https://${{ steps.info.outputs.fqdn }}/attestation" 2>/dev/null || echo "{}")
           
           if [ -z "$ATTESTATION" ] || [ "$ATTESTATION" = "{}" ]; then
             echo "⚠️ Could not fetch attestation - container may still be starting"
@@ -256,7 +255,7 @@ jobs:
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Service URL:** https://${{ steps.info.outputs.fqdn }}:8443" >> $GITHUB_STEP_SUMMARY
+          echo "**Service URL:** https://${{ steps.info.outputs.fqdn }}" >> $GITHUB_STEP_SUMMARY
           echo "**IP Address:** \`${{ steps.info.outputs.ip }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Image Digest:** \`${{ steps.digest.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -286,7 +285,7 @@ jobs:
           echo "To verify the deployment:" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
           echo "# Using the Rust verifier (once available)" >> $GITHUB_STEP_SUMMARY
-          echo "oa-verify --url https://${{ steps.info.outputs.fqdn }}:8443" >> $GITHUB_STEP_SUMMARY
+          echo "oa-verify --url https://${{ steps.info.outputs.fqdn }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "# Verify Sigstore signature" >> $GITHUB_STEP_SUMMARY
           echo "cosign verify ${{ env.GHCR_REGISTRY }}/${OWNER}/oa-verifier@${{ steps.digest.outputs.digest }} \\" >> $GITHUB_STEP_SUMMARY

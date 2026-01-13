@@ -58,9 +58,9 @@ func main() {
 		cancel()
 	}()
 
-	// Run server with self-signed TLS on port 8443
+	// Run server with TLS on port 443
 	// TLS terminates inside the enclave (not at Azure)
-	slog.Info("starting Enclave Verifier with self-signed TLS", "port", 8443, "attestation", *attestation)
+	slog.Info("starting Enclave Verifier with TLS", "port", 443, "attestation", *attestation)
 	err := srv.RunTLS(ctx)
 
 	if err != nil && err != http.ErrServerClosed {

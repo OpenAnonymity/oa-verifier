@@ -17,7 +17,7 @@
 
 set -e
 
-SERVICE_URL="${1:-https://oa-verifier.eastus.azurecontainer.io:8443}"
+SERVICE_URL="${1:-https://oa-verifier.eastus.azurecontainer.io}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -111,7 +111,7 @@ cat > "$TEMP_DIR/template.json" << EOF
         "name": "oa-verifier",
         "properties": {
           "image": "oa-verifier:latest",
-          "ports": [{"port": 8443, "protocol": "TCP"}],
+          "ports": [{"port": 443, "protocol": "TCP"}],
           "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
         }
       },{

@@ -188,7 +188,7 @@ jobs:
                   "name": "oa-verifier",
                   "properties": {
                     "image": "${IMAGE_REF}",
-                    "ports": [{"port": 8443, "protocol": "TCP"}],
+                    "ports": [{"port": 443, "protocol": "TCP"}],
                     "environmentVariables": [
                       {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
                       {"name": "MAA_PROVIDER_URL", "value": "sharedeus.eus.attest.azure.net"}
@@ -207,7 +207,7 @@ jobs:
                 "imageRegistryCredentials": ${CREDS_JSON},
                 "ipAddress": {
                   "type": "Public",
-                  "ports": [{"port": 8443, "protocol": "TCP"}],
+                  "ports": [{"port": 443, "protocol": "TCP"}],
                   "dnsNameLabel": "oa-verifier"
                 },
                 "osType": "Linux",
@@ -287,7 +287,7 @@ jobs:
                   "name": "oa-verifier",
                   "properties": {
                     "image": "${IMAGE_REF}",
-                    "ports": [{"port": 8443, "protocol": "TCP"}],
+                    "ports": [{"port": 443, "protocol": "TCP"}],
                     "environmentVariables": [
                       {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
                       {"name": "MAA_PROVIDER_URL", "value": "sharedeus.eus.attest.azure.net"},
@@ -311,7 +311,7 @@ jobs:
                 "imageRegistryCredentials": ${CREDS_JSON},
                 "ipAddress": {
                   "type": "Public",
-                  "ports": [{"port": 8443, "protocol": "TCP"}],
+                  "ports": [{"port": 443, "protocol": "TCP"}],
                   "dnsNameLabel": "oa-verifier"
                 },
                 "osType": "Linux",
@@ -356,9 +356,9 @@ jobs:
           EXPECTED_HASH: ${{ steps.policy.outputs.policy_hash }}
         run: |
           FQDN=$(az container show --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query "ipAddress.fqdn" -o tsv)
-          echo "Fetching attestation from: https://$FQDN:8443"
+          echo "Fetching attestation from: https://$FQDN"
           
-          ATTESTATION=$(curl -sfk "https://$FQDN:8443/attestation?nonce=verify-$(date +%s)" 2>/dev/null || echo "{}")
+          ATTESTATION=$(curl -sfk "https://$FQDN/attestation?nonce=verify-$(date +%s)" 2>/dev/null || echo "{}")
           
           if [ -z "$ATTESTATION" ] || [ "$ATTESTATION" = "{}" ]; then
             echo "⚠️ Could not fetch attestation - container may still be starting"
@@ -512,7 +512,7 @@ jobs:
                   "name": "oa-verifier",
                   "properties": {
                     "image": "${IMAGE_REF}",
-                    "ports": [{"port": 8443, "protocol": "TCP"}],
+                    "ports": [{"port": 443, "protocol": "TCP"}],
                     "environmentVariables": [
                       {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
                       {"name": "MAA_PROVIDER_URL", "value": "sharedeus.eus.attest.azure.net"}
@@ -585,7 +585,7 @@ jobs:
         env:
           SOURCE_HASH: ${{ steps.policy.outputs.source_hash }}
         run: |
-          ATTESTATION=$(curl -sfk "https://oa-verifier.eastus.azurecontainer.io:8443/attestation?nonce=verify-$(date +%s)" 2>/dev/null || echo "{}")
+          ATTESTATION=$(curl -sfk "https://oa-verifier.eastus.azurecontainer.io/attestation?nonce=verify-$(date +%s)" 2>/dev/null || echo "{}")
           
           if [ -z "$ATTESTATION" ] || [ "$ATTESTATION" = "{}" ]; then
             echo "⚠️ Could not fetch attestation"

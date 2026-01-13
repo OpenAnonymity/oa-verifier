@@ -32,7 +32,7 @@
               "image": "[concat(parameters('registryServer'), '/oa-verifier@', parameters('imageDigest'))]",
               "ports": [
                 {
-                  "port": 8443,
+                  "port": 443,
                   "protocol": "TCP"
                 }
               ],
@@ -112,7 +112,7 @@
           "type": "Public",
           "ports": [
             {
-              "port": 8443,
+              "port": 443,
               "protocol": "TCP"
             }
           ],

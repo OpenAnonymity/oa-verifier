@@ -195,8 +195,8 @@ deploy() {
     FQDN=$(az container show --name $CONTAINER_NAME --resource-group $RESOURCE_GROUP --query "ipAddress.fqdn" -o tsv)
     
     log "Container running at:"
-    log "  IP: https://${IP}:8443"
-    log "  FQDN: https://${FQDN}:8443"
+    log "  IP: https://${IP}"
+    log "  FQDN: https://${FQDN}"
     log "  Self-signed TLS (use curl -k to skip cert verification)"
     log "  TLS terminates inside the enclave, not at Azure"
 }
@@ -213,19 +213,19 @@ verify() {
     VERIFY_URL=$(az container show --name $CONTAINER_NAME --resource-group $RESOURCE_GROUP --query "ipAddress.fqdn" -o tsv)
     
     log "Testing broadcast endpoint..."
-    if curl -sfk "https://${VERIFY_URL}:8443/broadcast" >/dev/null 2>&1; then
+    if curl -sfk "https://${VERIFY_URL}/broadcast" >/dev/null 2>&1; then
         log "Broadcast check passed!"
     else
         warn "Broadcast check failed - container may still be starting"
         warn "Trying direct IP..."
         IP=$(az container show --name $CONTAINER_NAME --resource-group $RESOURCE_GROUP --query "ipAddress.ip" -o tsv)
-        if curl -sfk "https://${IP}:8443/broadcast" >/dev/null 2>&1; then
+        if curl -sfk "https://${IP}/broadcast" >/dev/null 2>&1; then
             log "Direct IP check passed (TLS cert may not match)"
         fi
     fi
     
     log "Testing attestation endpoint..."
-    ATTESTATION=$(curl -sfk "https://${VERIFY_URL}:8443/attestation" 2>/dev/null || echo "")
+    ATTESTATION=$(curl -sfk "https://${VERIFY_URL}/attestation" 2>/dev/null || echo "")
     if [[ -n "$ATTESTATION" ]]; then
         RETURNED_HASH=$(echo "$ATTESTATION" | jq -r '.summary.cce_policy_hash // .summary.host_data // "unknown"')
         EXPECTED_HASH=$(cat deploy/policy-hash.txt 2>/dev/null || echo "unknown")
