@@ -54,7 +54,7 @@ jobs:
       - name: Start local registry and get digest
         id: local_registry
         run: |
-          # Start a local registry
+          # Start a local registry (keep running for confcom)
           docker run -d -p 5000:5000 --name registry registry:2
           sleep 3
           
@@ -66,9 +66,6 @@ jobs:
           LOCAL_DIGEST=$(docker inspect localhost:5000/oa-verifier:latest --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
           echo "digest=$LOCAL_DIGEST" >> $GITHUB_OUTPUT
           echo "Local registry digest: $LOCAL_DIGEST"
-          
-          # Stop registry
-          docker stop registry && docker rm registry
 
       - name: Install Azure CLI and confcom
         run: |
@@ -79,16 +76,12 @@ jobs:
         id: policy
         env:
           LOCAL_DIGEST: ${{ steps.local_registry.outputs.digest }}
-          REPO_OWNER: ${{ github.repository_owner }}
         run: |
           echo "Generating CCE policy from local Nix build..."
           echo "Using local digest: $LOCAL_DIGEST"
           
-          # Lowercase the owner (Docker registries require lowercase)
-          OWNER=$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')
-          
-          # Create template using GHCR image reference (matches deployment)
-          # The digest from local build should match GHCR since Nix builds are reproducible
+          # Create template using LOCAL registry image (no remote pull needed)
+          # This is purely local verification - build from source and hash it
           cat > /tmp/verify-template.json << EOF
           {
             "\$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
@@ -103,7 +96,7 @@ jobs:
                 "containers": [{
                   "name": "oa-verifier",
                   "properties": {
-                    "image": "ghcr.io/${OWNER}/oa-verifier@${LOCAL_DIGEST}",
+                    "image": "localhost:5000/oa-verifier@${LOCAL_DIGEST}",
                     "ports": [{"port": 8443, "protocol": "TCP"}],
                     "environmentVariables": [
                       {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
@@ -260,3 +253,7 @@ jobs:
             echo "### ❌ Result: MISMATCH" >> $GITHUB_STEP_SUMMARY
             echo "The deployed code does NOT match the source code!" >> $GITHUB_STEP_SUMMARY
           fi
+
+      - name: Cleanup local registry
+        if: always()
+        run: docker stop registry && docker rm registry || true
