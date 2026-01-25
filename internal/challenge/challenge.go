@@ -52,7 +52,3 @@ func ShouldBan(reason string) bool {
 	}
 	return false
 }
-
-
-
-

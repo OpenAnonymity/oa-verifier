@@ -62,7 +62,3 @@ func FetchStations() ([]map[string]any, error) {
 
 	return result.Stations, nil
 }
-
-
-
-

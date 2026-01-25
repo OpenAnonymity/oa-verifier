@@ -160,7 +160,3 @@ func (m *Manager) Clear() int {
 	slog.Info("cleared all banned stations", "removed", count)
 	return count
 }
-
-
-
-

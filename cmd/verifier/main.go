@@ -35,7 +35,16 @@ import (
 func main() {
 	// Parse command-line flags
 	attestation := flag.Bool("attestation", true, "Enable attestation endpoints (requires Azure CC sidecar)")
+	httpMode := flag.Bool("http", false, "Run in HTTP mode instead of HTTPS (for local development)")
+	port := flag.String("port", "", "Port to listen on (default: 8080 for HTTP, 443 for HTTPS)")
+	local := flag.Bool("local", false, "Local development mode (implies -http -attestation=false)")
 	flag.Parse()
+
+	// Local mode overrides
+	if *local {
+		*httpMode = true
+		*attestation = false
+	}
 
 	// Setup structured logging
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
@@ -58,10 +67,28 @@ func main() {
 		cancel()
 	}()
 
-	// Run server with TLS on port 443
-	// TLS terminates inside the enclave (not at Azure)
-	slog.Info("starting Enclave Verifier with TLS", "port", 443, "attestation", *attestation)
-	err := srv.RunTLS(ctx)
+	// Determine address
+	addr := *port
+	if addr == "" {
+		if *httpMode {
+			addr = ":8080"
+		} else {
+			addr = ":443"
+		}
+	} else {
+		addr = ":" + addr
+	}
+
+	// Run server
+	var err error
+	if *httpMode {
+		slog.Info("starting Enclave Verifier with HTTP", "addr", addr, "attestation", *attestation)
+		err = srv.Run(ctx, addr)
+	} else {
+		// TLS terminates inside the enclave (not at Azure)
+		slog.Info("starting Enclave Verifier with TLS", "addr", addr, "attestation", *attestation)
+		err = srv.RunTLS(ctx)
+	}
 
 	if err != nil && err != http.ErrServerClosed {
 		slog.Error("server error", "error", err)
@@ -70,7 +97,3 @@ func main() {
 
 	slog.Info("server stopped")
 }
-
-
-
-

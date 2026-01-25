@@ -1,141 +1,150 @@
 # OA-Verifier
 
-Zero-trust verification service running in Azure Confidential Containers with AMD SEV-SNP hardware attestation.
+A general-purpose enclave verification service for proving station integrity. Runs in Azure Confidential Containers with AMD SEV-SNP hardware attestation.
 
-## Features
+## What It Does
 
-- **Hardware-backed attestation**: Runs in AMD SEV-SNP enclave with Microsoft Azure Attestation
-- **Zero-trust verification**: Users can cryptographically verify the running code
-- **Sigstore provenance**: Container images are signed with GitHub Actions OIDC
-- **Reproducible builds**: Nix flake for bit-for-bit reproducible builds
+OA-Verifier enables **zero-trust verification** of stations running in secure enclaves. Users can cryptographically prove:
+
+- **The exact code running** - via hardware-measured CCE policy hash
+- **No tampering possible** - AMD SEV-SNP isolates memory from hypervisor
+- **No logging/exfiltration** - auditable source code + disabled stdio in policy
+
+### Supported Station Types
+
+| Station Type | Verification |
+|-------------|--------------|
+| **OpenRouter Stations** | Privacy toggles, API key ownership, account binding |
+| **Proxy Stations** | Enclave attestation proving no-logging guarantees |
+| *Future* | Extensible for other enclave-based services |
 
 ## Verification
 
-Users can verify the service is running the expected code using two paths:
+Anyone can verify the service is running expected code:
 
-### Fast Path (Sigstore)
-
-For users who trust GitHub Actions:
+### Quick Verification
 
 ```bash
-# Install the verifier
-cargo install --git https://github.com/openanonymity/oa-verifier oa-verify
+# Fetch attestation from live service
+curl -sk https://oa-verifier.eastus.azurecontainer.io/attestation | jq .summary
 
-# Verify the service
-oa-verify --url https://oa-verifier.eastus.azurecontainer.io
-# Or use the web interface
-# https://openanonymity.github.io/oa-verifier/
+# Returns hardware-signed proof including:
+# - cce_policy_hash: SHA256 of the container policy (what code can run)
+# - attestation_type: sevsnpvm (AMD SEV-SNP)
+# - debug_disabled: true (no debugging possible)
 ```
 
-### Paranoid Path (Nix)
-
-For users who trust only the source code:
+### Full Verification (Zero-Trust)
 
 ```bash
-# Build from source (produces identical hash)
-nix build .#container
-
-# Compare hash to attestation
-# The policy hash in the attestation should match
+# Clone and run local verification script
+git clone https://github.com/openanonymity/oa-verifier
+cd oa-verifier
+./scripts/verify-local.sh https://oa-verifier.eastus.azurecontainer.io
 ```
 
-## Architecture
+This rebuilds the container locally with Nix and compares the policy hash against what Azure hardware attests.
+
+## Trust Chain
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           TRUST CHAIN                                        │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Source Code (GitHub)                                                       │
-│      ↓                                                                       │
-│  GitHub Actions Build (Sigstore signed)                                      │
-│      ↓                                                                       │
-│  Container Image (GHCR + ACR)                                                │
-│      ↓                                                                       │
-│  CCE Policy (specifies allowed container)                                    │
-│      ↓                                                                       │
-│  Policy Hash (measured by AMD SEV-SNP)                                       │
-│      ↓                                                                       │
-│  Azure MAA Attestation (signed JWT)                                          │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+Source Code (this repo)
+    ↓ [Nix reproducible build]
+Container Image (deterministic hash)
+    ↓ [CCE policy generated from image]
+Policy Hash (SHA256 of allowed container config)
+    ↓ [Measured by AMD SEV-SNP hardware]
+Attestation JWT (signed by Azure MAA)
+    ↓ [Verifiable by anyone]
+Proof: "This exact code is running in an isolated enclave"
 ```
 
-## API Endpoints
+## API
+
+### Core Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/attestation` | GET | Get hardware attestation (JWT from Azure MAA) |
+| `/attestation` | GET | Hardware attestation JWT with policy hash |
+| `/attestation/raw` | GET | Raw JWT token only |
+| `/broadcast` | GET | List of verified and banned stations |
+
+### Station Management
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
 | `/register` | POST | Register station with Ed25519 public key |
-| `/submit_key` | POST | Submit double-signed API key |
-| `/broadcast` | GET | Get verified and banned stations |
-| `/banned-stations` | GET | Get banned station list |
+| `/submit_key` | POST | Submit double-signed API key for verification |
+| `/station/{pk}` | GET | Get station info by public key |
+| `/banned-stations` | GET | List banned stations |
+
+## Security Model
+
+| Layer | Protection | Verification |
+|-------|------------|--------------|
+| **Source** | Public, auditable | You read it |
+| **Build** | Nix reproducible | Rebuild locally |
+| **Image** | Sigstore signed | `cosign verify` |
+| **Runtime** | AMD SEV-SNP enclave | MAA attestation |
+| **Network** | TLS terminates in enclave | Channel binding hash |
+
+### What The Enclave Guarantees
+
+- **Memory isolation**: Hypervisor cannot read enclave memory
+- **No stdio**: Container cannot write to stdout/stderr (policy enforced)
+- **No debugging**: Debug mode disabled in hardware
+- **Measured boot**: Only the attested container can run
 
 ## Development
 
-### Prerequisites
-
 ```bash
-# Go 1.22+
-go version
+# Build server
+go build -o oa-verifier ./cmd/verifier
 
-# Rust (for verifier)
-rustc --version
+# Run locally (without attestation)
+./oa-verifier -local
 
-# Or use Nix
-nix develop
+# Run with attestation (requires Azure environment)
+./oa-verifier -attestation
 ```
 
-### Build
+### Reproducible Build (Nix)
 
 ```bash
-# Server
-go build -o verifier ./cmd/verifier
+# Build container with deterministic hash
+nix build .#container
 
-# Verifier CLI
-cd verifier && cargo build --release
-```
-
-### With Nix (Reproducible)
-
-```bash
-# Build everything
-nix build .#server     # Go server
-nix build .#container  # Docker image
-
-# Development shell
-nix develop
+# Load and inspect
+docker load < result
+docker inspect oa-verifier:latest
 ```
 
 ## Deployment
 
-The service is deployed via GitHub Actions:
+Deployed via GitHub Actions to Azure Confidential Containers:
 
-1. Push to `main` triggers build
-2. Container is built and signed with Sigstore
-3. Pushed to GHCR and ACR
-4. Manual trigger deploys to Azure ACI
+1. Push to `main` → builds container
+2. Sigstore signs the image
+3. CCE policy generated with secret protection
+4. Deployed to Azure ACI with SEV-SNP
 
 See [deploy/README.md](deploy/README.md) for details.
 
-## Security Model
+## Configuration
 
-| What | Who Controls | Verification |
-|------|--------------|--------------|
-| Source Code | Public (GitHub) | You audit it |
-| Build Process | GitHub Actions | Sigstore signature |
-| Container | GHCR/ACR | Same digest |
-| Runtime | Azure SEV-SNP | MAA attestation |
+| Variable | Description |
+|----------|-------------|
+| `MAA_ENDPOINT` | Azure MAA sidecar endpoint |
+| `STATION_REGISTRY_URL` | Station registry service |
+| `STATION_REGISTRY_SECRET` | Registry auth secret |
+| `TLS_DOMAIN` | Custom domain for Let's Encrypt |
+| `CHALLENGE_MIN_INTERVAL` | Min seconds between privacy checks |
+| `CHALLENGE_MAX_INTERVAL` | Max seconds between privacy checks |
 
-## Module Structure
+## Documentation
 
-| Path | Purpose |
-|------|---------|
-| `cmd/verifier/` | Server entry point |
-| `internal/` | Core packages (server, config, models, banned, challenge, registry, openrouter) |
-| `verifier/` | Rust verifier CLI + WASM |
-| `deploy/` | Azure deployment templates |
-| `.github/workflows/` | CI/CD pipelines |
+- [Attestation Deep Dive](docs/ATTESTATION.md) - How zero-trust verification works
+- [Deployment Guide](deploy/README.md) - CI/CD and Azure setup
 
 ## License
 

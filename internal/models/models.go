@@ -56,7 +56,3 @@ type Cookie struct {
 	Value  string `json:"value"`
 	Domain string `json:"domain,omitempty"`
 }
-
-
-
-

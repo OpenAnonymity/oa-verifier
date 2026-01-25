@@ -420,5 +420,3 @@ func NotifyOrgBanned(stationID, reason string) error {
 	slog.Warn("failed to notify org about ban", "status", resp.StatusCode)
 	return fmt.Errorf("notify failed: status %d", resp.StatusCode)
 }
-
-

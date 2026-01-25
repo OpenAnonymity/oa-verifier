@@ -273,7 +273,3 @@ func (a *Auth) GetAllActionHashes() map[string]string {
 	}
 	return result
 }
-
-
-
-
