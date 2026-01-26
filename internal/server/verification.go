@@ -36,11 +36,13 @@ func (s *Server) verificationLoop(ctx context.Context) {
 	}
 }
 
+// maxConcurrentChallenges limits concurrent verification goroutines to prevent resource exhaustion
+const maxConcurrentChallenges = 10
+
 // checkDueStations finds stations due for challenge and challenges them concurrently.
 func (s *Server) checkDueStations(ctx context.Context) {
 	now := time.Now()
 
-	// Find all stations due for challenge
 	type stationEntry struct {
 		pk   string
 		data models.Station
@@ -50,7 +52,6 @@ func (s *Server) checkDueStations(ctx context.Context) {
 	s.mu.RLock()
 	for pk, data := range s.stations {
 		if now.After(data.NextChallengeAt) || now.Equal(data.NextChallengeAt) {
-			// Copy the data
 			stationsDue = append(stationsDue, stationEntry{pk: pk, data: *data})
 		}
 	}
@@ -60,12 +61,15 @@ func (s *Server) checkDueStations(ctx context.Context) {
 		return
 	}
 
-	// Challenge all due stations concurrently using goroutines
-	// This is true parallelism - each challenge runs independently
+	// Use semaphore to bound concurrent goroutines
+	sem := make(chan struct{}, maxConcurrentChallenges)
 	var wg sync.WaitGroup
+
 	for _, entry := range stationsDue {
 		wg.Add(1)
+		sem <- struct{}{} // Acquire semaphore slot
 		go func(pk string, station models.Station) {
+			defer func() { <-sem }() // Release semaphore slot
 			defer wg.Done()
 			s.challengeOneStation(ctx, pk, station)
 		}(entry.pk, entry.data)

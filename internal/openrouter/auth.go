@@ -102,12 +102,18 @@ func NewAuthFromCookieData(cookieData map[string]any) (*Auth, error) {
 
 func (a *Auth) fetchClerkVersions() {
 	resp, err := a.client.Get(clerkJSURL)
-	if err != nil || resp.StatusCode != 200 {
+	if err != nil {
 		a.clerkParams["__clerk_api_version"] = "2025-11-10"
 		a.clerkParams["_clerk_js_version"] = "5.111.0"
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		a.clerkParams["__clerk_api_version"] = "2025-11-10"
+		a.clerkParams["_clerk_js_version"] = "5.111.0"
+		return
+	}
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 20000))
 	text := string(body)
@@ -193,7 +199,11 @@ func (a *Auth) fetchActionHashes() {
 		}
 
 		resp, err := a.client.Do(req)
-		if err != nil || resp.StatusCode != 200 {
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
 			continue
 		}
 		body, _ := io.ReadAll(resp.Body)
@@ -213,7 +223,11 @@ func (a *Auth) fetchActionHashes() {
 			}
 
 			chunkResp, err := a.client.Do(chunkReq)
-			if err != nil || chunkResp.StatusCode != 200 {
+			if err != nil {
+				continue
+			}
+			if chunkResp.StatusCode != 200 {
+				chunkResp.Body.Close()
 				continue
 			}
 			js, _ := io.ReadAll(chunkResp.Body)

@@ -73,6 +73,7 @@ func (s *Server) Router() chi.Router {
 	r.Use(corsMiddleware)
 
 	// Routes
+	r.Get("/health", s.handleHealth)
 	r.Post("/register", s.handleRegister)
 	r.Post("/submit_key", s.handleSubmitKey)
 	r.Get("/station/{public_key}", s.handleGetStation)
@@ -107,8 +108,12 @@ func corsMiddleware(next http.Handler) http.Handler {
 // Run starts the HTTP server.
 func (s *Server) Run(ctx context.Context, addr string) error {
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: s.Router(),
+		Addr:              addr,
+		Handler:           s.Router(),
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	// Start verification loop in separate goroutine
@@ -175,8 +180,12 @@ func (s *Server) RunTLS(ctx context.Context) error {
 		"domain", customDomain)
 
 	tlsSrv := &http.Server{
-		Addr:    ":443",
-		Handler: s.Router(),
+		Addr:              ":443",
+		Handler:           s.Router(),
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
@@ -300,7 +309,3 @@ func computeKeyHash(apiKey string) string {
 	h := sha256.Sum256([]byte(apiKey))
 	return hex.EncodeToString(h[:])
 }
-
-
-
-

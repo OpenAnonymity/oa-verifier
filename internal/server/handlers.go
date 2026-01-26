@@ -38,7 +38,22 @@ func writeError(w http.ResponseWriter, status int, detail string) {
 	writeJSON(w, status, map[string]string{"detail": detail})
 }
 
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	stationCount := len(s.stations)
+	s.mu.RUnlock()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":   "healthy",
+		"stations": stationCount,
+	})
+}
+
+// maxRequestBodySize limits incoming request body to 1MB to prevent memory exhaustion
+const maxRequestBodySize = 1 << 20 // 1MB
+
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 	var req models.RegisterRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -274,6 +289,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 	var req models.SubmitKeyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "Invalid request body")
@@ -606,25 +622,30 @@ func getAttestationToken(nonce, tlsHash string) (string, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	// Use configured HTTP client with timeout
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to call MAA sidecar: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// Read body once for both error handling and parsing
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("MAA sidecar returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Response contains the JWT token
+	// Try parsing as JSON first
 	var result struct {
 		Token string `json:"token"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(body, &result); err != nil {
 		// Try reading as plain text token
-		resp.Body.Close()
-		body, _ := io.ReadAll(resp.Body)
 		token := strings.TrimSpace(string(body))
 		if token != "" && strings.Contains(token, ".") {
 			return token, nil
@@ -754,5 +775,3 @@ func (s *Server) handleAttestationRaw(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, map[string]string{"token": token})
 }
-
-
