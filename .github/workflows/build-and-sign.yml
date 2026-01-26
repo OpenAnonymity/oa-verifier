@@ -2,10 +2,10 @@ name: Build, Sign, and Deploy
 
 on:
   push:
-    branches: [main, attestation]
+    branches: [main]
     tags: ['v*']
   pull_request:
-    branches: [main, attestation]
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -136,17 +136,17 @@ jobs:
       # --- DEPLOY SECTION (same job, same runner, image already loaded) ---
       
       - name: Azure Login
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/attestation')
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Install confcom extension
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/attestation')
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
         run: az extension add --name confcom --yes
 
       - name: Generate CCE policy from LOCAL image
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/attestation')
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
         id: policy
         env:
           DEPLOY_REGISTRY: ${{ steps.registry.outputs.registry }}
@@ -328,7 +328,7 @@ jobs:
           echo "✅ CCE_POLICY_B64 env var added to deployment template"
 
       - name: Delete existing container group
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/attestation')
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
         run: |
           if az container show --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} &>/dev/null; then
             echo "Deleting existing container group..."
@@ -337,7 +337,7 @@ jobs:
           fi
 
       - name: Deploy to Azure
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/attestation')
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
         run: |
           echo "Deploying to Azure..."
           az deployment group create \
@@ -345,13 +345,13 @@ jobs:
             --template-file /tmp/aci-deploy.json
 
       - name: Wait for container
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/attestation')
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
         run: |
           echo "Waiting for container to start..."
           sleep 90
 
       - name: Verify attestation matches local build
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/attestation')
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
         env:
           EXPECTED_HASH: ${{ steps.policy.outputs.policy_hash }}
         run: |
@@ -402,7 +402,7 @@ jobs:
     name: Verify Attestation
     runs-on: ubuntu-latest
     needs: build-and-deploy
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/attestation')
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
     
     steps:
       - name: Checkout repository

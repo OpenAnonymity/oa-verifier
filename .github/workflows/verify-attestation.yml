@@ -9,7 +9,7 @@ on:
   workflow_run:
     workflows: ["Build, Sign, and Deploy"]
     types: [completed]
-    branches: [main, attestation]
+    branches: [main]
   
   # Manual trigger
   workflow_dispatch:
