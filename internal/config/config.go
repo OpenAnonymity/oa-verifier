@@ -109,3 +109,51 @@ func BannedStationsFile() string {
 	}
 	return f
 }
+
+// MaxConcurrentRequests returns MAX_CONCURRENT_REQUESTS (default 20).
+// Controls max concurrent HTTP request handlers for CPU-heavy endpoints.
+func MaxConcurrentRequests() int {
+	mu.RLock()
+	defer mu.RUnlock()
+	s := os.Getenv("MAX_CONCURRENT_REQUESTS")
+	if s == "" {
+		return 20
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil || v < 1 {
+		return 20
+	}
+	return v
+}
+
+// RateLimitRPS returns RATE_LIMIT_RPS (default 10).
+// Controls requests per second per IP.
+func RateLimitRPS() int {
+	mu.RLock()
+	defer mu.RUnlock()
+	s := os.Getenv("RATE_LIMIT_RPS")
+	if s == "" {
+		return 10
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil || v < 1 {
+		return 10
+	}
+	return v
+}
+
+// RateLimitBurst returns RATE_LIMIT_BURST (default 20).
+// Controls burst size per IP for rate limiting.
+func RateLimitBurst() int {
+	mu.RLock()
+	defer mu.RUnlock()
+	s := os.Getenv("RATE_LIMIT_BURST")
+	if s == "" {
+		return 20
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil || v < 1 {
+		return 20
+	}
+	return v
+}

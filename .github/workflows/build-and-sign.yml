@@ -246,16 +246,28 @@ jobs:
               # Add regex env rules to oa-verifier container (first one)
               if containers and "env_rules" in containers[0]:
                   # These env vars use regex patterns - actual values stay secret!
-                  dynamic_env_vars = [
+                  # Required vars use .+ (must have value), optional use .* (can be empty)
+                  required_env_vars = [
                       "CCE_POLICY_B64",
                       "STATION_REGISTRY_URL",
                       "STATION_REGISTRY_SECRET",
                       "CHALLENGE_MIN_INTERVAL",
                       "CHALLENGE_MAX_INTERVAL"
                   ]
-                  for env_var in dynamic_env_vars:
+                  optional_env_vars = [
+                      "MAX_CONCURRENT_REQUESTS",
+                      "RATE_LIMIT_RPS",
+                      "RATE_LIMIT_BURST"
+                  ]
+                  for env_var in required_env_vars:
                       containers[0]["env_rules"].append({
                           "pattern": f"{env_var}=.+",
+                          "required": False,
+                          "strategy": "re2"
+                      })
+                  for env_var in optional_env_vars:
+                      containers[0]["env_rules"].append({
+                          "pattern": f"{env_var}=.*",
                           "required": False,
                           "strategy": "re2"
                       })
@@ -295,7 +307,10 @@ jobs:
                       {"name": "STATION_REGISTRY_URL", "value": "${{ secrets.STATION_REGISTRY_URL }}"},
                       {"name": "STATION_REGISTRY_SECRET", "secureValue": "${{ secrets.STATION_REGISTRY_SECRET }}"},
                       {"name": "CHALLENGE_MIN_INTERVAL", "value": "${{ secrets.CHALLENGE_MIN_INTERVAL }}"},
-                      {"name": "CHALLENGE_MAX_INTERVAL", "value": "${{ secrets.CHALLENGE_MAX_INTERVAL }}"}
+                      {"name": "CHALLENGE_MAX_INTERVAL", "value": "${{ secrets.CHALLENGE_MAX_INTERVAL }}"},
+                      {"name": "MAX_CONCURRENT_REQUESTS", "value": "${{ secrets.MAX_CONCURRENT_REQUESTS }}"},
+                      {"name": "RATE_LIMIT_RPS", "value": "${{ secrets.RATE_LIMIT_RPS }}"},
+                      {"name": "RATE_LIMIT_BURST", "value": "${{ secrets.RATE_LIMIT_BURST }}"}
                     ],
                     "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
                   }
@@ -559,16 +574,28 @@ jobs:
               containers = json.loads(containers_json)
               if containers and "env_rules" in containers[0]:
                   # MUST match the same env vars as deploy job!
-                  dynamic_env_vars = [
+                  # Required vars use .+ (must have value), optional use .* (can be empty)
+                  required_env_vars = [
                       "CCE_POLICY_B64",
                       "STATION_REGISTRY_URL",
                       "STATION_REGISTRY_SECRET",
                       "CHALLENGE_MIN_INTERVAL",
                       "CHALLENGE_MAX_INTERVAL"
                   ]
-                  for env_var in dynamic_env_vars:
+                  optional_env_vars = [
+                      "MAX_CONCURRENT_REQUESTS",
+                      "RATE_LIMIT_RPS",
+                      "RATE_LIMIT_BURST"
+                  ]
+                  for env_var in required_env_vars:
                       containers[0]["env_rules"].append({
                           "pattern": f"{env_var}=.+",
+                          "required": False,
+                          "strategy": "re2"
+                      })
+                  for env_var in optional_env_vars:
+                      containers[0]["env_rules"].append({
+                          "pattern": f"{env_var}=.*",
                           "required": False,
                           "strategy": "re2"
                       })

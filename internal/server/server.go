@@ -67,15 +67,18 @@ func New(attestationEnabled bool) *Server {
 func (s *Server) Router() chi.Router {
 	r := chi.NewRouter()
 
-	// Middleware
+	// Middleware (order matters)
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(corsMiddleware)
+	r.Use(rateLimitMiddleware) // Rate limit all routes including /health
 
-	// Routes
+	// CPU-heavy endpoints get additional concurrency limiting
+	r.With(concurrencyLimitMiddleware).Post("/register", s.handleRegister)
+	r.With(concurrencyLimitMiddleware).Post("/submit_key", s.handleSubmitKey)
+
+	// Other routes
 	r.Get("/health", s.handleHealth)
-	r.Post("/register", s.handleRegister)
-	r.Post("/submit_key", s.handleSubmitKey)
 	r.Get("/station/{public_key}", s.handleGetStation)
 	r.Get("/broadcast", s.handleBroadcast)
 	r.Get("/banned-stations", s.handleBannedStations)
