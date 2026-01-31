@@ -1,7 +1,6 @@
 package openrouter
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -311,25 +310,32 @@ func CreateProvisioningKey(auth *Auth, label string) (string, error) {
 	return "", fmt.Errorf("create_provisioning_key failed after %d attempts", maxRetries)
 }
 
+// OwnershipCheckResult describes the ownership check outcome.
+type OwnershipCheckResult struct {
+	Owned      bool
+	NotOwned   bool
+	StatusCode int
+}
+
 // VerifyKeyOwnership verifies that a key belongs to the station's account.
-func VerifyKeyOwnership(provisioningKey, keyHash string) (bool, error) {
+func VerifyKeyOwnership(provisioningKey, keyHash string) (OwnershipCheckResult, error) {
 	reqURL := config.OpenRouterAPIURL + "/keys/" + url.PathEscape(keyHash)
 	req, _ := http.NewRequest("GET", reqURL, nil)
 	req.Header.Set("Authorization", "Bearer "+provisioningKey)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return false, err
+		return OwnershipCheckResult{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 404 {
 		slog.Warn("key not found", "hash", keyHash[:16])
-		return false, nil
+		return OwnershipCheckResult{NotOwned: true, StatusCode: resp.StatusCode}, nil
 	}
 
 	if resp.StatusCode != 200 {
-		return false, fmt.Errorf("key verification failed: status %d", resp.StatusCode)
+		return OwnershipCheckResult{StatusCode: resp.StatusCode}, fmt.Errorf("key verification failed: status %d", resp.StatusCode)
 	}
 
 	var result struct {
@@ -340,16 +346,16 @@ func VerifyKeyOwnership(provisioningKey, keyHash string) (bool, error) {
 
 	body, _ := io.ReadAll(resp.Body)
 	if err := json.Unmarshal(body, &result); err != nil {
-		return false, err
+		return OwnershipCheckResult{StatusCode: resp.StatusCode}, err
 	}
 
 	if result.Data.Hash == keyHash {
 		slog.Debug("key ownership verified", "hash", keyHash[:16])
-		return true, nil
+		return OwnershipCheckResult{Owned: true, StatusCode: resp.StatusCode}, nil
 	}
 
 	slog.Warn("key hash mismatch", "expected", keyHash[:16])
-	return false, nil
+	return OwnershipCheckResult{NotOwned: true, StatusCode: resp.StatusCode}, nil
 }
 
 // FetchOrgPublicKey fetches the org's public key from registry.

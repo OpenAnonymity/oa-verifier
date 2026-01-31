@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -375,43 +376,68 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify key ownership via OpenRouter API
-	keyHash := computeKeyHash(req.APIKey)
-	owned, err := openrouter.VerifyKeyOwnership(provisioningKey, keyHash)
-	if err != nil || !owned {
-		// Key doesn't belong to station - BAN immediately
-		reason := "issued_api_key_not_owned_by_registered_or_account"
-		bannedAt := utcNow()
-		slog.Error("key not owned by station - BANNING (potential shadow account)", "hash", keyHash[:16], "station_id", req.StationID)
-		s.banned.Ban(req.StationID, publicKey, stationEmail, reason)
+	keyHashFull := computeKeyHash(req.APIKey)
+	retryBase := 250 * time.Millisecond
+	maxJitter := 200 * time.Millisecond
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-		// Remove from active stations
-		s.mu.Lock()
-		delete(s.stations, publicKey)
-		if stationEmail != "" {
-			delete(s.emailToPK, stationEmail)
+	for attempt := 1; attempt <= 3; attempt++ {
+		result, err := openrouter.VerifyKeyOwnership(provisioningKey, keyHashFull)
+		if err == nil {
+			if result.Owned {
+				slog.Info("key ownership verified", "station_id", req.StationID, "hash", keyHashFull[:16])
+				writeJSON(w, http.StatusOK, map[string]any{
+					"status":     "verified",
+					"station_id": req.StationID,
+					"key_hash":   keyHashFull[:16],
+				})
+				return
+			}
+			if result.NotOwned {
+				// Key doesn't belong to station - BAN immediately
+				reason := "issued_api_key_not_owned_by_registered_or_account"
+				bannedAt := utcNow()
+				slog.Error("key not owned by station - BANNING (potential shadow account)", "hash", keyHashFull[:16], "station_id", req.StationID)
+				s.banned.Ban(req.StationID, publicKey, stationEmail, reason)
+
+				// Remove from active stations
+				s.mu.Lock()
+				delete(s.stations, publicKey)
+				if stationEmail != "" {
+					delete(s.emailToPK, stationEmail)
+				}
+				delete(s.stationIDToPK, req.StationID)
+				s.mu.Unlock()
+
+				writeJSON(w, http.StatusForbidden, map[string]any{
+					"error":  "Key not owned by station account. Station banned.",
+					"status": "banned",
+					"banned_station": map[string]string{
+						"station_id": req.StationID,
+						"public_key": publicKey,
+						"reason":     reason,
+						"banned_at":  bannedAt,
+					},
+				})
+				return
+			}
 		}
-		delete(s.stationIDToPK, req.StationID)
-		s.mu.Unlock()
 
-		writeJSON(w, http.StatusForbidden, map[string]any{
-			"error":  "Key not owned by station account. Station banned.",
-			"status": "banned",
-			"banned_station": map[string]string{
-				"station_id": req.StationID,
-				"public_key": publicKey,
-				"reason":     reason,
-				"banned_at":  bannedAt,
-			},
-		})
-		return
+		if attempt < 3 {
+			backoff := retryBase * time.Duration(1<<uint(attempt-1))
+			jitter := time.Duration(rng.Int63n(int64(maxJitter)))
+			time.Sleep(backoff + jitter)
+		}
 	}
 
-	slog.Info("key ownership verified", "station_id", req.StationID, "hash", keyHash[:16])
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":     "verified",
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+		"status":     "unverified",
 		"station_id": req.StationID,
-		"key_hash":   keyHash[:16],
+		"key_hash":   keyHashFull[:16],
+		"detail":     "ownership_check_error",
+		"retryable":  true,
 	})
+	return
 }
 
 func (s *Server) getOrgPublicKey() (string, error) {
@@ -770,10 +796,10 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 				"3. Policy is now VERIFIED by hardware - audit it to see what's running",
 				"4. (Optional) Check tls_pubkey_hash matches server's TLS cert for channel binding",
 			},
-			"what_policy_proves": "The exact CCE policy enforced by Azure hardware - contains layers, command, env vars, capabilities",
-			"what_host_data_proves":    "SHA256 hash of CCE policy - proves which container is allowed to run",
-			"what_tls_hash_proves":     "SHA256 hash of TLS public key - proves you're talking directly to the enclave",
-			"zero_trust_verification":  "sha256(policy.decoded) == summary.cce_policy_hash proves policy authenticity",
+			"what_policy_proves":      "The exact CCE policy enforced by Azure hardware - contains layers, command, env vars, capabilities",
+			"what_host_data_proves":   "SHA256 hash of CCE policy - proves which container is allowed to run",
+			"what_tls_hash_proves":    "SHA256 hash of TLS public key - proves you're talking directly to the enclave",
+			"zero_trust_verification": "sha256(policy.decoded) == summary.cce_policy_hash proves policy authenticity",
 		},
 	})
 }
