@@ -42,7 +42,6 @@ func GetRandomInterval() float64 {
 func ShouldBan(reason string) bool {
 	banPrefixes := []string{
 		"privacy_toggles_invalid",
-		"key_not_owned",
 		"issued_api_key_not_owned",
 	}
 	for _, prefix := range banPrefixes {
