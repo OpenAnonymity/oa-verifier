@@ -80,31 +80,13 @@ func (l *rateLimiterStore) cleanup() {
 
 // getClientIP extracts the client IP from the request.
 func getClientIP(r *http.Request) string {
-	// Check X-Forwarded-For header (for proxies/load balancers)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP in the chain
-		if ip, _, err := net.SplitHostPort(xff); err == nil {
-			return ip
-		}
-		// If no port, use as-is
-		if net.ParseIP(xff) != nil {
-			return xff
-		}
-		// Multiple IPs, take first
-		for i := 0; i < len(xff); i++ {
-			if xff[i] == ',' {
-				return xff[:i]
-			}
-		}
-		return xff
+	// Cloudflare's CF-Connecting-IP is most reliable when behind Cloudflare proxy
+	// This header is SET by Cloudflare (not appended), so it can't be spoofed
+	if cfIP := r.Header.Get("CF-Connecting-IP"); cfIP != "" {
+		return cfIP
 	}
 
-	// Check X-Real-IP header
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-
-	// Fall back to RemoteAddr
+	// Fall back to RemoteAddr (direct connection or non-Cloudflare)
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
