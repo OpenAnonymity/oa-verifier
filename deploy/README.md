@@ -46,6 +46,7 @@ gh workflow run build-and-sign.yml
 | `STATION_REGISTRY_SECRET` | Station registry API secret |
 | `CHALLENGE_MIN_INTERVAL` | Min seconds between privacy checks (default: 300) |
 | `CHALLENGE_MAX_INTERVAL` | Max seconds between privacy checks (default: 600) |
+| `SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS` | Grace window for ownership checks near key expiry (default: 300) |
 
 ### Optional (for custom TLS domain)
 

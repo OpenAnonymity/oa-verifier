@@ -99,6 +99,22 @@ func ChallengeMaxInterval() int {
 	return v
 }
 
+// SubmitKeyOwnershipGraceSeconds returns SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS.
+// When a submitted key is near expiry, ownership checks are skipped to avoid false bans.
+func SubmitKeyOwnershipGraceSeconds() int {
+	mu.RLock()
+	defer mu.RUnlock()
+	s := os.Getenv("SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS")
+	if s == "" {
+		return 300
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil || v < 0 {
+		return 300
+	}
+	return v
+}
+
 // BannedStationsFile returns BANNED_STATIONS_FILE (default "banned_stations.json").
 func BannedStationsFile() string {
 	mu.RLock()

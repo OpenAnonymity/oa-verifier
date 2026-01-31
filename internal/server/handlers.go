@@ -358,6 +358,22 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	secondsLeft := req.KeyValidTill - now
+	graceSeconds := int64(config.SubmitKeyOwnershipGraceSeconds())
+	if secondsLeft <= graceSeconds {
+		slog.Warn("skipping key ownership check near expiry",
+			"station_id", req.StationID,
+			"seconds_left", secondsLeft)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":     "unverified",
+			"station_id": req.StationID,
+			"key_hash":   computeKeyHash(req.APIKey)[:16],
+			"detail":     "key_near_expiry",
+			"retryable":  false,
+		})
+		return
+	}
+
 	// Verify key ownership via OpenRouter API
 	keyHash := computeKeyHash(req.APIKey)
 	owned, err := openrouter.VerifyKeyOwnership(provisioningKey, keyHash)

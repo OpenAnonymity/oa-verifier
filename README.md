@@ -140,6 +140,7 @@ See [deploy/README.md](deploy/README.md) for details.
 | `TLS_DOMAIN` | Custom domain for Let's Encrypt |
 | `CHALLENGE_MIN_INTERVAL` | Min seconds between privacy checks |
 | `CHALLENGE_MAX_INTERVAL` | Max seconds between privacy checks |
+| `SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS` | Grace window for ownership checks |
 
 ## Documentation
 

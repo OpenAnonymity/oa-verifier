@@ -257,7 +257,8 @@ jobs:
                   optional_env_vars = [
                       "MAX_CONCURRENT_REQUESTS",
                       "RATE_LIMIT_RPS",
-                      "RATE_LIMIT_BURST"
+                      "RATE_LIMIT_BURST",
+                      "SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS"
                   ]
                   for env_var in required_env_vars:
                       containers[0]["env_rules"].append({
@@ -310,7 +311,8 @@ jobs:
                       {"name": "CHALLENGE_MAX_INTERVAL", "value": "${{ secrets.CHALLENGE_MAX_INTERVAL }}"},
                       {"name": "MAX_CONCURRENT_REQUESTS", "value": "${{ secrets.MAX_CONCURRENT_REQUESTS }}"},
                       {"name": "RATE_LIMIT_RPS", "value": "${{ secrets.RATE_LIMIT_RPS }}"},
-                      {"name": "RATE_LIMIT_BURST", "value": "${{ secrets.RATE_LIMIT_BURST }}"}
+                      {"name": "RATE_LIMIT_BURST", "value": "${{ secrets.RATE_LIMIT_BURST }}"},
+                      {"name": "SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS", "value": "${{ secrets.SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS }}"}
                     ],
                     "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
                   }
@@ -585,7 +587,8 @@ jobs:
                   optional_env_vars = [
                       "MAX_CONCURRENT_REQUESTS",
                       "RATE_LIMIT_RPS",
-                      "RATE_LIMIT_BURST"
+                      "RATE_LIMIT_BURST",
+                      "SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS"
                   ]
                   for env_var in required_env_vars:
                       containers[0]["env_rules"].append({
