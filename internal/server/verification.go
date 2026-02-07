@@ -102,27 +102,67 @@ func (s *Server) challengeOneStation(ctx context.Context, pk string, station mod
 	// Check privacy toggles
 	passed := false
 	reason := ""
+	unregister := false
+	unregisterReason := ""
+	unregisterDetail := ""
+	transientFailure := false
+	withinGrace := false
 
 	if station.CookieData == nil {
 		reason = "no_cookie_data"
+		transientFailure = true
+		unregisterReason = "no_cookie_data"
+		unregisterDetail = "missing_cookie_data"
 	} else {
 		auth, err := openrouter.NewAuthFromCookieData(station.CookieData)
 		if err != nil {
-			reason = fmt.Sprintf("auth_error:%v", err)
+			reason = "auth_error"
+			transientFailure = true
+			unregisterReason = "auth_error"
+			unregisterDetail = err.Error()
 		} else {
 			activityData, err := openrouter.FetchActivityData(auth)
 			if err != nil || activityData == nil {
 				reason = "activity_fetch_failed"
+				transientFailure = true
+				unregisterReason = "activity_fetch_failed"
+				if err != nil {
+					unregisterDetail = err.Error()
+				}
 			} else {
-				privacyOK, invalidToggles := challenge.CheckPrivacyToggles(activityData)
-				if privacyOK {
+				toggleResult, toggleDetails := challenge.CheckPrivacyToggles(activityData)
+				switch toggleResult {
+				case challenge.ToggleOK:
 					passed = true
-				} else {
-					reason = fmt.Sprintf("privacy_toggles_invalid:[%s]", strings.Join(invalidToggles, ","))
-					slog.Error("station failed privacy toggle check", "station_id", stationID, "toggles", invalidToggles)
+				case challenge.ToggleInvalid:
+					reason = fmt.Sprintf("privacy_toggles_invalid:[%s]", strings.Join(toggleDetails, ","))
+					slog.Error("station failed privacy toggle check", "station_id", stationID, "toggles", toggleDetails)
+				case challenge.ToggleMissing:
+					reason = fmt.Sprintf("privacy_toggles_missing:[%s]", strings.Join(toggleDetails, ","))
+					transientFailure = true
+					unregisterReason = "privacy_toggles_missing"
+					unregisterDetail = strings.Join(toggleDetails, ",")
+				case challenge.ToggleUnparseable:
+					reason = fmt.Sprintf("privacy_toggles_unparseable:[%s]", strings.Join(toggleDetails, ","))
+					transientFailure = true
+					unregisterReason = "privacy_toggles_unparseable"
+					unregisterDetail = strings.Join(toggleDetails, ",")
 				}
 			}
 		}
+	}
+
+	if transientFailure {
+		withinGrace = s.markTransientFailure(pk, unregisterReason, 0, unregisterDetail)
+		if !withinGrace {
+			unregister = true
+		}
+	}
+
+	if unregister {
+		slog.Warn("unregistering station due to verification failure", "station_id", stationID, "reason", unregisterReason)
+		s.unregisterStation(station.StationID, pk, stationEmail, unregisterReason, 0, unregisterDetail)
+		return
 	}
 
 	// Update station state
@@ -135,9 +175,17 @@ func (s *Server) challengeOneStation(ctx context.Context, pk string, station mod
 			now := utcNow()
 			current.LastVerified = &now
 			slog.Info("privacy toggles OK", "station_id", stationID)
+			current.FailureFirstAt = nil
+			current.FailureLastAt = nil
+			current.FailureReason = ""
+			current.FailureDetail = ""
+			current.FailureStatus = 0
+			current.FailureCount = 0
 		} else {
-			current.LastVerified = nil
-			slog.Warn("verification FAILED", "station_id", stationID, "reason", reason)
+			if !transientFailure || !withinGrace {
+				current.LastVerified = nil
+			}
+			slog.Warn("verification FAILED", "station_id", stationID, "reason", reason, "grace", withinGrace)
 		}
 	}
 	s.mu.Unlock()
@@ -147,7 +195,3 @@ func (s *Server) challengeOneStation(ctx context.Context, pk string, station mod
 		s.banned.Ban(station.StationID, pk, stationEmail, reason)
 	}
 }
-
-
-
-

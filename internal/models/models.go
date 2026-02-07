@@ -48,6 +48,12 @@ type Station struct {
 	LastVerified    *string // nil if not verified
 	ProvisioningKey string
 	NextChallengeAt time.Time
+	FailureFirstAt  *time.Time
+	FailureLastAt   *time.Time
+	FailureReason   string
+	FailureDetail   string
+	FailureStatus   int
+	FailureCount    int
 }
 
 // Cookie represents a browser cookie.

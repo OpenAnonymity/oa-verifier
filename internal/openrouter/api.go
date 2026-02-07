@@ -2,6 +2,7 @@ package openrouter
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,12 +14,15 @@ import (
 	"time"
 
 	"github.com/oa-verifier/internal/config"
+	"github.com/oa-verifier/internal/netretry"
 )
 
 const (
 	maxRetries = 5
 	retryDelay = 2 * time.Second
 )
+
+var retryCfg = netretry.DefaultConfig(maxRetries)
 
 // Shared HTTP client with connection pooling
 var httpClient = &http.Client{
@@ -58,9 +62,10 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 		if err != nil {
 			slog.Warn("fetch_activity_data error", "attempt", attempt, "error", err)
 			if attempt < maxRetries {
-				time.Sleep(retryDelay)
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
 			}
-			continue
+			return nil, err
 		}
 
 		body, _ := io.ReadAll(resp.Body)
@@ -68,10 +73,11 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 
 		if resp.StatusCode != 200 {
 			slog.Warn("fetch_activity_data failed", "attempt", attempt, "status", resp.StatusCode)
-			if attempt < maxRetries {
-				time.Sleep(retryDelay)
+			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
 			}
-			continue
+			return nil, fmt.Errorf("fetch_activity_data failed: status %d", resp.StatusCode)
 		}
 
 		// Parse response
@@ -96,7 +102,8 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 
 		slog.Warn("fetch_activity_data could not parse response", "attempt", attempt)
 		if attempt < maxRetries {
-			time.Sleep(retryDelay)
+			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+			continue
 		}
 	}
 
@@ -179,9 +186,10 @@ func DeleteProvisioningKey(auth *Auth, keyHash string) error {
 		if err != nil {
 			slog.Warn("delete_provisioning_key error", "attempt", attempt, "error", err)
 			if attempt < maxRetries {
-				time.Sleep(retryDelay)
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
 			}
-			continue
+			return err
 		}
 
 		body, _ := io.ReadAll(resp.Body)
@@ -189,20 +197,22 @@ func DeleteProvisioningKey(auth *Auth, keyHash string) error {
 
 		if resp.StatusCode != 200 {
 			slog.Warn("delete_provisioning_key failed", "attempt", attempt, "status", resp.StatusCode)
-			if attempt < maxRetries {
-				time.Sleep(retryDelay)
+			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
 			}
-			continue
+			return fmt.Errorf("delete_provisioning_key failed: status %d", resp.StatusCode)
 		}
 
 		if strings.Contains(string(body), `"deleted":true`) || strings.Contains(string(body), `"__kind":"OK"`) {
-			slog.Info("deleted provisioning key", "hash", keyHash[:16])
+			slog.Info("deleted provisioning key", "hash", keyHash[:min(16, len(keyHash))])
 			return nil
 		}
 
 		slog.Warn("delete_provisioning_key unexpected response", "attempt", attempt)
 		if attempt < maxRetries {
-			time.Sleep(retryDelay)
+			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+			continue
 		}
 	}
 
@@ -269,9 +279,10 @@ func CreateProvisioningKey(auth *Auth, label string) (string, error) {
 		if err != nil {
 			slog.Warn("create_provisioning_key error", "attempt", attempt, "error", err)
 			if attempt < maxRetries {
-				time.Sleep(retryDelay)
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
 			}
-			continue
+			return "", err
 		}
 
 		body, _ := io.ReadAll(resp.Body)
@@ -279,10 +290,11 @@ func CreateProvisioningKey(auth *Auth, label string) (string, error) {
 
 		if resp.StatusCode != 200 {
 			slog.Warn("create_provisioning_key failed", "attempt", attempt, "status", resp.StatusCode)
-			if attempt < maxRetries {
-				time.Sleep(retryDelay)
+			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
 			}
-			continue
+			return "", fmt.Errorf("create_provisioning_key failed: status %d", resp.StatusCode)
 		}
 
 		for _, line := range strings.Split(string(body), "\n") {
@@ -304,7 +316,8 @@ func CreateProvisioningKey(auth *Auth, label string) (string, error) {
 
 		slog.Warn("create_provisioning_key could not parse key from response", "attempt", attempt)
 		if attempt < maxRetries {
-			time.Sleep(retryDelay)
+			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+			continue
 		}
 	}
 
@@ -316,6 +329,7 @@ type OwnershipCheckResult struct {
 	Owned      bool
 	NotOwned   bool
 	StatusCode int
+	Body       string
 }
 
 // VerifyKeyOwnership verifies that a key belongs to the station's account.
@@ -328,35 +342,43 @@ func VerifyKeyOwnership(provisioningKey, keyHash string) (OwnershipCheckResult, 
 	if err != nil {
 		return OwnershipCheckResult{}, err
 	}
-	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	result := OwnershipCheckResult{
+		StatusCode: resp.StatusCode,
+		Body:       string(body),
+	}
 
 	if resp.StatusCode == 404 {
 		slog.Warn("key not found", "hash", keyHash[:16])
-		return OwnershipCheckResult{NotOwned: true, StatusCode: resp.StatusCode}, nil
+		result.NotOwned = true
+		return result, nil
 	}
 
 	if resp.StatusCode != 200 {
-		return OwnershipCheckResult{StatusCode: resp.StatusCode}, fmt.Errorf("key verification failed: status %d", resp.StatusCode)
+		return result, nil
 	}
 
-	var result struct {
+	var resultJSON struct {
 		Data struct {
 			Hash string `json:"hash"`
 		} `json:"data"`
 	}
 
-	body, _ := io.ReadAll(resp.Body)
-	if err := json.Unmarshal(body, &result); err != nil {
-		return OwnershipCheckResult{StatusCode: resp.StatusCode}, err
+	if err := json.Unmarshal(body, &resultJSON); err != nil {
+		return result, err
 	}
 
-	if result.Data.Hash == keyHash {
+	if resultJSON.Data.Hash == keyHash {
 		slog.Debug("key ownership verified", "hash", keyHash[:16])
-		return OwnershipCheckResult{Owned: true, StatusCode: resp.StatusCode}, nil
+		result.Owned = true
+		return result, nil
 	}
 
 	slog.Warn("key hash mismatch", "expected", keyHash[:16])
-	return OwnershipCheckResult{NotOwned: true, StatusCode: resp.StatusCode}, nil
+	result.NotOwned = true
+	return result, nil
 }
 
 // FetchOrgPublicKey fetches the org's public key from registry.
@@ -366,33 +388,60 @@ func FetchOrgPublicKey() (string, error) {
 		return "", fmt.Errorf("REGISTRY_URL not configured")
 	}
 
-	req, _ := http.NewRequest("GET", registryURL+"/api/public_key", nil)
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
+	cfg := netretry.DefaultConfig(3)
+	var lastErr error
+	for attempt := 1; attempt <= cfg.Attempts; attempt++ {
+		req, _ := http.NewRequest("GET", registryURL+"/api/public_key", nil)
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < cfg.Attempts {
+				_ = netretry.Sleep(context.Background(), attempt, cfg)
+				continue
+			}
+			return "", err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("failed to fetch org public key: status %d", resp.StatusCode)
-	}
+		if resp.StatusCode != 200 {
+			lastErr = fmt.Errorf("failed to fetch org public key: status %d", resp.StatusCode)
+			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < cfg.Attempts {
+				_ = netretry.Sleep(context.Background(), attempt, cfg)
+				continue
+			}
+			return "", lastErr
+		}
 
-	var result struct {
-		PublicKey string `json:"public_key"`
-		Algorithm string `json:"algorithm"`
-	}
+		var result struct {
+			PublicKey string `json:"public_key"`
+			Algorithm string `json:"algorithm"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			lastErr = err
+			if attempt < cfg.Attempts {
+				_ = netretry.Sleep(context.Background(), attempt, cfg)
+				continue
+			}
+			return "", err
+		}
 
-	body, _ := io.ReadAll(resp.Body)
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", err
-	}
+		if result.PublicKey != "" {
+			slog.Info("fetched org public key", "key", result.PublicKey[:16], "algorithm", result.Algorithm)
+			return result.PublicKey, nil
+		}
 
-	if result.PublicKey != "" {
-		slog.Info("fetched org public key", "key", result.PublicKey[:16], "algorithm", result.Algorithm)
-		return result.PublicKey, nil
+		lastErr = fmt.Errorf("empty public key in response")
+		if attempt < cfg.Attempts {
+			_ = netretry.Sleep(context.Background(), attempt, cfg)
+			continue
+		}
+		return "", lastErr
 	}
-
-	return "", fmt.Errorf("empty public key in response")
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("failed to fetch org public key")
 }
 
 // NotifyOrgBanned notifies org about a banned station.
@@ -408,22 +457,99 @@ func NotifyOrgBanned(stationID, reason string) error {
 		"reason":     reason,
 	})
 
-	req, _ := http.NewRequest("POST", registryURL+"/verifier/ban_station", bytes.NewReader(payload))
-	req.Header.Set("Authorization", "Bearer "+registrySecret)
-	req.Header.Set("Content-Type", "application/json")
+	cfg := netretry.DefaultConfig(3)
+	var lastErr error
+	for attempt := 1; attempt <= cfg.Attempts; attempt++ {
+		req, _ := http.NewRequest("POST", registryURL+"/verifier/ban_station", bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+registrySecret)
+		req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		slog.Warn("failed to notify org about ban", "error", err)
-		return err
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < cfg.Attempts {
+				_ = netretry.Sleep(context.Background(), attempt, cfg)
+				continue
+			}
+			slog.Warn("failed to notify org about ban", "error", err)
+			return err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == 200 {
+			slog.Info("notified org about banned station", "station_id", stationID)
+			return nil
+		}
+
+		lastErr = fmt.Errorf("notify failed: status %d", resp.StatusCode)
+		if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < cfg.Attempts {
+			_ = netretry.Sleep(context.Background(), attempt, cfg)
+			continue
+		}
+
+		slog.Warn("failed to notify org about ban", "status", resp.StatusCode, "body", string(body))
+		return lastErr
 	}
-	defer resp.Body.Close()
+	return lastErr
+}
 
-	if resp.StatusCode == 200 {
-		slog.Info("notified org about banned station", "station_id", stationID)
-		return nil
+// OrgUpdate represents a station update payload sent to the registry.
+type OrgUpdate struct {
+	StationID   string `json:"station_id"`
+	PublicKey   string `json:"public_key"`
+	Email       string `json:"email"`
+	Reason      string `json:"reason"`
+	StatusCode  int    `json:"status_code"`
+	ErrorDetail string `json:"error_detail"`
+	Event       string `json:"event"`
+	OccurredAt  string `json:"occurred_at"`
+	Source      string `json:"source"`
+}
+
+// NotifyOrgUpdate notifies org about station status changes.
+func NotifyOrgUpdate(update OrgUpdate) error {
+	registryURL := config.RegistryURL()
+	registrySecret := config.RegistrySecret()
+	if registryURL == "" || registrySecret == "" {
+		return nil // Not configured, skip
 	}
 
-	slog.Warn("failed to notify org about ban", "status", resp.StatusCode)
-	return fmt.Errorf("notify failed: status %d", resp.StatusCode)
+	payload, _ := json.Marshal(update)
+
+	cfg := netretry.DefaultConfig(3)
+	var lastErr error
+	for attempt := 1; attempt <= cfg.Attempts; attempt++ {
+		req, _ := http.NewRequest("POST", registryURL+"/verifier/update", bytes.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+registrySecret)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < cfg.Attempts {
+				_ = netretry.Sleep(context.Background(), attempt, cfg)
+				continue
+			}
+			slog.Warn("failed to notify org update", "error", err)
+			return err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == 200 {
+			slog.Info("notified org update", "station_id", update.StationID, "event", update.Event)
+			return nil
+		}
+
+		lastErr = fmt.Errorf("update notify failed: status %d", resp.StatusCode)
+		if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < cfg.Attempts {
+			_ = netretry.Sleep(context.Background(), attempt, cfg)
+			continue
+		}
+
+		slog.Warn("failed to notify org update", "status", resp.StatusCode, "body", string(body))
+		return lastErr
+	}
+	return lastErr
 }

@@ -17,13 +17,13 @@ const (
 
 // RequiredToggles - privacy toggles that MUST be false (security-critical)
 var RequiredToggles = map[string]bool{
-	"enable_logging":              false,
-	"enable_training":             false,
-	"enable_free_model_training":  false,
+	"enable_logging":                false,
+	"enable_training":               false,
+	"enable_free_model_training":    false,
 	"enable_free_model_publication": false,
-	"enforce_zdr":                 false,
-	"always_enforce_allowed":      false,
-	"is_broadcast_enabled":        false,
+	"enforce_zdr":                   false,
+	"always_enforce_allowed":        false,
+	"is_broadcast_enabled":          false,
 }
 
 var (
@@ -111,6 +111,22 @@ func SubmitKeyOwnershipGraceSeconds() int {
 	v, err := strconv.Atoi(s)
 	if err != nil || v < 0 {
 		return 300
+	}
+	return v
+}
+
+// StationFailureGraceSeconds returns STATION_FAILURE_GRACE_SECONDS.
+// Grace window before unregistering on transient failures (default 600).
+func StationFailureGraceSeconds() int {
+	mu.RLock()
+	defer mu.RUnlock()
+	s := os.Getenv("STATION_FAILURE_GRACE_SECONDS")
+	if s == "" {
+		return 600
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil || v < 0 {
+		return 600
 	}
 	return v
 }

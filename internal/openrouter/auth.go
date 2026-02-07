@@ -2,6 +2,7 @@
 package openrouter
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/oa-verifier/internal/config"
+	"github.com/oa-verifier/internal/netretry"
 )
 
 const (
@@ -142,45 +144,80 @@ func (a *Auth) refreshToken() error {
 		data.Set("organization_id", orgID)
 	}
 
-	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
-	if err != nil {
-		return err
+	cfg := netretry.DefaultConfig(4)
+	var lastErr error
+
+	for attempt := 1; attempt <= cfg.Attempts; attempt++ {
+		req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
+		if err != nil {
+			return err
+		}
+
+		q := req.URL.Query()
+		for k, v := range a.clerkParams {
+			q.Set(k, v)
+		}
+		req.URL.RawQuery = q.Encode()
+
+		req.Header.Set("Origin", "https://openrouter.ai")
+		req.Header.Set("Referer", "https://openrouter.ai/")
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		req.AddCookie(&http.Cookie{Name: "__client", Value: a.state["client_token"]})
+		req.AddCookie(&http.Cookie{Name: "__client_uat", Value: a.state["client_uat"]})
+
+		resp, err := a.client.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < cfg.Attempts {
+				_ = netretry.Sleep(context.Background(), attempt, cfg)
+				continue
+			}
+			return err
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			lastErr = fmt.Errorf("token refresh failed: status %d", resp.StatusCode)
+			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < cfg.Attempts {
+				_ = netretry.Sleep(context.Background(), attempt, cfg)
+				continue
+			}
+			return lastErr
+		}
+
+		var result struct {
+			JWT string `json:"jwt"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			lastErr = err
+			if attempt < cfg.Attempts {
+				_ = netretry.Sleep(context.Background(), attempt, cfg)
+				continue
+			}
+			return err
+		}
+		if result.JWT == "" {
+			lastErr = fmt.Errorf("token refresh failed: empty jwt")
+			if attempt < cfg.Attempts {
+				_ = netretry.Sleep(context.Background(), attempt, cfg)
+				continue
+			}
+			return lastErr
+		}
+
+		a.mu.Lock()
+		a.sessionJWT = result.JWT
+		a.mu.Unlock()
+		return nil
 	}
 
-	q := req.URL.Query()
-	for k, v := range a.clerkParams {
-		q.Set(k, v)
+	if lastErr != nil {
+		return lastErr
 	}
-	req.URL.RawQuery = q.Encode()
-
-	req.Header.Set("Origin", "https://openrouter.ai")
-	req.Header.Set("Referer", "https://openrouter.ai/")
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	req.AddCookie(&http.Cookie{Name: "__client", Value: a.state["client_token"]})
-	req.AddCookie(&http.Cookie{Name: "__client_uat", Value: a.state["client_uat"]})
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("token refresh failed: status %d", resp.StatusCode)
-	}
-
-	var result struct {
-		JWT string `json:"jwt"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return err
-	}
-
-	a.mu.Lock()
-	a.sessionJWT = result.JWT
-	a.mu.Unlock()
-	return nil
+	return fmt.Errorf("token refresh failed after retries")
 }
 
 func (a *Auth) fetchActionHashes() {

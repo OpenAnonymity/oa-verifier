@@ -39,6 +39,37 @@ func writeError(w http.ResponseWriter, status int, detail string) {
 	writeJSON(w, status, map[string]string{"detail": detail})
 }
 
+func writeUnregisteredError(w http.ResponseWriter) {
+	writeError(w, http.StatusConflict, "Station credentials fetch failed; treat station as unregistered.")
+}
+
+func (s *Server) banStationForKeyNotOwned(w http.ResponseWriter, stationID, publicKey, stationEmail, keyHashFull string) {
+	reason := "issued_api_key_not_owned_by_registered_or_account"
+	bannedAt := utcNow()
+	slog.Error("key not owned by station - BANNING (potential shadow account)", "hash", keyHashFull[:16], "station_id", stationID)
+	s.banned.Ban(stationID, publicKey, stationEmail, reason)
+
+	// Remove from active stations
+	s.mu.Lock()
+	delete(s.stations, publicKey)
+	if stationEmail != "" {
+		delete(s.emailToPK, stationEmail)
+	}
+	delete(s.stationIDToPK, stationID)
+	s.mu.Unlock()
+
+	writeJSON(w, http.StatusForbidden, map[string]any{
+		"error":  "Key not owned by station account. Station banned.",
+		"status": "banned",
+		"banned_station": map[string]string{
+			"station_id": stationID,
+			"public_key": publicKey,
+			"reason":     reason,
+			"banned_at":  bannedAt,
+		},
+	})
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	stationCount := len(s.stations)
@@ -191,10 +222,11 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		"display_name", req.DisplayName)
 
 	// Verify privacy toggles immediately
-	privacyOK, invalidToggles := challenge.CheckPrivacyToggles(data)
-	if !privacyOK {
-		reason := fmt.Sprintf("privacy_toggles_invalid_on_register:[%s]", strings.Join(invalidToggles, ","))
-		slog.Error("registration rejected: FAILED privacy toggle check - BANNING", "station_id", stationID, "toggles", invalidToggles)
+	toggleResult, toggleDetails := challenge.CheckPrivacyToggles(data)
+	switch toggleResult {
+	case challenge.ToggleInvalid:
+		reason := fmt.Sprintf("privacy_toggles_invalid_on_register:[%s]", strings.Join(toggleDetails, ","))
+		slog.Error("registration rejected: FAILED privacy toggle check - BANNING", "station_id", stationID, "toggles", toggleDetails)
 		effectiveStationID := stationID
 		if effectiveStationID == "" {
 			effectiveStationID = "unknown"
@@ -202,6 +234,12 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		s.banned.Ban(effectiveStationID, req.PublicKey, email, reason)
 		writeError(w, http.StatusForbidden, "Privacy toggles not properly configured. Station banned.")
 		return
+	case challenge.ToggleMissing, challenge.ToggleUnparseable:
+		slog.Warn("registration rejected: unable to verify privacy toggles", "station_id", stationID, "result", toggleResult, "details", toggleDetails)
+		writeError(w, http.StatusServiceUnavailable, "Unable to verify privacy toggles; try again.")
+		return
+	case challenge.ToggleOK:
+		// continue
 	}
 
 	now := utcNow()
@@ -223,7 +261,10 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if provisioningKey == "" {
 		label := generateProvLabel(stationID)
 		// Cleanup any existing keys with this label
-		cleanedUp, _ := openrouter.CleanupProvisioningKeys(auth, label)
+		cleanedUp, cleanupErr := openrouter.CleanupProvisioningKeys(auth, label)
+		if cleanupErr != nil {
+			slog.Warn("failed cleanup of existing provisioning keys", "station_id", stationID, "label", label, "error", cleanupErr)
+		}
 		if cleanedUp > 0 {
 			slog.Info("cleaned up existing provisioning keys", "station_id", stationID, "label", label, "count", cleanedUp)
 		}
@@ -361,29 +402,33 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 
 	secondsLeft := req.KeyValidTill - now
 	graceSeconds := int64(config.SubmitKeyOwnershipGraceSeconds())
-	if secondsLeft <= graceSeconds {
-		slog.Warn("skipping key ownership check near expiry",
-			"station_id", req.StationID,
-			"seconds_left", secondsLeft)
-		writeJSON(w, http.StatusOK, map[string]any{
-			"status":     "unverified",
-			"station_id": req.StationID,
-			"key_hash":   computeKeyHash(req.APIKey)[:16],
-			"detail":     "key_near_expiry",
-			"retryable":  false,
-		})
-		return
-	}
+	nearExpiry := secondsLeft <= graceSeconds
 
 	// Verify key ownership via OpenRouter API
 	keyHashFull := computeKeyHash(req.APIKey)
 	retryBase := 250 * time.Millisecond
 	maxJitter := 200 * time.Millisecond
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	refreshed := false
+
+	sleepBackoff := func(attempt int) {
+		backoff := retryBase * time.Duration(1<<uint(attempt-1))
+		jitter := time.Duration(rng.Int63n(int64(maxJitter)))
+		time.Sleep(backoff + jitter)
+	}
 
 	for attempt := 1; attempt <= 3; attempt++ {
 		result, err := openrouter.VerifyKeyOwnership(provisioningKey, keyHashFull)
-		if err == nil {
+		if result.StatusCode == 0 || (result.StatusCode == 200 && err != nil) {
+			if attempt < 3 {
+				sleepBackoff(attempt)
+				continue
+			}
+			break
+		}
+
+		switch result.StatusCode {
+		case http.StatusOK:
 			if result.Owned {
 				slog.Info("key ownership verified", "station_id", req.StationID, "hash", keyHashFull[:16])
 				writeJSON(w, http.StatusOK, map[string]any{
@@ -394,39 +439,77 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if result.NotOwned {
-				// Key doesn't belong to station - BAN immediately
-				reason := "issued_api_key_not_owned_by_registered_or_account"
-				bannedAt := utcNow()
-				slog.Error("key not owned by station - BANNING (potential shadow account)", "hash", keyHashFull[:16], "station_id", req.StationID)
-				s.banned.Ban(req.StationID, publicKey, stationEmail, reason)
-
-				// Remove from active stations
-				s.mu.Lock()
-				delete(s.stations, publicKey)
-				if stationEmail != "" {
-					delete(s.emailToPK, stationEmail)
-				}
-				delete(s.stationIDToPK, req.StationID)
-				s.mu.Unlock()
-
-				writeJSON(w, http.StatusForbidden, map[string]any{
-					"error":  "Key not owned by station account. Station banned.",
-					"status": "banned",
-					"banned_station": map[string]string{
+				if nearExpiry {
+					writeJSON(w, http.StatusOK, map[string]any{
+						"status":     "unverified",
 						"station_id": req.StationID,
-						"public_key": publicKey,
-						"reason":     reason,
-						"banned_at":  bannedAt,
-					},
+						"key_hash":   keyHashFull[:16],
+						"detail":     "key_near_expiry_not_owned",
+						"retryable":  false,
+					})
+					return
+				}
+				s.banStationForKeyNotOwned(w, req.StationID, publicKey, stationEmail, keyHashFull)
+				return
+			}
+		case http.StatusNotFound:
+			if nearExpiry {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"status":     "unverified",
+					"station_id": req.StationID,
+					"key_hash":   keyHashFull[:16],
+					"detail":     "key_near_expiry_not_owned",
+					"retryable":  false,
 				})
 				return
 			}
-		}
-
-		if attempt < 3 {
-			backoff := retryBase * time.Duration(1<<uint(attempt-1))
-			jitter := time.Duration(rng.Int63n(int64(maxJitter)))
-			time.Sleep(backoff + jitter)
+			s.banStationForKeyNotOwned(w, req.StationID, publicKey, stationEmail, keyHashFull)
+			return
+		case http.StatusUnauthorized:
+			if !refreshed {
+				newKey, refreshErr := s.refreshProvisioningKey(req.StationID, publicKey, stationData.CookieData)
+				if refreshErr != nil {
+					withinGrace := s.markTransientFailure(publicKey, "provisioning_key_refresh_failed", result.StatusCode, refreshErr.Error())
+					if withinGrace {
+						writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+							"status":     "unverified",
+							"station_id": req.StationID,
+							"key_hash":   keyHashFull[:16],
+							"detail":     "auth_refresh_failed",
+							"retryable":  true,
+						})
+						return
+					}
+					s.unregisterStation(req.StationID, publicKey, stationEmail, "provisioning_key_refresh_failed", result.StatusCode, refreshErr.Error())
+					writeUnregisteredError(w)
+					return
+				}
+				s.clearTransientFailure(publicKey)
+				provisioningKey = newKey
+				refreshed = true
+				continue
+			}
+			if attempt < 3 {
+				sleepBackoff(attempt)
+				continue
+			}
+			writeError(w, http.StatusUnauthorized, "Unauthorized Error (OpenRouter)")
+			return
+		case http.StatusForbidden:
+			if attempt < 3 {
+				sleepBackoff(attempt)
+				continue
+			}
+			writeError(w, http.StatusForbidden, "Forbidden Error (OpenRouter)")
+			return
+		case http.StatusTooManyRequests:
+			writeError(w, http.StatusTooManyRequests, "Too Many Requests Error (OpenRouter)")
+			return
+		default:
+			if attempt < 3 {
+				sleepBackoff(attempt)
+				continue
+			}
 		}
 	}
 
