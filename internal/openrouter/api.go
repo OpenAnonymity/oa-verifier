@@ -19,10 +19,23 @@ import (
 
 const (
 	maxRetries = 5
-	retryDelay = 2 * time.Second
+
+	managementKeysRouterState = "%5B%22%22%2C%7B%22children%22%3A%5B%22(user)%22%2C%7B%22children%22%3A%5B%22settings%22%2C%7B%22children%22%3A%5B%22management-keys%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
 )
 
 var retryCfg = netretry.DefaultConfig(maxRetries)
+
+var (
+	escapedObjectRe = regexp.MustCompile(`\{[^{}]*\\"hash\\":\\"[0-9a-f]{64}\\"[^{}]*\}`)
+	escapedHashRe   = regexp.MustCompile(`\\"hash\\":\\"([0-9a-f]{64})\\"`)
+	escapedNameRe   = regexp.MustCompile(`\\"name\\":\\"([^"\\]+)\\"`)
+	escapedProvRe   = regexp.MustCompile(`\\"is_provisioning_key\\":(true|false)`)
+
+	plainObjectRe = regexp.MustCompile(`\{[^{}]*"hash":"[0-9a-f]{64}"[^{}]*\}`)
+	plainHashRe   = regexp.MustCompile(`"hash":"([0-9a-f]{64})"`)
+	plainNameRe   = regexp.MustCompile(`"name":"([^"]+)"`)
+	plainProvRe   = regexp.MustCompile(`"is_provisioning_key":(true|false)`)
+)
 
 // Shared HTTP client with connection pooling
 var httpClient = &http.Client{
@@ -114,47 +127,90 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 func FetchProvisioningKeys(auth *Auth) ([]map[string]string, error) {
 	cookies := auth.GetCookies()
 
-	keyRe := regexp.MustCompile(`\\"label\\":\\"([^"\\]+)\\",\\"name\\":\\"([0-9a-f]{16})\\".+?\\"hash\\":\\"([0-9a-f]{64})\\"`)
-
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, _ := http.NewRequest("GET", config.BaseURL+"/settings/provisioning-keys?page=1", nil)
+		req, _ := http.NewRequest("GET", config.BaseURL+managementKeysPagePath, nil)
 		for _, c := range cookies {
 			req.AddCookie(c)
 		}
 
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			slog.Warn("fetch_provisioning_keys error", "attempt", attempt, "error", err)
+			slog.Warn("fetch_provisioning_keys error", "attempt", attempt, "path", managementKeysPagePath, "error", err)
 			if attempt < maxRetries {
-				time.Sleep(retryDelay)
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
 			}
-			continue
+			return nil, err
 		}
 
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
 		if resp.StatusCode != 200 {
-			slog.Warn("fetch_provisioning_keys failed", "attempt", attempt, "status", resp.StatusCode)
-			if attempt < maxRetries {
-				time.Sleep(retryDelay)
+			slog.Warn("fetch_provisioning_keys failed", "attempt", attempt, "path", managementKeysPagePath, "status", resp.StatusCode)
+			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
 			}
-			continue
+			return nil, fmt.Errorf("fetch_provisioning_keys failed: status %d", resp.StatusCode)
 		}
 
-		matches := keyRe.FindAllStringSubmatch(string(body), -1)
-		var keys []map[string]string
-		for _, m := range matches {
-			keys = append(keys, map[string]string{
-				"label": m[1],
-				"name":  m[2],
-				"hash":  m[3],
-			})
-		}
-		return keys, nil
+		return parseProvisioningKeysResponse(string(body)), nil
 	}
 
 	return nil, fmt.Errorf("fetch_provisioning_keys failed after %d attempts", maxRetries)
+}
+
+func parseProvisioningKeysResponse(body string) []map[string]string {
+	candidates := parseProvisioningKeyCandidates(body, escapedObjectRe, escapedHashRe, escapedNameRe, escapedProvRe)
+
+	normalized := strings.ReplaceAll(body, `\"`, `"`)
+	candidates = append(candidates, parseProvisioningKeyCandidates(normalized, plainObjectRe, plainHashRe, plainNameRe, plainProvRe)...)
+
+	keys := make([]map[string]string, 0, len(candidates))
+	seen := make(map[string]struct{})
+	for _, key := range candidates {
+		hash := key["hash"]
+		if hash == "" {
+			continue
+		}
+		if _, exists := seen[hash]; exists {
+			continue
+		}
+		seen[hash] = struct{}{}
+		keys = append(keys, key)
+	}
+
+	return keys
+}
+
+func parseProvisioningKeyCandidates(body string, objectRe, hashRe, nameRe, provisioningRe *regexp.Regexp) []map[string]string {
+	objects := objectRe.FindAllString(body, -1)
+	keys := make([]map[string]string, 0, len(objects))
+
+	for _, obj := range objects {
+		hashMatch := hashRe.FindStringSubmatch(obj)
+		if len(hashMatch) < 2 || hashMatch[1] == "" {
+			continue
+		}
+
+		nameMatch := nameRe.FindStringSubmatch(obj)
+		if len(nameMatch) < 2 || nameMatch[1] == "" {
+			continue
+		}
+
+		provisioningMatch := provisioningRe.FindStringSubmatch(obj)
+		if len(provisioningMatch) >= 2 && provisioningMatch[1] != "true" {
+			continue
+		}
+
+		keys = append(keys, map[string]string{
+			"name": nameMatch[1],
+			"hash": hashMatch[1],
+		})
+	}
+
+	return keys
 }
 
 // DeleteProvisioningKey deletes a provisioning key by hash.
@@ -165,18 +221,17 @@ func DeleteProvisioningKey(auth *Auth, keyHash string) error {
 	}
 
 	cookies := auth.GetCookies()
-	routerState := "%5B%22%22%2C%7B%22children%22%3A%5B%22(user)%22%2C%7B%22children%22%3A%5B%22settings%22%2C%7B%22children%22%3A%5B%22provisioning-keys%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
 	payload := fmt.Sprintf(`[%q,{"deleted":true},{"isProvisioningKey":true}]`, keyHash)
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, _ := http.NewRequest("POST", config.BaseURL+"/settings/provisioning-keys?page=1", strings.NewReader(payload))
+		req, _ := http.NewRequest("POST", config.BaseURL+managementKeysPagePath, strings.NewReader(payload))
 		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
 		req.Header.Set("Accept", "text/x-component")
 		req.Header.Set("Accept-Encoding", "identity")
 		req.Header.Set("Next-Action", actionHash)
-		req.Header.Set("Next-Router-State-Tree", routerState)
+		req.Header.Set("Next-Router-State-Tree", managementKeysRouterState)
 		req.Header.Set("Origin", config.BaseURL)
-		req.Header.Set("Referer", config.BaseURL+"/settings/provisioning-keys?page=1")
+		req.Header.Set("Referer", config.BaseURL+managementKeysPagePath)
 
 		for _, c := range cookies {
 			req.AddCookie(c)
@@ -222,8 +277,11 @@ func DeleteProvisioningKey(auth *Auth, keyHash string) error {
 // CleanupProvisioningKeys deletes all provisioning keys matching the label.
 func CleanupProvisioningKeys(auth *Auth, label string) (int, error) {
 	keys, err := FetchProvisioningKeys(auth)
-	if err != nil || len(keys) == 0 {
+	if err != nil {
 		return 0, err
+	}
+	if len(keys) == 0 {
+		return 0, nil
 	}
 
 	var matching []map[string]string
@@ -257,18 +315,17 @@ func CreateProvisioningKey(auth *Auth, label string) (string, error) {
 	}
 
 	cookies := auth.GetCookies()
-	routerState := "%5B%22%22%2C%7B%22children%22%3A%5B%22(user)%22%2C%7B%22children%22%3A%5B%22settings%22%2C%7B%22children%22%3A%5B%22provisioning-keys%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
 	payload := fmt.Sprintf(`[{"name":%q}]`, label)
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, _ := http.NewRequest("POST", config.BaseURL+"/settings/provisioning-keys", strings.NewReader(payload))
+		req, _ := http.NewRequest("POST", config.BaseURL+managementKeysPagePath, strings.NewReader(payload))
 		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
 		req.Header.Set("Accept", "text/x-component")
 		req.Header.Set("Accept-Encoding", "identity")
 		req.Header.Set("Next-Action", actionHash)
-		req.Header.Set("Next-Router-State-Tree", routerState)
+		req.Header.Set("Next-Router-State-Tree", managementKeysRouterState)
 		req.Header.Set("Origin", config.BaseURL)
-		req.Header.Set("Referer", config.BaseURL+"/settings/provisioning-keys")
+		req.Header.Set("Referer", config.BaseURL+managementKeysPagePath)
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
 
 		for _, c := range cookies {

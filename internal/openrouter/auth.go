@@ -18,19 +18,26 @@ import (
 )
 
 const (
-	clerkJSURL = "https://clerk.openrouter.ai/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
-	clerkAPI   = "https://clerk.openrouter.ai/v1/client/sessions/%s/tokens"
+	clerkJSURL                 = "https://clerk.openrouter.ai/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+	clerkAPI                   = "https://clerk.openrouter.ai/v1/client/sessions/%s/tokens"
+	managementKeysPagePath     = "/settings/management-keys"
+	provisioningKeysLegacyPath = "/settings/provisioning-keys"
 )
 
 var pages = map[string]string{
-	"activity":          "/activity",
-	"provisioning_keys": "/settings/provisioning-keys",
+	"activity":                 "/activity",
+	"management_keys":          managementKeysPagePath,
+	"provisioning_keys_legacy": provisioningKeysLegacyPath,
 }
 
 var actionNameMap = map[string]string{
-	"getCurrentUserSA":          "activity",
+	"getCurrentUserSA":           "activity",
 	"createProvisioningAPIKeySA": "provisioning_keys_create",
-	"updateAPIKeySA":            "provisioning_keys_delete",
+	"createManagementAPIKeySA":   "provisioning_keys_create",
+	"createManagementKeySA":      "provisioning_keys_create",
+	"updateAPIKeySA":             "provisioning_keys_delete",
+	"updateManagementAPIKeySA":   "provisioning_keys_delete",
+	"updateManagementKeySA":      "provisioning_keys_delete",
 }
 
 // Auth manages OpenRouter authentication via Clerk cookies.
@@ -224,10 +231,11 @@ func (a *Auth) fetchActionHashes() {
 	cookies := a.GetCookies()
 	fetchedChunks := make(map[string]bool)
 	actionHashes := make(map[string]string)
+	requiredHashes := requiredActionHashCount()
 
 	hashRe := regexp.MustCompile(`"([0-9a-f]{40,42})"`)
 	chunkRe := regexp.MustCompile(`/_next/static/chunks/([^"']+\.js)`)
-	nameRe := regexp.MustCompile(`"([a-zA-Z_]+)"[)\]]`)
+	nameRe := regexp.MustCompile(`"([a-zA-Z0-9_]+)"[)\]]`)
 
 	for _, pagePath := range pages {
 		req, _ := http.NewRequest("GET", config.BaseURL+pagePath, nil)
@@ -286,7 +294,7 @@ func (a *Auth) fetchActionHashes() {
 			}
 		}
 
-		if len(actionHashes) >= len(actionNameMap) {
+		if len(actionHashes) >= requiredHashes {
 			break
 		}
 	}
@@ -294,6 +302,14 @@ func (a *Auth) fetchActionHashes() {
 	a.mu.Lock()
 	a.actionHashes = actionHashes
 	a.mu.Unlock()
+}
+
+func requiredActionHashCount() int {
+	unique := make(map[string]struct{})
+	for _, key := range actionNameMap {
+		unique[key] = struct{}{}
+	}
+	return len(unique)
 }
 
 // GetCookies returns cookies for HTTP requests.
