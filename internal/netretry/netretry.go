@@ -7,10 +7,6 @@ import (
 	"time"
 )
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-
 type Config struct {
 	Attempts  int
 	BaseDelay time.Duration

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -19,6 +18,7 @@ import (
 	"github.com/oa-verifier/internal/challenge"
 	"github.com/oa-verifier/internal/config"
 	"github.com/oa-verifier/internal/models"
+	"github.com/oa-verifier/internal/netretry"
 	"github.com/oa-verifier/internal/openrouter"
 	"github.com/oa-verifier/internal/registry"
 )
@@ -527,23 +527,17 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 	// Verify key ownership via OpenRouter API
 	keyHashFull := computeKeyHash(req.APIKey)
 	opIdentity := normalizeOpFailureIdentity(req.StationID, publicKey)
-	retryBase := 250 * time.Millisecond
-	maxJitter := 200 * time.Millisecond
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	ownershipRetryCfg := netretry.DefaultConfig(3)
 	refreshed := false
 	lastStatusCode := 0
 	lastDetail := ""
 	lastOwnershipDetails := map[string]any{}
 
-	sleepBackoff := func(attempt int) {
-		backoff := retryBase * time.Duration(1<<uint(attempt-1))
-		jitter := time.Duration(rng.Int63n(int64(maxJitter)))
-		time.Sleep(backoff + jitter)
-	}
-
 	for attempt := 1; attempt <= 3; attempt++ {
 		result, err := openrouter.VerifyKeyOwnership(provisioningKey, keyHashFull)
 		lastStatusCode = result.StatusCode
+		lastDetail = ""
+		lastOwnershipDetails = nil
 		if err != nil {
 			lastDetail = err.Error()
 		} else if result.Body != "" {
@@ -552,7 +546,9 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 		lastOwnershipDetails = openrouterOwnershipDetails(result)
 		if result.StatusCode == 0 || (result.StatusCode == 200 && err != nil) {
 			if attempt < 3 {
-				sleepBackoff(attempt)
+				if err := netretry.Sleep(r.Context(), attempt, ownershipRetryCfg); err != nil {
+					break
+				}
 				continue
 			}
 			break
@@ -653,7 +649,9 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if attempt < 3 {
-				sleepBackoff(attempt)
+				if err := netretry.Sleep(r.Context(), attempt, ownershipRetryCfg); err != nil {
+					break
+				}
 				continue
 			}
 			count := s.incOpFailure(opIdentity, "ownership_check")
@@ -673,7 +671,9 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 			return
 		case http.StatusForbidden:
 			if attempt < 3 {
-				sleepBackoff(attempt)
+				if err := netretry.Sleep(r.Context(), attempt, ownershipRetryCfg); err != nil {
+					break
+				}
 				continue
 			}
 			count := s.incOpFailure(opIdentity, "ownership_check")
@@ -709,7 +709,9 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 			return
 		default:
 			if attempt < 3 {
-				sleepBackoff(attempt)
+				if err := netretry.Sleep(r.Context(), attempt, ownershipRetryCfg); err != nil {
+					break
+				}
 				continue
 			}
 		}
