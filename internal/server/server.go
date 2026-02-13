@@ -36,6 +36,8 @@ type Server struct {
 	stations      map[string]*models.Station // pk -> Station
 	emailToPK     map[string]string          // email -> pk
 	stationIDToPK map[string]string          // station_id -> pk
+	opFailureMu   sync.Mutex
+	opFailure     map[string]int // "<identity>|<operation>" -> consecutive failures
 
 	banned *banned.Manager
 
@@ -58,6 +60,7 @@ func New(attestationEnabled bool) *Server {
 		stations:           make(map[string]*models.Station),
 		emailToPK:          make(map[string]string),
 		stationIDToPK:      make(map[string]string),
+		opFailure:          make(map[string]int),
 		banned:             banned.NewManager(),
 		attestationEnabled: attestationEnabled,
 	}

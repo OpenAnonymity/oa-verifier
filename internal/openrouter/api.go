@@ -779,15 +779,17 @@ func NotifyOrgBanned(stationID, reason string) error {
 
 // OrgUpdate represents a station update payload sent to the registry.
 type OrgUpdate struct {
-	StationID   string `json:"station_id"`
-	PublicKey   string `json:"public_key"`
-	Email       string `json:"email"`
-	Reason      string `json:"reason"`
-	StatusCode  int    `json:"status_code"`
-	ErrorDetail string `json:"error_detail"`
-	Event       string `json:"event"`
-	OccurredAt  string `json:"occurred_at"`
-	Source      string `json:"source"`
+	SchemaVersion int            `json:"schema_version"`
+	EventID       string         `json:"event_id"`
+	Event         string         `json:"event"`
+	Source        string         `json:"source"`
+	OccurredAt    string         `json:"occurred_at"`
+	Severity      string         `json:"severity,omitempty"`
+	StationID     string         `json:"station_id,omitempty"`
+	Message       string         `json:"message,omitempty"`
+	Operation     string         `json:"operation,omitempty"`
+	StatusCode    int            `json:"status_code,omitempty"`
+	Details       map[string]any `json:"details"`
 }
 
 // NotifyOrgUpdate notifies org about station status changes.
