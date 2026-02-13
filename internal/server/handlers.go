@@ -127,9 +127,22 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	registerIdentity := normalizeOpFailureIdentity("", req.PublicKey)
+
 	// Verify cookie and get account data
 	auth, err := openrouter.NewAuthFromCookieData(req.CookieData)
 	if err != nil {
+		count := s.incOpFailure(registerIdentity, "cookie_auth")
+		s.notifyOrgEvent(orgEvent{
+			event:                   "register_cookie_auth_failed",
+			publicKey:               req.PublicKey,
+			reason:                  "failed_to_verify_cookie",
+			statusCode:              http.StatusUnauthorized,
+			errorDetail:             err.Error(),
+			operation:               "cookie_auth",
+			consecutiveFailureCount: count,
+			details:                 openrouterErrorDetails(err),
+		})
 		slog.Warn("registration rejected: failed to verify cookie",
 			"pk", req.PublicKey[:16],
 			"display_name", req.DisplayName,
@@ -137,24 +150,58 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "Failed to verify cookie")
 		return
 	}
+	s.clearOpFailure(registerIdentity, "cookie_auth")
 
 	data, err := openrouter.FetchActivityData(auth)
 	if err != nil || data == nil {
+		errDetail := "empty_activity_payload"
+		if err != nil {
+			errDetail = err.Error()
+		}
+		eventDetails := map[string]any{}
+		if errCtx := openrouterErrorDetails(err); len(errCtx) > 0 {
+			for k, v := range errCtx {
+				eventDetails[k] = v
+			}
+		}
+		count := s.incOpFailure(registerIdentity, "activity_fetch")
+		s.notifyOrgEvent(orgEvent{
+			event:                   "register_activity_fetch_failed",
+			publicKey:               req.PublicKey,
+			reason:                  "failed_to_fetch_activity",
+			statusCode:              http.StatusUnauthorized,
+			errorDetail:             errDetail,
+			operation:               "activity_fetch",
+			consecutiveFailureCount: count,
+			details:                 eventDetails,
+		})
 		slog.Warn("registration rejected: failed to fetch activity data",
 			"pk", req.PublicKey[:16],
 			"display_name", req.DisplayName)
 		writeError(w, http.StatusUnauthorized, "Failed to verify cookie")
 		return
 	}
+	s.clearOpFailure(registerIdentity, "activity_fetch")
 
 	email := extractEmail(data)
 	if email == "" {
+		count := s.incOpFailure(registerIdentity, "email_extract")
+		s.notifyOrgEvent(orgEvent{
+			event:                   "register_email_extract_failed",
+			publicKey:               req.PublicKey,
+			reason:                  "email_missing_in_activity_payload",
+			statusCode:              http.StatusUnauthorized,
+			errorDetail:             "email_missing_in_activity_payload",
+			operation:               "email_extract",
+			consecutiveFailureCount: count,
+		})
 		slog.Warn("registration rejected: could not extract email",
 			"pk", req.PublicKey[:16],
 			"display_name", req.DisplayName)
 		writeError(w, http.StatusUnauthorized, "Could not extract email from account")
 		return
 	}
+	s.clearOpFailure(registerIdentity, "email_extract")
 
 	slog.Info("registration: cookie verified",
 		"email", email,
@@ -207,6 +254,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Station entry in registry has no station_id")
 		return
 	}
+	registerIdentity = normalizeOpFailureIdentity(stationID, req.PublicKey)
 
 	if s.banned.IsBanned(stationID, "") {
 		slog.Warn("registration rejected: station is BANNED", "station_id", stationID)
@@ -232,13 +280,36 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			effectiveStationID = "unknown"
 		}
 		s.banned.Ban(effectiveStationID, req.PublicKey, email, reason)
+		s.notifyOrgEvent(orgEvent{
+			event:       "station_banned",
+			stationID:   effectiveStationID,
+			publicKey:   req.PublicKey,
+			email:       email,
+			reason:      reason,
+			statusCode:  http.StatusForbidden,
+			errorDetail: strings.Join(toggleDetails, ","),
+			operation:   "privacy_toggle_check",
+		})
 		writeError(w, http.StatusForbidden, "Privacy toggles not properly configured. Station banned.")
 		return
 	case challenge.ToggleMissing, challenge.ToggleUnparseable:
+		count := s.incOpFailure(registerIdentity, "privacy_toggle_check")
+		s.notifyOrgEvent(orgEvent{
+			event:                   "register_privacy_toggles_unverifiable",
+			stationID:               stationID,
+			publicKey:               req.PublicKey,
+			email:                   email,
+			reason:                  toggleResult.String(),
+			statusCode:              http.StatusServiceUnavailable,
+			errorDetail:             strings.Join(toggleDetails, ","),
+			operation:               "privacy_toggle_check",
+			consecutiveFailureCount: count,
+		})
 		slog.Warn("registration rejected: unable to verify privacy toggles", "station_id", stationID, "result", toggleResult, "details", toggleDetails)
 		writeError(w, http.StatusServiceUnavailable, "Unable to verify privacy toggles; try again.")
 		return
 	case challenge.ToggleOK:
+		s.clearOpFailure(registerIdentity, "privacy_toggle_check")
 		// continue
 	}
 
@@ -263,13 +334,50 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		// Cleanup any existing keys with this label
 		cleanedUp, cleanupErr := openrouter.CleanupProvisioningKeys(auth, label)
 		if cleanupErr != nil {
+			op := "management_key_cleanup"
+			event := "register_management_key_cleanup_failed"
+			if opErr, ok := cleanupErr.(*openrouter.CleanupOperationError); ok && opErr != nil {
+				op = opErr.Operation
+				if op == "management_key_list" {
+					event = "register_management_key_list_failed"
+				}
+			}
+			count := s.incOpFailure(registerIdentity, op)
+			s.notifyOrgEvent(orgEvent{
+				event:                   event,
+				stationID:               stationID,
+				publicKey:               req.PublicKey,
+				email:                   email,
+				reason:                  op + "_failed",
+				statusCode:              http.StatusBadGateway,
+				errorDetail:             cleanupErr.Error(),
+				operation:               op,
+				consecutiveFailureCount: count,
+				details:                 openrouterErrorDetails(cleanupErr),
+			})
 			slog.Warn("failed cleanup of existing provisioning keys", "station_id", stationID, "label", label, "error", cleanupErr)
+		} else {
+			s.clearOpFailure(registerIdentity, "management_key_list")
+			s.clearOpFailure(registerIdentity, "management_key_cleanup")
 		}
 		if cleanedUp > 0 {
 			slog.Info("cleaned up existing provisioning keys", "station_id", stationID, "label", label, "count", cleanedUp)
 		}
 		key, err := openrouter.CreateProvisioningKey(auth, label)
 		if err != nil {
+			count := s.incOpFailure(registerIdentity, "management_key_create")
+			s.notifyOrgEvent(orgEvent{
+				event:                   "register_management_key_create_failed",
+				stationID:               stationID,
+				publicKey:               req.PublicKey,
+				email:                   email,
+				reason:                  "management_key_create_failed",
+				statusCode:              http.StatusInternalServerError,
+				errorDetail:             err.Error(),
+				operation:               "management_key_create",
+				consecutiveFailureCount: count,
+				details:                 openrouterErrorDetails(err),
+			})
 			slog.Error("failed to create provisioning key",
 				"station_id", stationID,
 				"label", label,
@@ -277,6 +385,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "Failed to create provisioning key")
 			return
 		}
+		s.clearOpFailure(registerIdentity, "management_key_create")
 		provisioningKey = key
 		slog.Info("created provisioning key",
 			"station_id", stationID,
