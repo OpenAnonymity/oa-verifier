@@ -49,11 +49,11 @@ func (s *Server) clearTransientFailure(pk string) {
 	s.mu.Unlock()
 }
 
-func (s *Server) getTransientFailure(pk string) (reason string, statusCode int, detail string) {
+func (s *Server) getFailureCount(pk string) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if station, ok := s.stations[pk]; ok {
-		return station.FailureReason, station.FailureStatus, station.FailureDetail
+		return station.FailureCount
 	}
-	return "", 0, ""
+	return 0
 }

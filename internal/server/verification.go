@@ -105,14 +105,22 @@ func (s *Server) challengeOneStation(ctx context.Context, pk string, station mod
 	unregister := false
 	unregisterReason := ""
 	unregisterDetail := ""
+	unregisterOperation := ""
 	transientFailure := false
 	withinGrace := false
+	transientEvent := ""
+	transientOperation := ""
+	transientStatusCode := 0
+	transientDetails := map[string]any{}
 
 	if station.CookieData == nil {
 		reason = "no_cookie_data"
 		transientFailure = true
 		unregisterReason = "no_cookie_data"
 		unregisterDetail = "missing_cookie_data"
+		unregisterOperation = "cookie_auth"
+		transientEvent = "verification_no_cookie_data"
+		transientOperation = "cookie_auth"
 	} else {
 		auth, err := openrouter.NewAuthFromCookieData(station.CookieData)
 		if err != nil {
@@ -120,14 +128,23 @@ func (s *Server) challengeOneStation(ctx context.Context, pk string, station mod
 			transientFailure = true
 			unregisterReason = "auth_error"
 			unregisterDetail = err.Error()
+			unregisterOperation = "cookie_auth"
+			transientEvent = "verification_cookie_auth_failed"
+			transientOperation = "cookie_auth"
+			transientStatusCode = 401
+			transientDetails = openrouterErrorDetails(err)
 		} else {
 			activityData, err := openrouter.FetchActivityData(auth)
 			if err != nil || activityData == nil {
 				reason = "activity_fetch_failed"
 				transientFailure = true
 				unregisterReason = "activity_fetch_failed"
+				unregisterOperation = "activity_fetch"
+				transientEvent = "verification_activity_fetch_failed"
+				transientOperation = "activity_fetch"
 				if err != nil {
 					unregisterDetail = err.Error()
+					transientDetails = openrouterErrorDetails(err)
 				}
 			} else {
 				toggleResult, toggleDetails := challenge.CheckPrivacyToggles(activityData)
@@ -142,18 +159,56 @@ func (s *Server) challengeOneStation(ctx context.Context, pk string, station mod
 					transientFailure = true
 					unregisterReason = "privacy_toggles_missing"
 					unregisterDetail = strings.Join(toggleDetails, ",")
+					unregisterOperation = "privacy_toggle_check"
+					transientEvent = "verification_privacy_toggles_missing"
+					transientOperation = "privacy_toggle_check"
 				case challenge.ToggleUnparseable:
 					reason = fmt.Sprintf("privacy_toggles_unparseable:[%s]", strings.Join(toggleDetails, ","))
 					transientFailure = true
 					unregisterReason = "privacy_toggles_unparseable"
 					unregisterDetail = strings.Join(toggleDetails, ",")
+					unregisterOperation = "privacy_toggle_check"
+					transientEvent = "verification_privacy_toggles_unparseable"
+					transientOperation = "privacy_toggle_check"
 				}
 			}
 		}
 	}
 
+	failureCount := 0
 	if transientFailure {
 		withinGrace = s.markTransientFailure(pk, unregisterReason, 0, unregisterDetail)
+		failureCount = s.getFailureCount(pk)
+		s.notifyOrgEvent(orgEvent{
+			event:                   transientEvent,
+			stationID:               stationID,
+			publicKey:               pk,
+			email:                   stationEmail,
+			reason:                  unregisterReason,
+			statusCode:              transientStatusCode,
+			errorDetail:             unregisterDetail,
+			operation:               transientOperation,
+			consecutiveFailureCount: failureCount,
+			withinGrace:             withinGrace,
+			withinGraceSet:          true,
+			details:                 transientDetails,
+		})
+		if failureCount == 1 {
+			s.notifyOrgEvent(orgEvent{
+				event:                   "transient_failure_started",
+				stationID:               stationID,
+				publicKey:               pk,
+				email:                   stationEmail,
+				reason:                  unregisterReason,
+				statusCode:              transientStatusCode,
+				errorDetail:             unregisterDetail,
+				operation:               transientOperation,
+				consecutiveFailureCount: failureCount,
+				withinGrace:             withinGrace,
+				withinGraceSet:          true,
+				details:                 transientDetails,
+			})
+		}
 		if !withinGrace {
 			unregister = true
 		}
@@ -161,7 +216,7 @@ func (s *Server) challengeOneStation(ctx context.Context, pk string, station mod
 
 	if unregister {
 		slog.Warn("unregistering station due to verification failure", "station_id", stationID, "reason", unregisterReason)
-		s.unregisterStation(station.StationID, pk, stationEmail, unregisterReason, 0, unregisterDetail)
+		s.unregisterStation(station.StationID, pk, stationEmail, unregisterReason, 0, unregisterDetail, unregisterOperation, failureCount, false)
 		return
 	}
 
@@ -193,5 +248,15 @@ func (s *Server) challengeOneStation(ctx context.Context, pk string, station mod
 	// Ban if necessary (outside lock)
 	if !passed && challenge.ShouldBan(reason) {
 		s.banned.Ban(station.StationID, pk, stationEmail, reason)
+		s.notifyOrgEvent(orgEvent{
+			event:       "station_banned",
+			stationID:   station.StationID,
+			publicKey:   pk,
+			email:       stationEmail,
+			reason:      reason,
+			statusCode:  403,
+			errorDetail: reason,
+			operation:   "privacy_toggle_check",
+		})
 	}
 }

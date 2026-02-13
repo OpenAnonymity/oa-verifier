@@ -48,6 +48,17 @@ func (s *Server) banStationForKeyNotOwned(w http.ResponseWriter, stationID, publ
 	bannedAt := utcNow()
 	slog.Error("key not owned by station - BANNING (potential shadow account)", "hash", keyHashFull[:16], "station_id", stationID)
 	s.banned.Ban(stationID, publicKey, stationEmail, reason)
+	s.clearOpFailure(normalizeOpFailureIdentity(stationID, publicKey), "ownership_check")
+	s.notifyOrgEvent(orgEvent{
+		event:       "station_banned",
+		stationID:   stationID,
+		publicKey:   publicKey,
+		email:       stationEmail,
+		reason:      reason,
+		statusCode:  http.StatusForbidden,
+		errorDetail: "key_not_owned_by_station",
+		operation:   "ownership_check",
+	})
 
 	// Remove from active stations
 	s.mu.Lock()
@@ -515,10 +526,14 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 
 	// Verify key ownership via OpenRouter API
 	keyHashFull := computeKeyHash(req.APIKey)
+	opIdentity := normalizeOpFailureIdentity(req.StationID, publicKey)
 	retryBase := 250 * time.Millisecond
 	maxJitter := 200 * time.Millisecond
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	refreshed := false
+	lastStatusCode := 0
+	lastDetail := ""
+	lastOwnershipDetails := map[string]any{}
 
 	sleepBackoff := func(attempt int) {
 		backoff := retryBase * time.Duration(1<<uint(attempt-1))
@@ -528,6 +543,13 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 
 	for attempt := 1; attempt <= 3; attempt++ {
 		result, err := openrouter.VerifyKeyOwnership(provisioningKey, keyHashFull)
+		lastStatusCode = result.StatusCode
+		if err != nil {
+			lastDetail = err.Error()
+		} else if result.Body != "" {
+			lastDetail = result.Body
+		}
+		lastOwnershipDetails = openrouterOwnershipDetails(result)
 		if result.StatusCode == 0 || (result.StatusCode == 200 && err != nil) {
 			if attempt < 3 {
 				sleepBackoff(attempt)
@@ -539,6 +561,7 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 		switch result.StatusCode {
 		case http.StatusOK:
 			if result.Owned {
+				s.clearOpFailure(opIdentity, "ownership_check")
 				slog.Info("key ownership verified", "station_id", req.StationID, "hash", keyHashFull[:16])
 				writeJSON(w, http.StatusOK, map[string]any{
 					"status":     "verified",
@@ -576,9 +599,40 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 			return
 		case http.StatusUnauthorized:
 			if !refreshed {
-				newKey, refreshErr := s.refreshProvisioningKey(req.StationID, publicKey, stationData.CookieData)
+				newKey, refreshErr := s.refreshProvisioningKey(req.StationID, publicKey, stationEmail, stationData.CookieData)
 				if refreshErr != nil {
 					withinGrace := s.markTransientFailure(publicKey, "provisioning_key_refresh_failed", result.StatusCode, refreshErr.Error())
+					failureCount := s.getFailureCount(publicKey)
+					s.notifyOrgEvent(orgEvent{
+						event:                   "submit_key_refresh_failed",
+						stationID:               req.StationID,
+						publicKey:               publicKey,
+						email:                   stationEmail,
+						reason:                  "provisioning_key_refresh_failed",
+						statusCode:              result.StatusCode,
+						errorDetail:             refreshErr.Error(),
+						operation:               "provisioning_key_refresh",
+						consecutiveFailureCount: failureCount,
+						withinGrace:             withinGrace,
+						withinGraceSet:          true,
+						details:                 openrouterErrorDetails(refreshErr),
+					})
+					if failureCount == 1 {
+						s.notifyOrgEvent(orgEvent{
+							event:                   "transient_failure_started",
+							stationID:               req.StationID,
+							publicKey:               publicKey,
+							email:                   stationEmail,
+							reason:                  "provisioning_key_refresh_failed",
+							statusCode:              result.StatusCode,
+							errorDetail:             refreshErr.Error(),
+							operation:               "provisioning_key_refresh",
+							consecutiveFailureCount: failureCount,
+							withinGrace:             withinGrace,
+							withinGraceSet:          true,
+							details:                 openrouterErrorDetails(refreshErr),
+						})
+					}
 					if withinGrace {
 						writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 							"status":     "unverified",
@@ -589,7 +643,7 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 						})
 						return
 					}
-					s.unregisterStation(req.StationID, publicKey, stationEmail, "provisioning_key_refresh_failed", result.StatusCode, refreshErr.Error())
+					s.unregisterStation(req.StationID, publicKey, stationEmail, "provisioning_key_refresh_failed", result.StatusCode, refreshErr.Error(), "provisioning_key_refresh", failureCount, false)
 					writeUnregisteredError(w)
 					return
 				}
@@ -602,6 +656,19 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 				sleepBackoff(attempt)
 				continue
 			}
+			count := s.incOpFailure(opIdentity, "ownership_check")
+			s.notifyOrgEvent(orgEvent{
+				event:                   "submit_key_ownership_check_failed",
+				stationID:               req.StationID,
+				publicKey:               publicKey,
+				email:                   stationEmail,
+				reason:                  "ownership_check_unauthorized",
+				statusCode:              http.StatusUnauthorized,
+				errorDetail:             lastDetail,
+				operation:               "ownership_check",
+				consecutiveFailureCount: count,
+				details:                 lastOwnershipDetails,
+			})
 			writeError(w, http.StatusUnauthorized, "Unauthorized Error (OpenRouter)")
 			return
 		case http.StatusForbidden:
@@ -609,9 +676,35 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 				sleepBackoff(attempt)
 				continue
 			}
+			count := s.incOpFailure(opIdentity, "ownership_check")
+			s.notifyOrgEvent(orgEvent{
+				event:                   "submit_key_ownership_forbidden",
+				stationID:               req.StationID,
+				publicKey:               publicKey,
+				email:                   stationEmail,
+				reason:                  "ownership_check_forbidden",
+				statusCode:              http.StatusForbidden,
+				errorDetail:             lastDetail,
+				operation:               "ownership_check",
+				consecutiveFailureCount: count,
+				details:                 lastOwnershipDetails,
+			})
 			writeError(w, http.StatusForbidden, "Forbidden Error (OpenRouter)")
 			return
 		case http.StatusTooManyRequests:
+			count := s.incOpFailure(opIdentity, "ownership_check")
+			s.notifyOrgEvent(orgEvent{
+				event:                   "submit_key_ownership_rate_limited",
+				stationID:               req.StationID,
+				publicKey:               publicKey,
+				email:                   stationEmail,
+				reason:                  "ownership_check_rate_limited",
+				statusCode:              http.StatusTooManyRequests,
+				errorDetail:             lastDetail,
+				operation:               "ownership_check",
+				consecutiveFailureCount: count,
+				details:                 lastOwnershipDetails,
+			})
 			writeError(w, http.StatusTooManyRequests, "Too Many Requests Error (OpenRouter)")
 			return
 		default:
@@ -622,6 +715,22 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	count := s.incOpFailure(opIdentity, "ownership_check")
+	if lastStatusCode == 0 {
+		lastStatusCode = http.StatusServiceUnavailable
+	}
+	s.notifyOrgEvent(orgEvent{
+		event:                   "submit_key_ownership_check_failed",
+		stationID:               req.StationID,
+		publicKey:               publicKey,
+		email:                   stationEmail,
+		reason:                  "ownership_check_failed",
+		statusCode:              lastStatusCode,
+		errorDetail:             lastDetail,
+		operation:               "ownership_check",
+		consecutiveFailureCount: count,
+		details:                 lastOwnershipDetails,
+	})
 	writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 		"status":     "unverified",
 		"station_id": req.StationID,
