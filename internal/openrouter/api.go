@@ -422,11 +422,34 @@ func DeleteProvisioningKey(auth *Auth, keyHash string) error {
 	return fmt.Errorf("delete_provisioning_key failed after %d attempts", maxRetries)
 }
 
+// CleanupOperationError identifies the failing operation in provisioning-key cleanup.
+type CleanupOperationError struct {
+	Operation string
+	Err       error
+}
+
+func (e *CleanupOperationError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s failed: %v", e.Operation, e.Err)
+}
+
+func (e *CleanupOperationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 // CleanupProvisioningKeys deletes all provisioning keys matching the label.
 func CleanupProvisioningKeys(auth *Auth, label string) (int, error) {
 	keys, err := FetchProvisioningKeys(auth)
 	if err != nil {
-		return 0, err
+		return 0, &CleanupOperationError{
+			Operation: "management_key_list",
+			Err:       err,
+		}
 	}
 	if len(keys) == 0 {
 		return 0, nil
@@ -445,13 +468,30 @@ func CleanupProvisioningKeys(auth *Auth, label string) (int, error) {
 
 	slog.Info("cleaning up provisioning keys", "label", label, "count", len(matching))
 	deleted := 0
+	deleteFailures := 0
+	var firstErr error
 	for _, k := range matching {
 		if err := DeleteProvisioningKey(auth, k["hash"]); err == nil {
 			deleted++
+		} else {
+			deleteFailures++
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 
 	slog.Info("cleaned up provisioning keys", "label", label, "deleted", deleted, "total", len(matching))
+	if deleteFailures > 0 {
+		err := fmt.Errorf("failed to delete %d of %d matching keys", deleteFailures, len(matching))
+		if firstErr != nil {
+			err = fmt.Errorf("failed to delete %d of %d matching keys: %w", deleteFailures, len(matching), firstErr)
+		}
+		return deleted, &CleanupOperationError{
+			Operation: "management_key_cleanup",
+			Err:       err,
+		}
+	}
 	return deleted, nil
 }
 
