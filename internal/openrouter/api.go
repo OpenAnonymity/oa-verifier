@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -24,6 +25,81 @@ const (
 )
 
 var retryCfg = netretry.DefaultConfig(maxRetries)
+
+// RequestResponseError captures full OpenRouter request/response context for failures.
+type RequestResponseError struct {
+	Operation       string
+	Method          string
+	URL             string
+	RequestHeaders  map[string]string
+	RequestBody     string
+	ResponseStatus  int
+	ResponseHeaders map[string]string
+	ResponseBody    string
+	Err             error
+}
+
+func (e *RequestResponseError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Err != nil {
+		return fmt.Sprintf("%s failed: %v", e.Operation, e.Err)
+	}
+	return fmt.Sprintf("%s failed", e.Operation)
+}
+
+func (e *RequestResponseError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (e *RequestResponseError) Context() map[string]any {
+	if e == nil {
+		return nil
+	}
+	return map[string]any{
+		"openrouter_operation": e.Operation,
+		"openrouter_request": map[string]any{
+			"method":  e.Method,
+			"url":     e.URL,
+			"headers": e.RequestHeaders,
+			"body":    e.RequestBody,
+		},
+		"openrouter_response": map[string]any{
+			"status_code": e.ResponseStatus,
+			"headers":     e.ResponseHeaders,
+			"body":        e.ResponseBody,
+		},
+	}
+}
+
+// ErrorContext extracts OpenRouter request/response context from wrapped errors.
+func ErrorContext(err error) map[string]any {
+	type contextErr interface {
+		Context() map[string]any
+	}
+	for err != nil {
+		if ce, ok := err.(contextErr); ok {
+			return ce.Context()
+		}
+		err = errors.Unwrap(err)
+	}
+	return nil
+}
+
+func flattenHeaders(h http.Header) map[string]string {
+	if h == nil {
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(h))
+	for k, vals := range h {
+		out[k] = strings.Join(vals, ", ")
+	}
+	return out
+}
 
 var (
 	escapedObjectRe = regexp.MustCompile(`\{[^{}]*\\"hash\\":\\"[0-9a-f]{64}\\"[^{}]*\}`)
@@ -56,9 +132,10 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 
 	cookies := auth.GetCookies()
 	routerState := "%5B%22%22%2C%7B%22children%22%3A%5B%22(user)%22%2C%7B%22children%22%3A%5B%22activity%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
+	reqBody := "[]"
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, _ := http.NewRequest("POST", config.BaseURL+"/activity", strings.NewReader("[]"))
+		req, _ := http.NewRequest("POST", config.BaseURL+"/activity", strings.NewReader(reqBody))
 		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
 		req.Header.Set("Accept", "text/x-component")
 		req.Header.Set("Accept-Encoding", "identity")
@@ -78,7 +155,14 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 				continue
 			}
-			return nil, err
+			return nil, &RequestResponseError{
+				Operation:      "fetch_activity_data",
+				Method:         req.Method,
+				URL:            req.URL.String(),
+				RequestHeaders: flattenHeaders(req.Header),
+				RequestBody:    reqBody,
+				Err:            err,
+			}
 		}
 
 		body, _ := io.ReadAll(resp.Body)
@@ -90,7 +174,17 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 				continue
 			}
-			return nil, fmt.Errorf("fetch_activity_data failed: status %d", resp.StatusCode)
+			return nil, &RequestResponseError{
+				Operation:       "fetch_activity_data",
+				Method:          req.Method,
+				URL:             req.URL.String(),
+				RequestHeaders:  flattenHeaders(req.Header),
+				RequestBody:     reqBody,
+				ResponseStatus:  resp.StatusCode,
+				ResponseHeaders: flattenHeaders(resp.Header),
+				ResponseBody:    string(body),
+				Err:             fmt.Errorf("fetch_activity_data failed: status %d", resp.StatusCode),
+			}
 		}
 
 		// Parse response
@@ -118,6 +212,17 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 			continue
 		}
+		return nil, &RequestResponseError{
+			Operation:       "fetch_activity_data_parse",
+			Method:          req.Method,
+			URL:             req.URL.String(),
+			RequestHeaders:  flattenHeaders(req.Header),
+			RequestBody:     reqBody,
+			ResponseStatus:  resp.StatusCode,
+			ResponseHeaders: flattenHeaders(resp.Header),
+			ResponseBody:    string(body),
+			Err:             fmt.Errorf("fetch_activity_data parse failed"),
+		}
 	}
 
 	return nil, fmt.Errorf("fetch_activity_data failed after %d attempts", maxRetries)
@@ -140,7 +245,13 @@ func FetchProvisioningKeys(auth *Auth) ([]map[string]string, error) {
 				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 				continue
 			}
-			return nil, err
+			return nil, &RequestResponseError{
+				Operation:      "fetch_provisioning_keys",
+				Method:         req.Method,
+				URL:            req.URL.String(),
+				RequestHeaders: flattenHeaders(req.Header),
+				Err:            err,
+			}
 		}
 
 		body, _ := io.ReadAll(resp.Body)
@@ -152,7 +263,16 @@ func FetchProvisioningKeys(auth *Auth) ([]map[string]string, error) {
 				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 				continue
 			}
-			return nil, fmt.Errorf("fetch_provisioning_keys failed: status %d", resp.StatusCode)
+			return nil, &RequestResponseError{
+				Operation:       "fetch_provisioning_keys",
+				Method:          req.Method,
+				URL:             req.URL.String(),
+				RequestHeaders:  flattenHeaders(req.Header),
+				ResponseStatus:  resp.StatusCode,
+				ResponseHeaders: flattenHeaders(resp.Header),
+				ResponseBody:    string(body),
+				Err:             fmt.Errorf("fetch_provisioning_keys failed: status %d", resp.StatusCode),
+			}
 		}
 
 		return parseProvisioningKeysResponse(string(body)), nil
@@ -244,7 +364,14 @@ func DeleteProvisioningKey(auth *Auth, keyHash string) error {
 				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 				continue
 			}
-			return err
+			return &RequestResponseError{
+				Operation:      "delete_provisioning_key",
+				Method:         req.Method,
+				URL:            req.URL.String(),
+				RequestHeaders: flattenHeaders(req.Header),
+				RequestBody:    payload,
+				Err:            err,
+			}
 		}
 
 		body, _ := io.ReadAll(resp.Body)
@@ -256,7 +383,17 @@ func DeleteProvisioningKey(auth *Auth, keyHash string) error {
 				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 				continue
 			}
-			return fmt.Errorf("delete_provisioning_key failed: status %d", resp.StatusCode)
+			return &RequestResponseError{
+				Operation:       "delete_provisioning_key",
+				Method:          req.Method,
+				URL:             req.URL.String(),
+				RequestHeaders:  flattenHeaders(req.Header),
+				RequestBody:     payload,
+				ResponseStatus:  resp.StatusCode,
+				ResponseHeaders: flattenHeaders(resp.Header),
+				ResponseBody:    string(body),
+				Err:             fmt.Errorf("delete_provisioning_key failed: status %d", resp.StatusCode),
+			}
 		}
 
 		if strings.Contains(string(body), `"deleted":true`) || strings.Contains(string(body), `"__kind":"OK"`) {
@@ -268,6 +405,17 @@ func DeleteProvisioningKey(auth *Auth, keyHash string) error {
 		if attempt < maxRetries {
 			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 			continue
+		}
+		return &RequestResponseError{
+			Operation:       "delete_provisioning_key_parse",
+			Method:          req.Method,
+			URL:             req.URL.String(),
+			RequestHeaders:  flattenHeaders(req.Header),
+			RequestBody:     payload,
+			ResponseStatus:  resp.StatusCode,
+			ResponseHeaders: flattenHeaders(resp.Header),
+			ResponseBody:    string(body),
+			Err:             fmt.Errorf("delete_provisioning_key unexpected response"),
 		}
 	}
 
@@ -339,7 +487,14 @@ func CreateProvisioningKey(auth *Auth, label string) (string, error) {
 				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 				continue
 			}
-			return "", err
+			return "", &RequestResponseError{
+				Operation:      "create_provisioning_key",
+				Method:         req.Method,
+				URL:            req.URL.String(),
+				RequestHeaders: flattenHeaders(req.Header),
+				RequestBody:    payload,
+				Err:            err,
+			}
 		}
 
 		body, _ := io.ReadAll(resp.Body)
@@ -351,7 +506,17 @@ func CreateProvisioningKey(auth *Auth, label string) (string, error) {
 				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 				continue
 			}
-			return "", fmt.Errorf("create_provisioning_key failed: status %d", resp.StatusCode)
+			return "", &RequestResponseError{
+				Operation:       "create_provisioning_key",
+				Method:          req.Method,
+				URL:             req.URL.String(),
+				RequestHeaders:  flattenHeaders(req.Header),
+				RequestBody:     payload,
+				ResponseStatus:  resp.StatusCode,
+				ResponseHeaders: flattenHeaders(resp.Header),
+				ResponseBody:    string(body),
+				Err:             fmt.Errorf("create_provisioning_key failed: status %d", resp.StatusCode),
+			}
 		}
 
 		for _, line := range strings.Split(string(body), "\n") {
@@ -376,6 +541,17 @@ func CreateProvisioningKey(auth *Auth, label string) (string, error) {
 			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 			continue
 		}
+		return "", &RequestResponseError{
+			Operation:       "create_provisioning_key_parse",
+			Method:          req.Method,
+			URL:             req.URL.String(),
+			RequestHeaders:  flattenHeaders(req.Header),
+			RequestBody:     payload,
+			ResponseStatus:  resp.StatusCode,
+			ResponseHeaders: flattenHeaders(resp.Header),
+			ResponseBody:    string(body),
+			Err:             fmt.Errorf("create_provisioning_key parse failed"),
+		}
 	}
 
 	return "", fmt.Errorf("create_provisioning_key failed after %d attempts", maxRetries)
@@ -383,10 +559,15 @@ func CreateProvisioningKey(auth *Auth, label string) (string, error) {
 
 // OwnershipCheckResult describes the ownership check outcome.
 type OwnershipCheckResult struct {
-	Owned      bool
-	NotOwned   bool
-	StatusCode int
-	Body       string
+	Owned           bool
+	NotOwned        bool
+	StatusCode      int
+	Body            string
+	RequestMethod   string
+	RequestURL      string
+	RequestHeaders  map[string]string
+	RequestBody     string
+	ResponseHeaders map[string]string
 }
 
 // VerifyKeyOwnership verifies that a key belongs to the station's account.
@@ -403,8 +584,13 @@ func VerifyKeyOwnership(provisioningKey, keyHash string) (OwnershipCheckResult, 
 	resp.Body.Close()
 
 	result := OwnershipCheckResult{
-		StatusCode: resp.StatusCode,
-		Body:       string(body),
+		StatusCode:      resp.StatusCode,
+		Body:            string(body),
+		RequestMethod:   req.Method,
+		RequestURL:      req.URL.String(),
+		RequestHeaders:  flattenHeaders(req.Header),
+		RequestBody:     "",
+		ResponseHeaders: flattenHeaders(resp.Header),
 	}
 
 	if resp.StatusCode == 404 {

@@ -150,12 +150,13 @@ func (a *Auth) refreshToken() error {
 	if orgID := a.state["org_id"]; orgID != "" {
 		data.Set("organization_id", orgID)
 	}
+	reqBody := data.Encode()
 
 	cfg := netretry.DefaultConfig(4)
 	var lastErr error
 
 	for attempt := 1; attempt <= cfg.Attempts; attempt++ {
-		req, err := http.NewRequest("POST", tokenURL, strings.NewReader(data.Encode()))
+		req, err := http.NewRequest("POST", tokenURL, strings.NewReader(reqBody))
 		if err != nil {
 			return err
 		}
@@ -180,7 +181,14 @@ func (a *Auth) refreshToken() error {
 				_ = netretry.Sleep(context.Background(), attempt, cfg)
 				continue
 			}
-			return err
+			return &RequestResponseError{
+				Operation:      "refresh_token",
+				Method:         req.Method,
+				URL:            req.URL.String(),
+				RequestHeaders: flattenHeaders(req.Header),
+				RequestBody:    reqBody,
+				Err:            err,
+			}
 		}
 
 		body, _ := io.ReadAll(resp.Body)
@@ -192,7 +200,17 @@ func (a *Auth) refreshToken() error {
 				_ = netretry.Sleep(context.Background(), attempt, cfg)
 				continue
 			}
-			return lastErr
+			return &RequestResponseError{
+				Operation:       "refresh_token",
+				Method:          req.Method,
+				URL:             req.URL.String(),
+				RequestHeaders:  flattenHeaders(req.Header),
+				RequestBody:     reqBody,
+				ResponseStatus:  resp.StatusCode,
+				ResponseHeaders: flattenHeaders(resp.Header),
+				ResponseBody:    string(body),
+				Err:             lastErr,
+			}
 		}
 
 		var result struct {
@@ -204,7 +222,17 @@ func (a *Auth) refreshToken() error {
 				_ = netretry.Sleep(context.Background(), attempt, cfg)
 				continue
 			}
-			return err
+			return &RequestResponseError{
+				Operation:       "refresh_token_parse",
+				Method:          req.Method,
+				URL:             req.URL.String(),
+				RequestHeaders:  flattenHeaders(req.Header),
+				RequestBody:     reqBody,
+				ResponseStatus:  resp.StatusCode,
+				ResponseHeaders: flattenHeaders(resp.Header),
+				ResponseBody:    string(body),
+				Err:             err,
+			}
 		}
 		if result.JWT == "" {
 			lastErr = fmt.Errorf("token refresh failed: empty jwt")
@@ -212,7 +240,17 @@ func (a *Auth) refreshToken() error {
 				_ = netretry.Sleep(context.Background(), attempt, cfg)
 				continue
 			}
-			return lastErr
+			return &RequestResponseError{
+				Operation:       "refresh_token_parse",
+				Method:          req.Method,
+				URL:             req.URL.String(),
+				RequestHeaders:  flattenHeaders(req.Header),
+				RequestBody:     reqBody,
+				ResponseStatus:  resp.StatusCode,
+				ResponseHeaders: flattenHeaders(resp.Header),
+				ResponseBody:    string(body),
+				Err:             lastErr,
+			}
 		}
 
 		a.mu.Lock()
