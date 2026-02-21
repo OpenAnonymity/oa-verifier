@@ -262,7 +262,8 @@ jobs:
                       "TLS_DOMAIN",
                       "ACME_EMAIL",
                       "ACME_DNS_PROVIDER",
-                      "CF_API_TOKEN"
+                      "CF_DNS_API_TOKEN",
+                      "CF_ZONE_API_TOKEN"
                   ]
                   for env_var in required_env_vars:
                       containers[0]["env_rules"].append({
@@ -320,7 +321,7 @@ jobs:
                       {"name": "TLS_DOMAIN", "value": "${{ secrets.TLS_DOMAIN }}"},
                       {"name": "ACME_EMAIL", "value": "${{ secrets.ACME_EMAIL }}"},
                       {"name": "ACME_DNS_PROVIDER", "value": "${{ secrets.ACME_DNS_PROVIDER }}"},
-                      {"name": "CF_API_TOKEN", "secureValue": "${{ secrets.CF_API_TOKEN }}"}
+                      {"name": "CF_DNS_API_TOKEN", "secureValue": "${{ secrets.CF_API_TOKEN }}"}
                     ],
                     "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
                   }
@@ -697,7 +698,8 @@ jobs:
                       "TLS_DOMAIN",
                       "ACME_EMAIL",
                       "ACME_DNS_PROVIDER",
-                      "CF_API_TOKEN"
+                      "CF_DNS_API_TOKEN",
+                      "CF_ZONE_API_TOKEN"
                   ]
                   for env_var in required_env_vars:
                       containers[0]["env_rules"].append({

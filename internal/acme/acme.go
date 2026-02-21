@@ -135,7 +135,8 @@ func ObtainCertificate(ctx context.Context, cfg *Config) (tls.Certificate, strin
 func getDNSProvider(name string) (*cloudflare.DNSProvider, error) {
 	switch name {
 	case "cloudflare":
-		// Cloudflare uses CF_API_TOKEN or CF_DNS_API_TOKEN environment variable
+		// Cloudflare provider expects CF_DNS_API_TOKEN (optionally CF_ZONE_API_TOKEN).
+		// Legacy email/key auth is also supported by lego via CF_API_EMAIL + CF_API_KEY.
 		return cloudflare.NewDNSProvider()
 	default:
 		return nil, fmt.Errorf("unsupported DNS provider: %s (supported: cloudflare)", name)
