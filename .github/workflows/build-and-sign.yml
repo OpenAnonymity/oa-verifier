@@ -258,7 +258,11 @@ jobs:
                       "MAX_CONCURRENT_REQUESTS",
                       "RATE_LIMIT_RPS",
                       "RATE_LIMIT_BURST",
-                      "SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS"
+                      "SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS",
+                      "TLS_DOMAIN",
+                      "ACME_EMAIL",
+                      "ACME_DNS_PROVIDER",
+                      "CF_API_TOKEN"
                   ]
                   for env_var in required_env_vars:
                       containers[0]["env_rules"].append({
@@ -312,7 +316,11 @@ jobs:
                       {"name": "MAX_CONCURRENT_REQUESTS", "value": "${{ secrets.MAX_CONCURRENT_REQUESTS }}"},
                       {"name": "RATE_LIMIT_RPS", "value": "${{ secrets.RATE_LIMIT_RPS }}"},
                       {"name": "RATE_LIMIT_BURST", "value": "${{ secrets.RATE_LIMIT_BURST }}"},
-                      {"name": "SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS", "value": "${{ secrets.SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS }}"}
+                      {"name": "SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS", "value": "${{ secrets.SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS }}"},
+                      {"name": "TLS_DOMAIN", "value": "${{ secrets.TLS_DOMAIN }}"},
+                      {"name": "ACME_EMAIL", "value": "${{ secrets.ACME_EMAIL }}"},
+                      {"name": "ACME_DNS_PROVIDER", "value": "${{ secrets.ACME_DNS_PROVIDER }}"},
+                      {"name": "CF_API_TOKEN", "secureValue": "${{ secrets.CF_API_TOKEN }}"}
                     ],
                     "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
                   }
@@ -367,6 +375,99 @@ jobs:
           echo "Waiting for container to start..."
           sleep 90
 
+      - name: Check origin TLS certificate (ACME vs fallback)
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
+        id: origin_cert
+        run: |
+          FQDN=$(az container show --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query "ipAddress.fqdn" -o tsv)
+          if [ -z "$FQDN" ]; then
+            echo "❌ Could not determine Azure origin FQDN"
+            exit 1
+          fi
+
+          if [ -n "${{ secrets.TLS_DOMAIN }}" ]; then
+            SNI="${{ secrets.TLS_DOMAIN }}"
+          else
+            SNI="$FQDN"
+          fi
+
+          echo "Inspecting origin cert directly (bypasses Cloudflare edge certs)"
+          echo "Origin FQDN: $FQDN"
+          echo "SNI: $SNI"
+
+          CERT_FILE=/tmp/origin-cert.pem
+          FOUND_CERT=false
+
+          for i in {1..8}; do
+            echo "TLS cert fetch attempt $i/8..."
+            if echo | openssl s_client -connect "${FQDN}:443" -servername "$SNI" -showcerts 2>/dev/null \
+              | awk '/-----BEGIN CERTIFICATE-----/{flag=1} flag{print} /-----END CERTIFICATE-----/{exit}' > "$CERT_FILE"; then
+              if [ -s "$CERT_FILE" ]; then
+                FOUND_CERT=true
+                break
+              fi
+            fi
+            sleep 15
+          done
+
+          if [ "$FOUND_CERT" != "true" ]; then
+            echo "❌ Could not retrieve origin TLS certificate after retries"
+            exit 1
+          fi
+
+          ISSUER=$(openssl x509 -in "$CERT_FILE" -noout -issuer | sed 's/^issuer=//')
+          SUBJECT=$(openssl x509 -in "$CERT_FILE" -noout -subject | sed 's/^subject=//')
+          NOT_BEFORE=$(openssl x509 -in "$CERT_FILE" -noout -startdate | cut -d= -f2-)
+          NOT_AFTER=$(openssl x509 -in "$CERT_FILE" -noout -enddate | cut -d= -f2-)
+          SERIAL=$(openssl x509 -in "$CERT_FILE" -noout -serial | cut -d= -f2-)
+          FINGERPRINT_SHA256=$(openssl x509 -in "$CERT_FILE" -noout -fingerprint -sha256 | cut -d= -f2)
+          SAN_LINE=$(openssl x509 -in "$CERT_FILE" -noout -ext subjectAltName | tail -n +2 | tr '\n' ' ' | sed 's/  */ /g')
+
+          CERT_STATUS="non-letsencrypt"
+          if echo "$ISSUER" | grep -qi "let's encrypt"; then
+            CERT_STATUS="letsencrypt"
+          elif [ "$ISSUER" = "$SUBJECT" ]; then
+            CERT_STATUS="self-signed"
+          fi
+
+          SAN_OK="unknown"
+          if [ -n "${{ secrets.TLS_DOMAIN }}" ]; then
+            if echo "$SAN_LINE" | grep -Fq "${{ secrets.TLS_DOMAIN }}"; then
+              SAN_OK="yes"
+            else
+              SAN_OK="no"
+            fi
+          fi
+
+          echo "issuer=$ISSUER" >> $GITHUB_OUTPUT
+          echo "subject=$SUBJECT" >> $GITHUB_OUTPUT
+          echo "not_before=$NOT_BEFORE" >> $GITHUB_OUTPUT
+          echo "not_after=$NOT_AFTER" >> $GITHUB_OUTPUT
+          echo "serial=$SERIAL" >> $GITHUB_OUTPUT
+          echo "fingerprint_sha256=$FINGERPRINT_SHA256" >> $GITHUB_OUTPUT
+          echo "cert_status=$CERT_STATUS" >> $GITHUB_OUTPUT
+          echo "san_ok=$SAN_OK" >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "=========================================="
+          echo "  ORIGIN TLS CERTIFICATE CHECK"
+          echo "=========================================="
+          echo "Status:        $CERT_STATUS"
+          echo "Issuer:        $ISSUER"
+          echo "Subject:       $SUBJECT"
+          echo "Not Before:    $NOT_BEFORE"
+          echo "Not After:     $NOT_AFTER"
+          echo "Serial:        $SERIAL"
+          echo "SHA256 FP:     $FINGERPRINT_SHA256"
+          echo "SANs:          $SAN_LINE"
+          if [ -n "${{ secrets.TLS_DOMAIN }}" ]; then
+            echo "Has TLS_DOMAIN SAN (${{ secrets.TLS_DOMAIN }}): $SAN_OK"
+          fi
+
+          if [ "$CERT_STATUS" != "letsencrypt" ]; then
+            echo "⚠️ Origin certificate is not Let's Encrypt (likely ACME fallback)"
+          fi
+
       - name: Verify attestation matches local build
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
         env:
@@ -413,6 +514,10 @@ jobs:
           echo "| ACR Push | ✅ ${{ steps.push-acr.outputs.digest }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Deploy Registry | ${{ steps.registry.outputs.registry }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Policy Hash | ${{ steps.policy.outputs.policy_hash }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Origin Cert Status | ${{ steps.origin_cert.outputs.cert_status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Origin Cert Not Before | ${{ steps.origin_cert.outputs.not_before }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Origin Cert Not After | ${{ steps.origin_cert.outputs.not_after }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Origin Cert SHA256 | ${{ steps.origin_cert.outputs.fingerprint_sha256 }} |" >> $GITHUB_STEP_SUMMARY
 
   # Independent verification job - rebuilds from source and verifies against deployed attestation
   verify:
@@ -588,7 +693,11 @@ jobs:
                       "MAX_CONCURRENT_REQUESTS",
                       "RATE_LIMIT_RPS",
                       "RATE_LIMIT_BURST",
-                      "SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS"
+                      "SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS",
+                      "TLS_DOMAIN",
+                      "ACME_EMAIL",
+                      "ACME_DNS_PROVIDER",
+                      "CF_API_TOKEN"
                   ]
                   for env_var in required_env_vars:
                       containers[0]["env_rules"].append({
