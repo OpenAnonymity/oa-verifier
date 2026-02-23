@@ -1,14 +1,26 @@
 # OA-Verifier
 
-A general-purpose enclave verification service for proving station integrity. Runs in Azure Confidential Containers with AMD SEV-SNP hardware attestation.
+A station verification service for enforcing station compliance and proving runtime integrity in confidential runtimes (Azure ACI Confidential Containers).
 
 ## What It Does
 
-OA-Verifier enables **zero-trust verification** of stations running in secure enclaves. Users can cryptographically prove:
+OA-Verifier provides verifier-side evidence and enforcement for station governance:
 
-- **The exact code running** - via hardware-measured CCE policy hash
-- **No tampering possible** - AMD SEV-SNP isolates memory from hypervisor
-- **No logging/exfiltration** - auditable source code + disabled stdio in policy
+- **The exact runtime policy measured** - via attested CCE policy hash
+- **No runtime tampering of measured policy path** - via AMD SEV-SNP attestation
+- **Station compliance enforcement** - via toggle checks and ownership/signature verification
+
+## Trust Model
+
+- Verifier role: station compliance enforcer, not prompt/response transport.
+- Prompt/response path: end user client -> provider.
+- Governance path: station registration, signature checks, toggle checks.
+- Required anti-forgery verification inputs: registry station authorization,
+  org signature/public-key path, provider account-state APIs.
+
+See:
+
+- [Trust Model](docs/TRUST_MODEL.md)
 
 ### Supported Station Types
 
@@ -121,13 +133,6 @@ docker inspect oa-verifier:latest
 
 ## Deployment
 
-Deployed via GitHub Actions to Azure Confidential Containers:
-
-1. Push to `main` → builds container
-2. Sigstore signs the image
-3. CCE policy generated with secret protection
-4. Deployed to Azure ACI with SEV-SNP
-
 See [deploy/README.md](deploy/README.md) for details.
 
 ## Configuration
@@ -144,6 +149,7 @@ See [deploy/README.md](deploy/README.md) for details.
 
 ## Documentation
 
+- [Trust Model](docs/TRUST_MODEL.md) - Role boundaries, data flow, guarantees/non-goals, unlinkability model
 - [Attestation Deep Dive](docs/ATTESTATION.md) - How zero-trust verification works
 - [Deployment Guide](deploy/README.md) - CI/CD and Azure setup
 

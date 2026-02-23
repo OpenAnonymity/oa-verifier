@@ -1,4 +1,13 @@
-// Package models contains data structures for the verifier.
+// Package models contains verifier data structures.
+//
+// Docstream:
+//
+// Actor boundary:
+// - `Station` represents station-operator governance state.
+// - `Email` and `CookieData` belong to station operator accounts and are used for
+//   registration binding + periodic compliance checks.
+// - These fields are verifier evidence for station governance, not end-user
+//   prompt/chat identity data.
 package models
 
 import "time"
@@ -38,7 +47,17 @@ type SubmitKeyRequest struct {
 	OrgSignature     string `json:"org_signature"`
 }
 
-// Station represents a registered station in memory.
+// Station represents a registered station operator's governance state.
+//
+// All fields (CookieData, Email, etc.) are station-operator credentials used
+// for compliance checks against the provider's account-state APIs:
+// 1. Independent provider-state checks (re-auth and activity fetch)
+// 2. Three-way binding integrity (station_id <-> email <-> public_key)
+// 3. Provisioning key lifecycle management
+//
+// These are not end-user data and have no bearing on user privacy or
+// unlinkability. The verifier never receives, stores, or processes any
+// end-user identity material.
 type Station struct {
 	StationID       string
 	Email           string

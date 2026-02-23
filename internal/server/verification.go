@@ -1,3 +1,27 @@
+// Docstream:
+//
+// Purpose:
+// - This loop is the core station-compliance enforcement path for privacy toggles.
+//
+// Enforcement behavior:
+// - It continuously re-checks station operator account-state against
+//   `OpenRouterRequiredToggles` and updates verification outcomes
+//   (verified, transiently unverified, banned/unregistered).
+// - Check intervals are cryptographically random (see challenge.GetRandomInterval),
+//   making it impossible for stations to predict when checks occur and cheat
+//   by temporarily toggling settings.
+// - Checks use provider-exposed account metadata fetched by verifier; station
+//   self-assertions are not accepted as sufficient evidence.
+//
+// Data-path boundary:
+// - End-user prompts/responses do not transit this loop; it only consumes station
+//   governance metadata (cookie-authenticated provider account state).
+// - This loop operates exclusively on station-operator account data. It never
+//   receives, processes, or stores any end-user identity material.
+//
+// Trust chain (runtime view):
+// - Attested verifier runtime -> enforced toggle checks -> station verification-state updates
+//   -> client key acceptance/rejection behavior.
 package server
 
 import (

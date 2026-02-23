@@ -1,6 +1,8 @@
 # Zero-Trust Attestation & Verification Guide
 
-This document explains how to verify that OA-Verifier is running exactly the code published in this repository, **without trusting anyone**.
+This document explains how to verify that OA-Verifier is running exactly the code
+published in this repository using zero-trust verification (verify evidence, do not
+blindly trust operators).
 
 ## Table of Contents
 
@@ -25,6 +27,25 @@ The OA-Verifier runs inside an **Azure Confidential Container** using AMD SEV-SN
 3. **Summary** - Key claims extracted for convenience
 
 The hardware measures the policy at boot and stores its hash in a tamper-proof register. This hash (`host_data`) proves exactly which container configuration is running.
+
+---
+
+## Boundary Scope (Attestation vs Trust Model)
+
+Attestation evidence in this file proves runtime/policy integrity properties of verifier deployment.
+It does not by itself prove all operational governance semantics or external system claims.
+
+Use these alongside this guide:
+
+- [Trust Model](TRUST_MODEL.md)
+
+Boundary notes:
+
+1. Attestation summary decode is not full cryptographic verification by itself.
+2. Governance/control decisions still use required anti-forgery verification inputs
+   (registry/org/provider APIs) to prevent forged/misattributed key submissions that
+   could wrongly penalize a genuine station.
+3. Ticket unlinkability claims are external system context and are not verifier-runtime-only claims.
 
 ---
 
@@ -129,7 +150,9 @@ Docker Image
 
 ## Complete Zero-Trust Verification
 
-This is the full verification procedure that requires **no trust in any third party**.
+This is the full verification procedure for strong zero-trust assurance: conclusions
+come from cryptographic checks plus required anti-forgery verification inputs, not
+blind trust.
 
 ### Prerequisites
 
@@ -226,24 +249,27 @@ else
 fi
 ```
 
-### Step 6: (Optional) Verify JWT Signature
+### Step 6: Verify JWT Signature (Required for strict zero-trust conclusions)
 
 ```bash
 # Get Azure's public keys
 VERIFY_URL=$(jq -r '.verify_at' attestation.json)
 curl -s "$VERIFY_URL" | jq
 
-# The JWT can be verified using any JWT library with these keys
-# The "kid" in the JWT header identifies which key to use
+# The JWT must be verified using these keys.
+# The "kid" in the JWT header identifies which key to use.
 ```
 
-### Complete Script
+Without Step 6, you only have partial/integrity-level evidence from decoded fields.
+Strict cryptographic conclusions require successful JWT signature verification.
+
+### Script (Hash + Digest checks only; not strict by itself)
 
 ```bash
 #!/bin/bash
 set -e
 
-echo "=== Zero-Trust Verification ==="
+echo "=== Attestation Integrity Check (non-strict) ==="
 
 # Step 1: Fetch attestation
 NONCE=$(date +%s)
@@ -288,7 +314,7 @@ if docker inspect oa-verifier:latest &>/dev/null; then
 fi
 
 echo ""
-echo "=== Verification Complete ==="
+echo "=== Verification Complete (signature verification not included in this script) ==="
 ```
 
 ---

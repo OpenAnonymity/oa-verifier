@@ -1,23 +1,50 @@
 // Enclave Verifier - Secure station verification with key-based identity.
 //
+// Docstream:
+//
 // Endpoints:
+// - POST /register: Register station with Ed25519 public key and cookie.
+// - POST /submit_key: Submit double-signed API key for ownership verification.
+// - GET /station/{public_key}: Get station info.
+// - GET /broadcast: Get all verified stations.
 //
-//	POST /register - Register station with Ed25519 public key and cookie
-//	POST /submit_key - Submit double-signed API key for ownership verification
-//	GET /station/{public_key} - Get station info
-//	GET /broadcast - Get all verified stations
+// Security & Verification Flow:
+//   - Registration input includes station public key + OpenRouter session cookie.
+//   - Verifier fetches provider account-state using the cookie and extracts email
+//     server-side (not from station self-assertion), then enforces:
+//     station_id <-> email <-> public_key.
+//   - Verifier requests OpenRouter to issue a management key (called provisioning
+//     key in code) on the station operator's account for ownership checks.
+//     This key is hosted by OpenRouter, not the verifier; station does not
+//     provide this key.
+//   - Required privacy toggles are enforced as false on provider account-state:
+//     enable_logging, enable_training, enable_free_model_training,
+//     enable_free_model_publication, enforce_zdr, always_enforce_allowed,
+//     is_broadcast_enabled.
+//   - `/submit_key` validates station+org signatures as anti-forgery binding inputs,
+//     then verifies submitted key ownership against provider account state via
+//     OpenRouter API:
+//     https://openrouter.ai/docs/api/api-reference/api-keys/get-key
+//   - Broadcast toggle reference:
+//     https://openrouter.ai/docs/guides/features/broadcast/overview#enabling-broadcast
+//   - No public challenge trigger endpoint: periodic verification is internal.
+//   - No /update endpoint: Cookie changes require re-registration to re-verify binding.
 //
-// Security:
-//   - Three-way binding: station_id (registry) <-> email (cookie) <-> public_key (station)
-//   - Anti-Squatting: Email extracted server-side from cookie
-//   - Identity Migration: Same email can move to new key (device recovery)
-//   - DoS Protection: Verification runs internally, not via public endpoint
-//   - No /update endpoint: Cookie changes require re-registration to re-verify binding
+// Trust Model:
+//   - Verifier role: station compliance enforcement, not end-user prompt transport.
+//   - End-user prompt/response traffic is client -> provider (`oa-fastchat` ->
+//     OpenRouter), and does not transit verifier handlers.
+//   - Verifier independently checks provider account-state and
+//     key ownership/signature constraints; station/org inputs are validated as
+//     anti-forgery evidence, not blindly trusted.
+//   - To avoid trusting submitter assertions, verifier cross-checks anti-forgery
+//     evidence from registry records, org signature/public-key material, and
+//     provider-exposed account-state APIs.
+//   - These are verification evidence inputs, not blind-trust authorities.
 //
-// Concurrency:
-//   - HTTP handlers run in separate goroutines (net/http)
-//   - Verification loop runs in a dedicated goroutine
-//   - True parallelism: thousands of /submit_key requests won't slow down verification
+// Scope:
+// - This entrypoint wires runtime mode and lifecycle only.
+// - Enforcement logic lives in `internal/server` and `internal/challenge`.
 package main
 
 import (

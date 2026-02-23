@@ -1,4 +1,57 @@
-// Package openrouter handles OpenRouter authentication and API interactions.
+// Package openrouter is the verifier's read/query interface to the provider's
+// own systems. It is the foundation of the zero-trust architecture for
+// oa-chat users.
+//
+// Zero-trust design:
+//
+// The verifier audits stations -- the entities that issue ephemeral API keys to
+// oa-chat users -- to confirm they are doing a genuine, privacy-compliant
+// job. Every piece of verification evidence originates from OpenRouter's own
+// systems; the verifier adds zero proprietary truth to the chain.
+//
+//   - Toggle state: read from OpenRouter's /activity page using the station
+//     operator's own authenticated session (cookies). These are OpenRouter's own
+//     account settings, not station self-reported claims. Checks occur at
+//     cryptographically random intervals, making it impossible for stations to
+//     predict when checks happen and cheat by temporarily toggling settings.
+//   - Management key: issued by OpenRouter on the station operator's account
+//     when the verifier calls POST /settings/management-keys with the operator's
+//     cookies. The key lives on OpenRouter; the verifier merely holds a
+//     reference to use for subsequent ownership checks.
+//   - Key ownership: checked by calling OpenRouter's GET /api/v1/keys/{hash}
+//     authenticated with the management key. OpenRouter's own API answers
+//     whether a submitted key belongs to the same account.
+//     Ref: https://openrouter.ai/docs/api/api-reference/api-keys/get-key
+//   - Account identity (email): extracted server-side from the OpenRouter
+//     activity response, not from station-supplied text.
+//
+// Shadow-account attack prevention:
+//
+// A malicious station could register with a privacy-compliant account (all
+// toggles correct) but then issue keys to users from a different shadow account
+// that has logging/training enabled. The ownership check defeats this: the
+// management key lives on the registered account, so when the verifier asks
+// OpenRouter "does this submitted key belong to the same account?", a key from
+// a shadow account will fail -- and the station gets banned.
+//
+// What this means for oa-chat users:
+//
+//   - Prompts/responses go directly from oa-chat to OpenRouter; the
+//     verifier never touches user data.
+//   - The verifier's broadcast endpoint tells oa-chat which stations are
+//     verified/banned, based entirely on evidence from OpenRouter's own APIs.
+//   - Users only need to trust that (1) the verifier code is what it claims
+//     (hardware attestation proves this) and (2) OpenRouter's APIs returned the
+//     data the verifier reports (the code is open-source and auditable).
+//
+// Provider trust scope (audit note):
+//
+// OpenRouter is used as the frontier model provider. Due to OA's unlinkable
+// inference layer, even if OpenRouter is malicious, user prompts are still
+// unlinkable to the user's identity and unlinkable across sessions. Each
+// session uses an ephemeral key issued via blind signatures with no identity
+// binding. The verifier adds enforceable accountability on top: verified
+// toggle state and shadow-account prevention via ownership checks.
 package openrouter
 
 import (

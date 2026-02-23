@@ -1,3 +1,18 @@
+// Docstream:
+//
+// Purpose:
+// - Handlers implement governance/control APIs, not end-user prompt transport.
+//
+// Core behavior:
+//   - `/register` binds station operator identity/material to station governance state.
+//   - `/submit_key` verifies a submitted key belongs to the registered station account
+//     that is under privacy-toggle enforcement.
+//   - Station+org signatures are required anti-forgery binding inputs before ownership
+//     verification against provider account state.
+//   - Ownership check uses OpenRouter-issued management key (requested by verifier
+//     during registration); see internal/openrouter for API details.
+//   - `/attestation` returns evidence material; strict conclusions require external
+//     JWT signature verification and freshness checks.
 package server
 
 import (
@@ -92,9 +107,18 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// maxRequestBodySize limits incoming request body to 1MB to prevent memory exhaustion
+// maxRequestBodySize limits incoming request body to 1MB to prevent memory exhaustion.
 const maxRequestBodySize = 1 << 20 // 1MB
 
+// handleRegister registers a station operator (not an end user).
+//
+// Three-way binding (station_id <-> email <-> public_key) is used for station
+// governance:
+// - anti-squatting and accountability of station operators
+// - identity migration/recovery via re-registration
+// - linking periodic toggle checks to the same station operator account
+// - enabling OpenRouter-issued management key lifecycle on that account
+// - preventing malicious actors from registering mismatched identity material
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 	var req models.RegisterRequest
@@ -219,7 +243,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		"public_key", req.PublicKey,
 		"display_name", req.DisplayName)
 
-	// Validate against station registry - REQUIRED
+	// Anti-forgery cross-check against station registry records (prevents impersonation).
 	registryStations, err := registry.FetchStations()
 	if err != nil {
 		slog.Error("registration rejected: failed to fetch registry",
@@ -326,7 +350,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	now := utcNow()
 
-	// Check for existing provisioning key
+	// Reuse existing OpenRouter-issued management key if present.
 	var existingProvKey string
 	s.mu.RLock()
 	if station, ok := s.stations[req.PublicKey]; ok {
@@ -338,7 +362,9 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.RUnlock()
 
-	// Create provisioning key if needed (station_id is always set at this point)
+	// Request OpenRouter to issue a management key if needed.
+	// This key is issued by OpenRouter on the station operator's authenticated
+	// account session, not created by the verifier or supplied by the station.
 	provisioningKey := existingProvKey
 	if provisioningKey == "" {
 		label := generateProvLabel(stationID)
@@ -450,6 +476,31 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSubmitKey verifies that a submitted API key belongs to the registered,
+// privacy-checked station account.
+//
+// Station+org signatures are validated first as anti-forgery binding inputs;
+// ownership is then checked against provider-side account state.
+//
+// Ownership evidence is fetched via OpenRouter-issued management key (requested
+// by verifier during registration); see internal/openrouter for API details.
+//
+// Returned states include verified/unverified/retryable and hard rejection paths (including ban).
+//
+// Key handling (audit note):
+//
+// The raw API key (req.APIKey) is used transiently within this handler for:
+//  1. Signature message construction (inner + outer verification)
+//  2. SHA-256 hashing via computeKeyHash for ownership lookup
+//
+// The raw key is never stored in server state, never written to logs, and never
+// included in org event payloads. Only a truncated hash prefix (first 16 hex chars
+// of the SHA-256) appears in structured log entries for operational diagnostics.
+//
+// Even if the verifier were compromised, the key cannot be linked to a user identity
+// because the key was issued through blind signatures -- no user identity was attached at
+// any point in the issuance chain. See docs/TRUST_MODEL.md "System-Level Unlinkability
+// Model" for the full explanation.
 func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodySize)
 	var req models.SubmitKeyRequest
@@ -483,6 +534,7 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// OpenRouter-issued management key (requested by verifier during registration)
 	provisioningKey := stationData.ProvisioningKey
 	stationEmail := stationData.Email
 
@@ -491,7 +543,7 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify inner signature (station): message = "station_id|api_key|key_valid_till"
+	// Verify inner signature (station) to bind station key material to this submission.
 	innerMessage := fmt.Sprintf("%s|%s|%d", req.StationID, req.APIKey, req.KeyValidTill)
 	if !verifyEd25519Signature(publicKey, innerMessage, req.StationSignature) {
 		slog.Warn("invalid station signature for key submission", "station_id", req.StationID)
@@ -499,7 +551,7 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify outer signature (org)
+	// Verify outer signature (org) as anti-forgery proof for the request-key issuance path.
 	orgPublicKey, err := s.getOrgPublicKey()
 	if err != nil || orgPublicKey == "" {
 		writeError(w, http.StatusServiceUnavailable, "Could not fetch org public key")
@@ -892,7 +944,13 @@ func (s *Server) handleReloadConfig(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// decodeJWTPayload decodes JWT payload without verification (for display only).
+// decodeJWTPayload decodes JWT payload without signature verification.
+// This is intentional: the MAA sidecar runs inside the same TEE (measured in
+// the CCE policy), so the localhost call is within the trust boundary. JWT
+// signature verification is the responsibility of external parties (users,
+// auditors) who fetch /attestation and verify against Azure MAA's public keys.
+// Self-verification would be circular (the verifier proving to itself that it
+// is the verifier).
 func decodeJWTPayload(token string) map[string]any {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
