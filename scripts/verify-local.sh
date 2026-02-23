@@ -17,13 +17,55 @@
 
 set -e
 
-SERVICE_URL="${1:-https://oa-verifier.eastus.azurecontainer.io}"
+STRICT_TLS_BINDING=true
+SERVICE_URL=""
+
+usage() {
+    cat <<EOF
+Usage: $0 [--strict-tls-binding] [SERVICE_URL]
+
+Options:
+  --strict-tls-binding  Fail if tls_pubkey_hash does not match live endpoint cert/public key.
+  -h, --help            Show this help.
+
+Examples:
+  $0
+  $0 https://oa-verifier.eastus.azurecontainer.io
+  $0 --strict-tls-binding https://verifier.openanonymity.ai
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --strict-tls-binding)
+            STRICT_TLS_BINDING=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            if [[ -n "$SERVICE_URL" ]]; then
+                echo "❌ ERROR: Unexpected argument: $1"
+                usage
+                exit 1
+            fi
+            SERVICE_URL="$1"
+            shift
+            ;;
+    esac
+done
+
+SERVICE_URL="${SERVICE_URL:-https://oa-verifier.eastus.azurecontainer.io}"
+SERVICE_URL="${SERVICE_URL%/}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 echo "=============================================="
 echo "  ZERO-TRUST LOCAL VERIFICATION"
 echo "=============================================="
+echo "  Strict TLS binding: $STRICT_TLS_BINDING"
 echo ""
 
 # Check we're on Linux x86_64
@@ -44,7 +86,7 @@ if ! command -v nix &> /dev/null; then
 fi
 
 # Check required tools
-for cmd in curl jq sha256sum; do
+for cmd in curl jq sha256sum openssl; do
     if ! command -v $cmd &> /dev/null; then
         echo "❌ ERROR: $cmd is not installed"
         exit 1
@@ -61,11 +103,89 @@ if [[ -z "$ATTESTATION" ]]; then
     exit 1
 fi
 
-REMOTE_POLICY_HASH=$(echo "$ATTESTATION" | jq -r '.summary.cce_policy_hash')
+REMOTE_POLICY_HASH=$(echo "$ATTESTATION" | jq -r '.summary.cce_policy_hash // .summary.host_data')
+ATTESTED_TLS_HASH=$(echo "$ATTESTATION" | jq -r '.summary.tls_pubkey_hash // empty')
 echo "   Remote policy hash: $REMOTE_POLICY_HASH"
 echo ""
 
-echo "Step 2: Building container with Nix (reproducible)..."
+echo "Step 2: Verifying TLS channel binding..."
+if [[ -z "$ATTESTED_TLS_HASH" ]]; then
+    echo "   ⚠️  No tls_pubkey_hash in attestation summary"
+    if [[ "$STRICT_TLS_BINDING" == "true" ]]; then
+        echo "❌ ERROR: Strict mode enabled and tls_pubkey_hash is missing"
+        exit 1
+    fi
+    TLS_BINDING_RESULT="MISSING"
+else
+    scheme="${SERVICE_URL%%://*}"
+    endpoint_no_scheme="${SERVICE_URL#*://}"
+    hostport="${endpoint_no_scheme%%/*}"
+    host="${hostport%%:*}"
+    port=""
+    if [[ "$hostport" == *:* ]]; then
+        port="${hostport##*:}"
+    elif [[ "$scheme" == "https" ]]; then
+        port="443"
+    else
+        port="80"
+    fi
+
+    if [[ "$scheme" != "https" ]]; then
+        echo "   ⚠️  Endpoint is not HTTPS; cannot perform TLS channel-binding check"
+        TLS_BINDING_RESULT="SKIPPED-NON-HTTPS"
+        if [[ "$STRICT_TLS_BINDING" == "true" ]]; then
+            echo "❌ ERROR: Strict mode enabled and endpoint is not HTTPS"
+            exit 1
+        fi
+    else
+        CERT_DER_FILE=$(mktemp)
+        if ! echo | openssl s_client -connect "${host}:${port}" -servername "$host" 2>/dev/null \
+            | openssl x509 -outform DER > "$CERT_DER_FILE" 2>/dev/null; then
+            rm -f "$CERT_DER_FILE"
+            echo "   ⚠️  Could not fetch endpoint TLS certificate from ${host}:${port}"
+            TLS_BINDING_RESULT="CERT-FETCH-FAILED"
+            if [[ "$STRICT_TLS_BINDING" == "true" ]]; then
+                echo "❌ ERROR: Strict mode enabled and TLS certificate fetch failed"
+                exit 1
+            fi
+        else
+            LIVE_CERT_DER_HASH=$(sha256sum "$CERT_DER_FILE" | cut -d' ' -f1)
+            LIVE_SPKI_HASH=$(openssl x509 -inform DER -in "$CERT_DER_FILE" -pubkey -noout \
+                | openssl pkey -pubin -outform DER 2>/dev/null \
+                | sha256sum | cut -d' ' -f1)
+            rm -f "$CERT_DER_FILE"
+
+            echo "   Attested hash:      $ATTESTED_TLS_HASH"
+            echo "   Live SPKI hash:     $LIVE_SPKI_HASH"
+            echo "   Live cert DER hash: $LIVE_CERT_DER_HASH"
+
+            if [[ "$ATTESTED_TLS_HASH" == "$LIVE_SPKI_HASH" ]]; then
+                echo "   ✓ Channel binding match (SPKI/public-key hash)"
+                TLS_BINDING_RESULT="MATCH-SPKI"
+            elif [[ "$ATTESTED_TLS_HASH" == "$LIVE_CERT_DER_HASH" ]]; then
+                echo "   ✓ Channel binding match (leaf cert DER hash)"
+                TLS_BINDING_RESULT="MATCH-CERT-DER"
+            else
+                CF_RAY=$(curl -skI "$SERVICE_URL/health" 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="cf-ray"{print $2}')
+                if [[ -n "$CF_RAY" ]]; then
+                    echo "   ⚠️  TLS hash mismatch with Cloudflare header detected (cf-ray: $CF_RAY)"
+                    echo "      Expected if this hostname is Cloudflare proxied (orange cloud)."
+                    TLS_BINDING_RESULT="MISMATCH-CLOUDFLARE"
+                else
+                    echo "   ⚠️  TLS hash mismatch (no Cloudflare header detected)"
+                    TLS_BINDING_RESULT="MISMATCH"
+                fi
+                if [[ "$STRICT_TLS_BINDING" == "true" ]]; then
+                    echo "❌ ERROR: Strict mode enabled and TLS channel binding failed"
+                    exit 1
+                fi
+            fi
+        fi
+    fi
+fi
+echo ""
+
+echo "Step 3: Building container with Nix (reproducible)..."
 echo "   This may take a few minutes on first run..."
 echo ""
 
@@ -80,18 +200,18 @@ fi
 echo "   Build complete!"
 echo ""
 
-echo "Step 3: Calculating local image hash..."
+echo "Step 4: Calculating local image hash..."
 LOCAL_TARBALL_HASH=$(sha256sum result | cut -d' ' -f1)
 echo "   Local tarball hash: $LOCAL_TARBALL_HASH"
 echo ""
 
-echo "Step 4: Loading image and getting ID..."
+echo "Step 5: Loading image and getting ID..."
 docker load < result > /dev/null 2>&1
 LOCAL_IMAGE_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}' | cut -d: -f2)
 echo "   Local image ID: $LOCAL_IMAGE_ID"
 echo ""
 
-echo "Step 5: Generating CCE policy locally..."
+echo "Step 6: Generating CCE policy locally..."
 echo "   (Requires az CLI with confcom extension)"
 
 # Create temp deployment template
@@ -149,6 +269,7 @@ echo "=============================================="
 echo ""
 echo "Remote (from attestation):"
 echo "  Policy Hash: $REMOTE_POLICY_HASH"
+echo "  TLS Binding: $TLS_BINDING_RESULT"
 echo ""
 echo "Local (from Nix build):"
 echo "  Tarball Hash: $LOCAL_TARBALL_HASH"
