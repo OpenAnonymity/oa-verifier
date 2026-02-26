@@ -26,7 +26,7 @@ import (
 	"math/big"
 	"strings"
 
-	"github.com/oa-verifier/internal/config"
+	"github.com/openanonymity/oa-verifier/internal/config"
 )
 
 // ToggleCheckResult describes the outcome of the privacy toggle check.

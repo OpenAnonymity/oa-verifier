@@ -32,10 +32,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oa-verifier/internal/challenge"
-	"github.com/oa-verifier/internal/config"
-	"github.com/oa-verifier/internal/models"
-	"github.com/oa-verifier/internal/openrouter"
+	"github.com/openanonymity/oa-verifier/internal/challenge"
+	"github.com/openanonymity/oa-verifier/internal/config"
+	"github.com/openanonymity/oa-verifier/internal/models"
+	"github.com/openanonymity/oa-verifier/internal/openrouter"
 )
 
 // verificationLoop runs in a dedicated goroutine, completely independent

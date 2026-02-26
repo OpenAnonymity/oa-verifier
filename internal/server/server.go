@@ -4,8 +4,8 @@ package server
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -21,13 +21,11 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"golang.org/x/crypto/ed25519"
 
-	"github.com/oa-verifier/internal/acme"
-	"github.com/oa-verifier/internal/banned"
-	"github.com/oa-verifier/internal/challenge"
-	"github.com/oa-verifier/internal/config"
-	"github.com/oa-verifier/internal/models"
+	"github.com/openanonymity/oa-verifier/internal/acme"
+	"github.com/openanonymity/oa-verifier/internal/banned"
+	"github.com/openanonymity/oa-verifier/internal/challenge"
+	"github.com/openanonymity/oa-verifier/internal/models"
 )
 
 // Server holds all server state.

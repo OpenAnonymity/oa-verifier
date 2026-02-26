@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/oa-verifier/internal/openrouter"
+	"github.com/openanonymity/oa-verifier/internal/openrouter"
 )
 
 func (s *Server) unregisterStation(stationID, publicKey, email, reason string, statusCode int, errorDetail, operation string, consecutiveFailureCount int, withinGrace bool) {

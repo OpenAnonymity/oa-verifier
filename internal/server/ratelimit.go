@@ -8,10 +8,10 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"github.com/oa-verifier/internal/config"
+	"github.com/openanonymity/oa-verifier/internal/config"
 )
 
-// rateLimiterStore manages per-client (IP+UserAgent) rate limiters.
+// rateLimiterStore manages per-client IP rate limiters.
 type rateLimiterStore struct {
 	mu       sync.RWMutex
 	limiters map[string]*rateLimiterEntry

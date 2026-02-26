@@ -56,7 +56,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/oa-verifier/internal/server"
+	"github.com/openanonymity/oa-verifier/internal/server"
 )
 
 func main() {

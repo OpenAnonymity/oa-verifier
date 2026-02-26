@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oa-verifier/internal/config"
-	"github.com/oa-verifier/internal/models"
-	"github.com/oa-verifier/internal/openrouter"
+	"github.com/openanonymity/oa-verifier/internal/config"
+	"github.com/openanonymity/oa-verifier/internal/models"
+	"github.com/openanonymity/oa-verifier/internal/openrouter"
 )
 
 // Manager handles banned station storage.

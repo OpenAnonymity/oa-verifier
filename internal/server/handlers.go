@@ -30,12 +30,12 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/oa-verifier/internal/challenge"
-	"github.com/oa-verifier/internal/config"
-	"github.com/oa-verifier/internal/models"
-	"github.com/oa-verifier/internal/netretry"
-	"github.com/oa-verifier/internal/openrouter"
-	"github.com/oa-verifier/internal/registry"
+	"github.com/openanonymity/oa-verifier/internal/challenge"
+	"github.com/openanonymity/oa-verifier/internal/config"
+	"github.com/openanonymity/oa-verifier/internal/models"
+	"github.com/openanonymity/oa-verifier/internal/netretry"
+	"github.com/openanonymity/oa-verifier/internal/openrouter"
+	"github.com/openanonymity/oa-verifier/internal/registry"
 )
 
 // ACI Confidential Containers attestation endpoint (SKR sidecar)

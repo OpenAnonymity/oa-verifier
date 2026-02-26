@@ -10,8 +10,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/oa-verifier/internal/config"
-	"github.com/oa-verifier/internal/netretry"
+	"github.com/openanonymity/oa-verifier/internal/config"
+	"github.com/openanonymity/oa-verifier/internal/netretry"
 )
 
 var httpClient = &http.Client{
