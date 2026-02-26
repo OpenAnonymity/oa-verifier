@@ -3,20 +3,20 @@
 // Docstream:
 //
 // Purpose:
-// - `CheckPrivacyToggles` is the toggle-evaluation core used by handler/loop
-//   enforcement.
+//   - `CheckPrivacyToggles` is the toggle-evaluation core used by handler/loop
+//     enforcement.
 //
 // Result model:
-// - It classifies provider-exposed account-state into deterministic outcomes:
-//   ok, invalid, missing, unparseable.
-// - `ToggleInvalid` indicates policy violation and can drive ban/not-verified
-//   decisions in caller policy.
+//   - It classifies provider-exposed account-state into deterministic outcomes:
+//     ok, invalid, missing, unparseable.
+//   - `ToggleInvalid` indicates policy violation and can drive ban/not-verified
+//     decisions in caller policy.
 //
 // Input boundary:
-// - Checks run on provider-exposed account metadata fetched by verifier, not
-//   station self-reported claims.
-// - This package validates exposed account metadata; it does not attest
-//   provider-internal systems beyond those exposed fields.
+//   - Checks run on provider-exposed account metadata fetched by verifier, not
+//     station self-reported claims.
+//   - This package validates exposed account metadata; it does not attest
+//     provider-internal systems beyond those exposed fields.
 package challenge
 
 import (

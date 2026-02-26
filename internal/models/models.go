@@ -3,11 +3,11 @@
 // Docstream:
 //
 // Actor boundary:
-// - `Station` represents station-operator governance state.
-// - `Email` and `CookieData` belong to station operator accounts and are used for
-//   registration binding + periodic compliance checks.
-// - These fields are verifier evidence for station governance, not end-user
-//   prompt/chat identity data.
+//   - `Station` represents station-operator governance state.
+//   - `Email` and `CookieData` belong to station operator accounts and are used for
+//     registration binding + periodic compliance checks.
+//   - These fields are verifier evidence for station governance, not end-user
+//     prompt/chat identity data.
 package models
 
 import "time"
