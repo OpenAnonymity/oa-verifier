@@ -18,6 +18,7 @@
 set -e
 
 STRICT_TLS_BINDING=true
+INSECURE_SKIP_TLS_VERIFY=false
 SERVICE_URL=""
 
 usage() {
@@ -26,11 +27,13 @@ Usage: $0 [--strict-tls-binding] [SERVICE_URL]
 
 Options:
   --strict-tls-binding  Fail if tls_pubkey_hash does not match live endpoint cert/public key.
+  --no-strict-tls-binding  Continue even if TLS channel binding cannot be strictly validated.
+  --insecure-skip-tls-verify  Allow curl -k when fetching attestation (not zero-trust safe).
   -h, --help            Show this help.
 
 Examples:
   $0
-  $0 https://oa-verifier.eastus.azurecontainer.io
+  $0 https://verifier.openanonymity.ai
   $0 --strict-tls-binding https://verifier.openanonymity.ai
 EOF
 }
@@ -39,6 +42,14 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --strict-tls-binding)
             STRICT_TLS_BINDING=true
+            shift
+            ;;
+        --no-strict-tls-binding)
+            STRICT_TLS_BINDING=false
+            shift
+            ;;
+        --insecure-skip-tls-verify)
+            INSECURE_SKIP_TLS_VERIFY=true
             shift
             ;;
         -h|--help)
@@ -57,7 +68,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-SERVICE_URL="${SERVICE_URL:-https://oa-verifier.eastus.azurecontainer.io}"
+SERVICE_URL="${SERVICE_URL:-https://verifier.openanonymity.ai}"
 SERVICE_URL="${SERVICE_URL%/}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -66,6 +77,7 @@ echo "=============================================="
 echo "  ZERO-TRUST LOCAL VERIFICATION"
 echo "=============================================="
 echo "  Strict TLS binding: $STRICT_TLS_BINDING"
+echo "  Insecure TLS fetch: $INSECURE_SKIP_TLS_VERIFY"
 echo ""
 
 # Check we're on Linux x86_64
@@ -86,7 +98,7 @@ if ! command -v nix &> /dev/null; then
 fi
 
 # Check required tools
-for cmd in curl jq sha256sum openssl; do
+for cmd in curl jq sha256sum openssl docker; do
     if ! command -v $cmd &> /dev/null; then
         echo "❌ ERROR: $cmd is not installed"
         exit 1
@@ -97,7 +109,12 @@ echo "Step 1: Fetching attestation from service..."
 echo "   URL: $SERVICE_URL/attestation"
 echo ""
 
-ATTESTATION=$(curl -sk "$SERVICE_URL/attestation?nonce=verify-$(date +%s)")
+if [[ "$INSECURE_SKIP_TLS_VERIFY" == "true" ]]; then
+    CURL_FLAGS="-sfk"
+else
+    CURL_FLAGS="-sf"
+fi
+ATTESTATION=$(curl $CURL_FLAGS "$SERVICE_URL/attestation?nonce=verify-$(date +%s)")
 if [[ -z "$ATTESTATION" ]]; then
     echo "❌ ERROR: Could not fetch attestation"
     exit 1
@@ -105,6 +122,11 @@ fi
 
 REMOTE_POLICY_HASH=$(echo "$ATTESTATION" | jq -r '.summary.cce_policy_hash // .summary.host_data')
 ATTESTED_TLS_HASH=$(echo "$ATTESTATION" | jq -r '.summary.tls_pubkey_hash // empty')
+COMPUTED_REMOTE_POLICY_HASH=$(echo "$ATTESTATION" | jq -r '.policy.base64' | base64 -d | sha256sum | cut -d' ' -f1)
+if [[ "$COMPUTED_REMOTE_POLICY_HASH" != "$REMOTE_POLICY_HASH" ]]; then
+    echo "❌ ERROR: Attestation policy hash mismatch (decoded policy != host_data)"
+    exit 1
+fi
 echo "   Remote policy hash: $REMOTE_POLICY_HASH"
 echo ""
 
@@ -166,15 +188,8 @@ else
                 echo "   ✓ Channel binding match (leaf cert DER hash)"
                 TLS_BINDING_RESULT="MATCH-CERT-DER"
             else
-                CF_RAY=$(curl -skI "$SERVICE_URL/health" 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="cf-ray"{print $2}')
-                if [[ -n "$CF_RAY" ]]; then
-                    echo "   ⚠️  TLS hash mismatch with Cloudflare header detected (cf-ray: $CF_RAY)"
-                    echo "      Expected if this hostname is Cloudflare proxied (orange cloud)."
-                    TLS_BINDING_RESULT="MISMATCH-CLOUDFLARE"
-                else
-                    echo "   ⚠️  TLS hash mismatch (no Cloudflare header detected)"
-                    TLS_BINDING_RESULT="MISMATCH"
-                fi
+                echo "   ⚠️  TLS hash mismatch: endpoint certificate/public key does not match attested hash"
+                TLS_BINDING_RESULT="MISMATCH"
                 if [[ "$STRICT_TLS_BINDING" == "true" ]]; then
                     echo "❌ ERROR: Strict mode enabled and TLS channel binding failed"
                     exit 1
@@ -211,56 +226,40 @@ LOCAL_IMAGE_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}' | cut -d: 
 echo "   Local image ID: $LOCAL_IMAGE_ID"
 echo ""
 
-echo "Step 6: Generating CCE policy locally..."
-echo "   (Requires az CLI with confcom extension)"
-
-# Create temp deployment template
-TEMP_DIR=$(mktemp -d)
-cat > "$TEMP_DIR/template.json" << EOF
-{
-  "\$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-  "contentVersion": "1.0.0.0",
-  "resources": [{
-    "type": "Microsoft.ContainerInstance/containerGroups",
-    "apiVersion": "2023-05-01",
-    "name": "verify-test",
-    "location": "eastus",
-    "properties": {
-      "sku": "Confidential",
-      "containers": [{
-        "name": "oa-verifier",
-        "properties": {
-          "image": "oa-verifier:latest",
-          "ports": [{"port": 443, "protocol": "TCP"}],
-          "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
-        }
-      },{
-        "name": "skr-sidecar",
-        "properties": {
-          "image": "mcr.microsoft.com/aci/skr@sha256:baa6acf093c011cb26799187b6a535e32bd8248f52dd2cd9c606732b8a23c112",
-          "command": ["/skr.sh"],
-          "ports": [{"port": 8080, "protocol": "TCP"}],
-          "resources": {"requests": {"cpu": 0.5, "memoryInGB": 1.0}}
-        }
-      }],
-      "osType": "Linux",
-      "confidentialComputeProperties": {"ccePolicy": ""}
-    }
-  }]
-}
-EOF
-
-if command -v az &> /dev/null && az extension show --name confcom &> /dev/null; then
-    az confcom acipolicygen -a "$TEMP_DIR/template.json" --disable-stdio > /dev/null 2>&1
-    LOCAL_POLICY=$(jq -r '.resources[0].properties.confidentialComputeProperties.ccePolicy' "$TEMP_DIR/template.json")
-    LOCAL_POLICY_HASH=$(echo "$LOCAL_POLICY" | base64 -d | sha256sum | cut -d' ' -f1)
-    echo "   Local policy hash: $LOCAL_POLICY_HASH"
-else
-    echo "   ⚠️  az confcom not available - cannot generate policy hash locally"
-    LOCAL_POLICY_HASH="SKIPPED"
+echo "Step 6: Extracting deployed image digest from attestation policy..."
+REMOTE_IMAGE=$(echo "$ATTESTATION" | jq -r '.policy.decoded | capture("\"id\":\"(?<img>[^\"]+)\"") | .img' 2>/dev/null || true)
+if [[ -z "$REMOTE_IMAGE" || "$REMOTE_IMAGE" == "null" ]]; then
+    echo "❌ ERROR: Could not extract image reference from attestation policy"
+    exit 1
 fi
+REMOTE_DIGEST="${REMOTE_IMAGE##*@}"
+if [[ -z "$REMOTE_DIGEST" || "$REMOTE_DIGEST" == "$REMOTE_IMAGE" ]]; then
+    echo "❌ ERROR: Could not extract digest from image reference: $REMOTE_IMAGE"
+    exit 1
+fi
+echo "   Remote image:  $REMOTE_IMAGE"
+echo "   Remote digest: $REMOTE_DIGEST"
+echo ""
 
-rm -rf "$TEMP_DIR"
+echo "Step 7: Calculating local manifest digest..."
+LOCAL_REGISTRY_NAME="oa-verifier-local-registry"
+if docker ps -a --format '{{.Names}}' | grep -qx "$LOCAL_REGISTRY_NAME"; then
+    docker rm -f "$LOCAL_REGISTRY_NAME" >/dev/null 2>&1 || true
+fi
+docker run -d -p 5000:5000 --name "$LOCAL_REGISTRY_NAME" registry:2 >/dev/null
+trap 'docker rm -f "$LOCAL_REGISTRY_NAME" >/dev/null 2>&1 || true' EXIT
+
+docker tag oa-verifier:latest localhost:5000/oa-verifier:latest
+docker push localhost:5000/oa-verifier:latest >/dev/null
+LOCAL_DIGEST=$(docker inspect localhost:5000/oa-verifier:latest --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
+docker rm -f "$LOCAL_REGISTRY_NAME" >/dev/null 2>&1 || true
+trap - EXIT
+
+if [[ -z "$LOCAL_DIGEST" ]]; then
+    echo "❌ ERROR: Could not determine local image digest"
+    exit 1
+fi
+echo "   Local digest:  $LOCAL_DIGEST"
 echo ""
 
 echo "=============================================="
@@ -270,26 +269,22 @@ echo ""
 echo "Remote (from attestation):"
 echo "  Policy Hash: $REMOTE_POLICY_HASH"
 echo "  TLS Binding: $TLS_BINDING_RESULT"
+echo "  Image Digest: $REMOTE_DIGEST"
 echo ""
 echo "Local (from Nix build):"
 echo "  Tarball Hash: $LOCAL_TARBALL_HASH"
 echo "  Image ID:     $LOCAL_IMAGE_ID"
-echo "  Policy Hash:  $LOCAL_POLICY_HASH"
+echo "  Image Digest: $LOCAL_DIGEST"
 echo ""
 
-if [[ "$LOCAL_POLICY_HASH" == "$REMOTE_POLICY_HASH" ]]; then
+if [[ "$LOCAL_DIGEST" == "$REMOTE_DIGEST" ]]; then
     echo "✅ VERIFICATION PASSED"
-    echo "   The locally built image matches the deployed attestation!"
-    echo "   You can trust the code running in the enclave."
-    exit 0
-elif [[ "$LOCAL_POLICY_HASH" == "SKIPPED" ]]; then
-    echo "⚠️  PARTIAL VERIFICATION"
-    echo "   Nix build succeeded but policy hash could not be compared."
-    echo "   Install az CLI with confcom extension for full verification."
+    echo "   The locally built image digest matches the deployed attestation policy."
+    echo "   You can trust this deployment is running this source build."
     exit 0
 else
     echo "❌ VERIFICATION FAILED"
-    echo "   Local build does NOT match the deployed attestation!"
+    echo "   Local build digest does NOT match the deployed attestation policy digest!"
     echo "   The deployed code may be different from this source."
     exit 1
 fi
