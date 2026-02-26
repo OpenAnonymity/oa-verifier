@@ -114,7 +114,7 @@ func main() {
 	} else {
 		// TLS terminates inside the enclave (not at Azure)
 		slog.Info("starting Enclave Verifier with TLS", "addr", addr, "attestation", *attestation)
-		err = srv.RunTLS(ctx)
+		err = srv.RunTLS(ctx, addr)
 	}
 
 	if err != nil && err != http.ErrServerClosed {
