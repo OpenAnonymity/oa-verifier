@@ -794,7 +794,6 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 		"detail":     "ownership_check_error",
 		"retryable":  true,
 	})
-	return
 }
 
 func (s *Server) getOrgPublicKey() (string, error) {

@@ -97,7 +97,7 @@ func (s *Server) checkDueStations(ctx context.Context) {
 
 // challengeOneStation challenges a single station by checking privacy toggles.
 // Runs in its own goroutine, fully concurrent with other challenges and HTTP handlers.
-func (s *Server) challengeOneStation(ctx context.Context, pk string, station models.Station) {
+func (s *Server) challengeOneStation(_ context.Context, pk string, station models.Station) {
 	stationID := station.StationID
 	if stationID == "" {
 		stationID = pk[:16]
@@ -201,7 +201,7 @@ func (s *Server) challengeOneStation(ctx context.Context, pk string, station mod
 
 	failureCount := 0
 	if transientFailure {
-		withinGrace = s.markTransientFailure(pk, unregisterReason, 0, unregisterDetail)
+		withinGrace = s.markTransientFailure(pk, unregisterReason, transientStatusCode, unregisterDetail)
 		failureCount = s.getFailureCount(pk)
 		s.notifyOrgEvent(orgEvent{
 			event:                   transientEvent,
@@ -240,7 +240,7 @@ func (s *Server) challengeOneStation(ctx context.Context, pk string, station mod
 
 	if unregister {
 		slog.Warn("unregistering station due to verification failure", "station_id", stationID, "reason", unregisterReason)
-		s.unregisterStation(station.StationID, pk, stationEmail, unregisterReason, 0, unregisterDetail, unregisterOperation, failureCount, false)
+		s.unregisterStation(station.StationID, pk, stationEmail, unregisterReason, transientStatusCode, unregisterDetail, unregisterOperation, failureCount, false)
 		return
 	}
 
