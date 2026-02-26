@@ -115,6 +115,13 @@ jobs:
           echo "registry=${{ env.ACR_REGISTRY }}" >> $GITHUB_OUTPUT
           echo "✅ Pushed to ACR with digest: $DIGEST"
 
+      - name: Sign ACR image with Cosign
+        if: github.event_name != 'pull_request'
+        run: |
+          IMAGE="${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push-acr.outputs.digest }}"
+          echo "Signing: $IMAGE"
+          cosign sign --yes "$IMAGE"
+
       # --- Determine which registry to use for deployment ---
       - name: Select registry for deployment
         if: github.event_name != 'pull_request'
@@ -476,14 +483,26 @@ jobs:
         run: |
           FQDN=$(az container show --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query "ipAddress.fqdn" -o tsv)
           echo "Fetching attestation from: https://$FQDN"
-          
-          ATTESTATION=$(curl -sfk "https://$FQDN/attestation?nonce=verify-$(date +%s)" 2>/dev/null || echo "{}")
+
+          python3 -m pip install --quiet pyjwt cryptography
+
+          NONCE="verify-$(date +%s)"
+          ATTESTATION=$(curl -sf "https://$FQDN/attestation?nonce=$NONCE" 2>/dev/null || echo "{}")
           
           if [ -z "$ATTESTATION" ] || [ "$ATTESTATION" = "{}" ]; then
             echo "⚠️ Could not fetch attestation - container may still be starting"
             echo "Expected hash was: $EXPECTED_HASH"
             exit 0
           fi
+
+          TOKEN=$(echo "$ATTESTATION" | jq -r '.token // empty')
+          VERIFY_AT=$(echo "$ATTESTATION" | jq -r '.verify_at // empty')
+          if [ -z "$TOKEN" ] || [ -z "$VERIFY_AT" ]; then
+            echo "❌ Missing token or verify_at in attestation payload"
+            exit 1
+          fi
+
+          python3 -c 'import sys,urllib.parse,jwt; token,verify_at,expected_nonce=sys.argv[1:4]; header=jwt.get_unverified_header(token); jku=header.get("jku"); key_url=jku or verify_at; if jku and verify_at and jku!=verify_at: raise SystemExit(f"jku mismatch: header={jku} verify_at={verify_at}"); p=urllib.parse.urlparse(key_url); if p.scheme!="https" or not p.netloc.endswith(".attest.azure.net") or p.path!="/certs": raise SystemExit(f"untrusted key URL: {key_url}"); signing_key=jwt.PyJWKClient(key_url).get_signing_key_from_jwt(token).key; claims=jwt.decode(token, signing_key, algorithms=["RS256","RS384","RS512","ES256","ES384","ES512"], options={"verify_aud": False}); runtime=claims.get("x-ms-runtime"); nonce=((runtime.get("client-payload") or {}).get("nonce") if isinstance(runtime, dict) and isinstance(runtime.get("client-payload"), dict) else None); if expected_nonce and nonce is None: raise SystemExit("nonce missing from JWT runtime payload"); if expected_nonce and nonce!=expected_nonce: raise SystemExit(f"nonce mismatch: expected {expected_nonce}, got {nonce}"); print("JWT signature and nonce verified")' "$TOKEN" "$VERIFY_AT" "$NONCE"
           
           REMOTE_HASH=$(echo "$ATTESTATION" | jq -r '.summary.cce_policy_hash // .summary.host_data')
           echo ""
@@ -497,6 +516,7 @@ jobs:
           if [ "$EXPECTED_HASH" = "$REMOTE_HASH" ]; then
             echo "✅ VERIFICATION PASSED!"
             echo "The deployed code matches what was built from source."
+            echo "JWT signature and nonce were verified against Azure Attestation keys."
           else
             echo "❌ VERIFICATION FAILED!"
             echo "Hashes do not match!"
@@ -726,6 +746,8 @@ jobs:
         env:
           SOURCE_HASH: ${{ steps.policy.outputs.source_hash }}
         run: |
+          python3 -m pip install --quiet pyjwt cryptography
+
           # Use custom domain if configured, otherwise Azure FQDN
           if [ -n "${{ secrets.TLS_DOMAIN }}" ]; then
             SERVICE_URL="https://${{ secrets.TLS_DOMAIN }}"
@@ -735,12 +757,22 @@ jobs:
             CURL_FLAGS="-sfk"
           fi
           echo "Fetching attestation from: $SERVICE_URL"
-          ATTESTATION=$(curl $CURL_FLAGS "$SERVICE_URL/attestation?nonce=verify-$(date +%s)" 2>/dev/null || echo "{}")
+          NONCE="verify-$(date +%s)"
+          ATTESTATION=$(curl $CURL_FLAGS "$SERVICE_URL/attestation?nonce=$NONCE" 2>/dev/null || echo "{}")
           
           if [ -z "$ATTESTATION" ] || [ "$ATTESTATION" = "{}" ]; then
             echo "⚠️ Could not fetch attestation"
             exit 1
           fi
+
+          TOKEN=$(echo "$ATTESTATION" | jq -r '.token // empty')
+          VERIFY_AT=$(echo "$ATTESTATION" | jq -r '.verify_at // empty')
+          if [ -z "$TOKEN" ] || [ -z "$VERIFY_AT" ]; then
+            echo "❌ Missing token or verify_at in attestation payload"
+            exit 1
+          fi
+
+          python3 -c 'import sys,urllib.parse,jwt; token,verify_at,expected_nonce=sys.argv[1:4]; header=jwt.get_unverified_header(token); jku=header.get("jku"); key_url=jku or verify_at; if jku and verify_at and jku!=verify_at: raise SystemExit(f"jku mismatch: header={jku} verify_at={verify_at}"); p=urllib.parse.urlparse(key_url); if p.scheme!="https" or not p.netloc.endswith(".attest.azure.net") or p.path!="/certs": raise SystemExit(f"untrusted key URL: {key_url}"); signing_key=jwt.PyJWKClient(key_url).get_signing_key_from_jwt(token).key; claims=jwt.decode(token, signing_key, algorithms=["RS256","RS384","RS512","ES256","ES384","ES512"], options={"verify_aud": False}); runtime=claims.get("x-ms-runtime"); nonce=((runtime.get("client-payload") or {}).get("nonce") if isinstance(runtime, dict) and isinstance(runtime.get("client-payload"), dict) else None); if expected_nonce and nonce is None: raise SystemExit("nonce missing from JWT runtime payload"); if expected_nonce and nonce!=expected_nonce: raise SystemExit(f"nonce mismatch: expected {expected_nonce}, got {nonce}"); print("JWT signature and nonce verified")' "$TOKEN" "$VERIFY_AT" "$NONCE"
           
           REMOTE_HASH=$(echo "$ATTESTATION" | jq -r '.summary.cce_policy_hash // .summary.host_data')
           
@@ -754,6 +786,7 @@ jobs:
           if [ "$SOURCE_HASH" = "$REMOTE_HASH" ]; then
             echo "✅ VERIFICATION PASSED!"
             echo "Deployed code matches source code."
+            echo "JWT signature and nonce were verified against Azure Attestation keys."
           else
             echo "❌ VERIFICATION FAILED!"
             exit 1
@@ -767,4 +800,5 @@ jobs:
           echo "Independent verification that deployed code matches source:" >> $GITHUB_STEP_SUMMARY
           echo "- Rebuilt from source with Nix" >> $GITHUB_STEP_SUMMARY
           echo "- Verified ACR image = local build" >> $GITHUB_STEP_SUMMARY
+          echo "- Verified JWT signature + nonce against Azure Attestation keys" >> $GITHUB_STEP_SUMMARY
           echo "- Compared policy hash with hardware attestation" >> $GITHUB_STEP_SUMMARY
