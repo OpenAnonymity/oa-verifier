@@ -39,14 +39,11 @@ func init() {
 
 // getLimiter returns the rate limiter for the given key (IP+UA), creating one if needed.
 func (l *rateLimiterStore) getLimiter(key string) *rate.Limiter {
-	l.mu.RLock()
-	entry, exists := l.limiters[key]
-	l.mu.RUnlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
-	if exists {
-		l.mu.Lock()
+	if entry, exists := l.limiters[key]; exists {
 		entry.lastSeen = time.Now()
-		l.mu.Unlock()
 		return entry.limiter
 	}
 
@@ -54,14 +51,10 @@ func (l *rateLimiterStore) getLimiter(key string) *rate.Limiter {
 	rps := rate.Limit(config.RateLimitRPS())
 	burst := config.RateLimitBurst()
 	limiter := rate.NewLimiter(rps, burst)
-
-	l.mu.Lock()
 	l.limiters[key] = &rateLimiterEntry{
 		limiter:  limiter,
 		lastSeen: time.Now(),
 	}
-	l.mu.Unlock()
-
 	return limiter
 }
 
@@ -80,13 +73,6 @@ func (l *rateLimiterStore) cleanup() {
 
 // getClientIP extracts the client IP from the request.
 func getClientIP(r *http.Request) string {
-	// Cloudflare's CF-Connecting-IP is most reliable when behind Cloudflare proxy
-	// This header is SET by Cloudflare (not appended), so it can't be spoofed
-	if cfIP := r.Header.Get("CF-Connecting-IP"); cfIP != "" {
-		return cfIP
-	}
-
-	// Fall back to RemoteAddr (direct connection or non-Cloudflare)
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
@@ -94,12 +80,11 @@ func getClientIP(r *http.Request) string {
 	return ip
 }
 
-// rateLimitMiddleware limits requests per IP+UserAgent using token bucket algorithm.
+// rateLimitMiddleware limits requests per client IP using token bucket algorithm.
 func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := getClientIP(r)
-		ua := r.Header.Get("User-Agent")
-		key := ip + "|" + ua
+		key := ip
 		limiter := globalRateLimiter.getLimiter(key)
 
 		if !limiter.Allow() {
