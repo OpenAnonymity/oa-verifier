@@ -1166,7 +1166,23 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 		policyResponse["decoded"] = policyDecoded
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	// Build Sigstore transparency log section (if available from CI)
+	var sigstoreResponse map[string]any
+	rekorLogIndex := os.Getenv("REKOR_LOG_INDEX")
+	sigstorePayloadHash := os.Getenv("SIGSTORE_PAYLOAD_HASH")
+	if rekorLogIndex != "" || sigstorePayloadHash != "" {
+		sigstoreResponse = map[string]any{}
+		if rekorLogIndex != "" {
+			sigstoreResponse["rekor_log_index"] = rekorLogIndex
+		}
+		if sigstorePayloadHash != "" {
+			sigstoreResponse["signing_payload_hash"] = sigstorePayloadHash
+			sigstoreResponse["search_url"] = "https://search.sigstore.dev/?hash=" + sigstorePayloadHash
+		}
+		sigstoreResponse["verify_command"] = "cosign verify --certificate-identity-regexp='https://github.com/OpenAnonymity/oa-verifier/' --certificate-oidc-issuer='https://token.actions.githubusercontent.com' ghcr.io/openanonymity/oa-verifier:latest"
+	}
+
+	response := map[string]any{
 		"token":     token,
 		"timestamp": utcNow(),
 		"nonce":     nonce,
@@ -1185,7 +1201,12 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 			"what_tls_hash_proves":    "SHA256 hash of TLS public key - proves you're talking directly to the enclave",
 			"zero_trust_verification": "sha256(policy.decoded) == summary.cce_policy_hash proves policy authenticity",
 		},
-	})
+	}
+	if sigstoreResponse != nil {
+		response["sigstore"] = sigstoreResponse
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) handleAttestationRaw(w http.ResponseWriter, r *http.Request) {
