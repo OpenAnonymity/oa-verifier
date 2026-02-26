@@ -1127,9 +1127,7 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 
 	// Runtime data contains the nonce we provided
 	if runtimeData, ok := claims["x-ms-runtime"].(map[string]any); ok {
-		if clientPayload, ok := runtimeData["client-payload"].(map[string]any); ok {
-			summary["runtime_data"] = clientPayload
-		}
+		summary["runtime_data"] = runtimeData
 	}
 
 	// Debug/security status

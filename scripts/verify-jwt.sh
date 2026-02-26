@@ -103,7 +103,7 @@ fi
 # --- verify nonce ---
 
 PAYLOAD_JSON=$(b64url_decode "$PAYLOAD_B64")
-NONCE=$(echo "$PAYLOAD_JSON" | jq -r '."x-ms-runtime"."client-payload".nonce // empty')
+NONCE=$(echo "$PAYLOAD_JSON" | jq -r '(."x-ms-runtime".nonce // ."x-ms-runtime"."client-payload".nonce) // empty')
 
 if [ -n "$EXPECTED_NONCE" ]; then
   if [ -z "$NONCE" ]; then
