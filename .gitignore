@@ -1,9 +1,7 @@
 # Go
 verifier
+oa-verifier
 *.exe
-
-# Rust
-target/
 
 # Cookies (sensitive)
 cookies.json
@@ -24,5 +22,6 @@ Thumbs.db
 banned_stations.json
 
 .env
+.context/
 result
 *.tar.gz
