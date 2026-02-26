@@ -999,6 +999,14 @@ type maaAttestRequest struct {
 	RuntimeData string `json:"runtime_data"` // base64-encoded nonce data
 }
 
+func resolveAttestationNonce(raw string) string {
+	nonce := strings.TrimSpace(raw)
+	if nonce != "" {
+		return nonce
+	}
+	return fmt.Sprintf("server-%d", time.Now().UnixNano())
+}
+
 // getAttestationToken calls the ACI MAA sidecar to get an attestation token.
 // tlsHash is the SHA256 hash of the TLS public key for channel binding.
 func getAttestationToken(nonce, tlsHash string) (string, error) {
@@ -1014,11 +1022,6 @@ func getAttestationToken(nonce, tlsHash string) (string, error) {
 	maaProvider := os.Getenv("MAA_PROVIDER_URL")
 	if maaProvider == "" {
 		maaProvider = defaultMAAProviderURL
-	}
-
-	// Ensure nonce is not empty - required by the sidecar
-	if nonce == "" {
-		nonce = "default-nonce"
 	}
 
 	// runtime_data must be valid JSON for MAA
@@ -1085,13 +1088,15 @@ func getAttestationToken(nonce, tlsHash string) (string, error) {
 }
 
 func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
-	nonce := r.URL.Query().Get("nonce")
+	nonce := resolveAttestationNonce(r.URL.Query().Get("nonce"))
+
+	tlsHash := s.getTLSPubKeyHash()
 
 	// Pass TLS public key hash for channel binding
-	token, err := getAttestationToken(nonce, s.tlsPubKeyHash)
+	token, err := getAttestationToken(nonce, tlsHash)
 	if err != nil {
 		slog.Error("attestation failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "Attestation failed: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "Attestation failed")
 		return
 	}
 
@@ -1141,8 +1146,8 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 	issuer, _ := claims["iss"].(string)
 
 	// Include TLS hash in summary for channel binding verification
-	if s.tlsPubKeyHash != "" {
-		summary["tls_pubkey_hash"] = s.tlsPubKeyHash
+	if tlsHash != "" {
+		summary["tls_pubkey_hash"] = tlsHash
 	}
 
 	// Get CCE policy from environment (set at deployment time)
@@ -1187,10 +1192,10 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAttestationRaw(w http.ResponseWriter, r *http.Request) {
-	nonce := r.URL.Query().Get("nonce")
+	nonce := resolveAttestationNonce(r.URL.Query().Get("nonce"))
 
 	// Pass TLS public key hash for channel binding
-	token, err := getAttestationToken(nonce, s.tlsPubKeyHash)
+	token, err := getAttestationToken(nonce, s.getTLSPubKeyHash())
 	if err != nil {
 		slog.Error("attestation failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "Attestation failed")
