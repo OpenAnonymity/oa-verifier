@@ -22,48 +22,7 @@ permissions:
   id-token: write
 
 jobs:
-  detect-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      should_build: ${{ steps.decide.outputs.should_build }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Check for code changes
-        id: filter
-        uses: dorny/paths-filter@v3
-        with:
-          filters: |
-            code:
-              - '**/*.go'
-              - 'go.mod'
-              - 'go.sum'
-              - '**/*.nix'
-              - 'flake.lock'
-              - 'cmd/**'
-              - 'internal/**'
-
-      - name: Decide whether to build
-        id: decide
-        run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "Manual dispatch -- always build"
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "Tag push -- always build"
-          elif [[ "${{ steps.filter.outputs.code }}" == "true" ]]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "Code files changed -- building"
-          else
-            echo "should_build=false" >> $GITHUB_OUTPUT
-            echo "No code changes (docs/CI only) -- skipping build"
-          fi
-
   build-and-deploy:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.should_build == 'true'
     runs-on: ubuntu-latest
 
     steps:
@@ -645,12 +604,8 @@ jobs:
   verify:
     name: Verify Attestation
     runs-on: ubuntu-latest
-    needs: [detect-changes, build-and-deploy]
-    if: |
-      always() &&
-      needs.build-and-deploy.result == 'success' &&
-      github.event_name != 'pull_request' &&
-      github.ref == 'refs/heads/main'
+    needs: build-and-deploy
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
     
     steps:
       - name: Checkout repository
