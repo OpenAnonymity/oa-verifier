@@ -84,11 +84,34 @@ jobs:
 
       - name: Sign GHCR image with Cosign
         if: github.event_name != 'pull_request' && steps.push-ghcr.outcome == 'success'
+        id: sign-ghcr
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           IMAGE="${{ env.GHCR_REGISTRY }}/${OWNER}/${{ env.IMAGE_NAME }}@${{ steps.push-ghcr.outputs.digest }}"
           echo "Signing: $IMAGE"
-          cosign sign --yes "$IMAGE"
+          OUTPUT=$(cosign sign --yes "$IMAGE" 2>&1)
+          echo "$OUTPUT"
+
+          # Extract Rekor tlog index from cosign output
+          LOG_INDEX=$(echo "$OUTPUT" | grep -o 'tlog entry created with index: [0-9]*' | grep -o '[0-9]*')
+          if [ -n "$LOG_INDEX" ]; then
+            echo "rekor_log_index=$LOG_INDEX" >> $GITHUB_OUTPUT
+            echo "✅ Rekor log index: $LOG_INDEX"
+
+            # Fetch signing payload hash from Rekor using the log index
+            PAYLOAD_HASH=$(curl -sS "https://rekor.sigstore.dev/api/v1/log/entries?logIndex=$LOG_INDEX" \
+              | jq -r 'to_entries[0].value.body' \
+              | base64 -d \
+              | jq -r '.spec.data.hash | "\(.algorithm):\(.value)"')
+            if [ -n "$PAYLOAD_HASH" ] && [ "$PAYLOAD_HASH" != "null:null" ]; then
+              echo "signing_payload_hash=$PAYLOAD_HASH" >> $GITHUB_OUTPUT
+              echo "✅ Signing payload hash: $PAYLOAD_HASH"
+            else
+              echo "⚠️ Could not extract signing payload hash from Rekor"
+            fi
+          else
+            echo "⚠️ Could not extract Rekor log index from cosign output"
+          fi
 
       # --- Always push to ACR (fallback, always works) ---
       - name: Log in to ACR
@@ -140,6 +163,10 @@ jobs:
             echo "use_ghcr=false" >> $GITHUB_OUTPUT
           fi
 
+          # Forward Sigstore info (from GHCR signing step)
+          echo "rekor_log_index=${{ steps.sign-ghcr.outputs.rekor_log_index }}" >> $GITHUB_OUTPUT
+          echo "signing_payload_hash=${{ steps.sign-ghcr.outputs.signing_payload_hash }}" >> $GITHUB_OUTPUT
+
       # --- DEPLOY SECTION (same job, same runner, image already loaded) ---
       
       - name: Azure Login
@@ -159,6 +186,8 @@ jobs:
           DEPLOY_REGISTRY: ${{ steps.registry.outputs.registry }}
           DEPLOY_DIGEST: ${{ steps.registry.outputs.digest }}
           USE_GHCR: ${{ steps.registry.outputs.use_ghcr }}
+          REKOR_LOG_INDEX: ${{ steps.registry.outputs.rekor_log_index }}
+          SIGSTORE_PAYLOAD_HASH: ${{ steps.registry.outputs.signing_payload_hash }}
         run: |
           echo "Generating CCE policy..."
           echo "Registry: $DEPLOY_REGISTRY"
@@ -270,7 +299,9 @@ jobs:
                       "ACME_EMAIL",
                       "ACME_DNS_PROVIDER",
                       "CF_DNS_API_TOKEN",
-                      "CF_ZONE_API_TOKEN"
+                      "CF_ZONE_API_TOKEN",
+                      "REKOR_LOG_INDEX",
+                      "SIGSTORE_PAYLOAD_HASH"
                   ]
                   for env_var in required_env_vars:
                       containers[0]["env_rules"].append({
@@ -284,13 +315,13 @@ jobs:
                           "required": False,
                           "strategy": "re2"
                       })
-              
+
               new_containers_json = json.dumps(containers, separators=(",", ":"))
               policy = policy[:match.start(1)] + new_containers_json + policy[match.end(1):]
-          
+
           print(policy)
           ')
-          
+
           # Step 4: Encode modified policy and compute hash
           POLICY_B64=$(echo "$MODIFIED_POLICY" | base64 -w0)
           POLICY_HASH=$(echo "$MODIFIED_POLICY" | sha256sum | cut -d' ' -f1)
@@ -328,7 +359,9 @@ jobs:
                       {"name": "TLS_DOMAIN", "value": "${{ secrets.TLS_DOMAIN }}"},
                       {"name": "ACME_EMAIL", "value": "${{ secrets.ACME_EMAIL }}"},
                       {"name": "ACME_DNS_PROVIDER", "value": "${{ secrets.ACME_DNS_PROVIDER }}"},
-                      {"name": "CF_DNS_API_TOKEN", "secureValue": "${{ secrets.CF_API_TOKEN }}"}
+                      {"name": "CF_DNS_API_TOKEN", "secureValue": "${{ secrets.CF_API_TOKEN }}"},
+                      {"name": "REKOR_LOG_INDEX", "value": "${REKOR_LOG_INDEX}"},
+                      {"name": "SIGSTORE_PAYLOAD_HASH", "value": "${SIGSTORE_PAYLOAD_HASH}"}
                     ],
                     "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
                   }
@@ -717,7 +750,9 @@ jobs:
                       "ACME_EMAIL",
                       "ACME_DNS_PROVIDER",
                       "CF_DNS_API_TOKEN",
-                      "CF_ZONE_API_TOKEN"
+                      "CF_ZONE_API_TOKEN",
+                      "REKOR_LOG_INDEX",
+                      "SIGSTORE_PAYLOAD_HASH"
                   ]
                   for env_var in required_env_vars:
                       containers[0]["env_rules"].append({
