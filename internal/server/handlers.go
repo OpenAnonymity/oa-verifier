@@ -139,6 +139,18 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if already banned by public key
+	if s.banned.IsBanned("", req.PublicKey) {
+		bannedID := s.banned.GetStationIDByPK(req.PublicKey)
+		if bannedID == "" {
+			bannedID = "pk:" + req.PublicKey[:16]
+		}
+		slog.Warn("registration rejected: station is BANNED", "station_id", bannedID)
+		go func() { _ = openrouter.NotifyOrgBanned(bannedID, "banned_reregister_attempt") }()
+		writeError(w, http.StatusForbidden, "Station is banned")
+		return
+	}
+
 	// Early return if already registered with same public key
 	s.mu.RLock()
 	if existing, ok := s.stations[req.PublicKey]; ok {
@@ -151,18 +163,6 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.RUnlock()
-
-	// Check if already banned by public key
-	if s.banned.IsBanned("", req.PublicKey) {
-		bannedID := s.banned.GetStationIDByPK(req.PublicKey)
-		if bannedID == "" {
-			bannedID = "pk:" + req.PublicKey[:16]
-		}
-		slog.Warn("registration rejected: station is BANNED", "station_id", bannedID)
-		go func() { _ = openrouter.NotifyOrgBanned(bannedID, "banned_reregister_attempt") }()
-		writeError(w, http.StatusForbidden, "Station is banned")
-		return
-	}
 
 	registerIdentity := normalizeOpFailureIdentity("", req.PublicKey)
 
