@@ -22,9 +22,50 @@ permissions:
   id-token: write
 
 jobs:
-  build-and-deploy:
+  detect-changes:
     runs-on: ubuntu-latest
-    
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for code changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            code:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - '**/*.nix'
+              - 'flake.lock'
+              - 'cmd/**'
+              - 'internal/**'
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "Manual dispatch -- always build"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "Tag push -- always build"
+          elif [[ "${{ steps.filter.outputs.code }}" == "true" ]]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "Code files changed -- building"
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "No code changes (docs/CI only) -- skipping build"
+          fi
+
+  build-and-deploy:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -509,6 +550,30 @@ jobs:
             echo "⚠️ Origin certificate is not Let's Encrypt (likely ACME fallback)"
           fi
 
+      - name: Fetch container logs (ACME debug)
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main') && steps.origin_cert.outputs.cert_status != 'letsencrypt'
+        run: |
+          echo "=============================================="
+          echo "  CONTAINER LOGS (ACME DEBUG)"
+          echo "=============================================="
+          echo ""
+          echo "Certificate status: ${{ steps.origin_cert.outputs.cert_status }}"
+          echo "Expected: letsencrypt"
+          echo ""
+          echo "--- oa-verifier container logs ---"
+          az container logs \
+            --name ${{ env.CONTAINER_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --container-name oa-verifier \
+            2>&1 || echo "(failed to fetch oa-verifier logs)"
+          echo ""
+          echo "--- container state ---"
+          az container show \
+            --name ${{ env.CONTAINER_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query "containers[].{name:name, state:instanceView.currentState}" \
+            -o json 2>&1 || echo "(failed to fetch container details)"
+
       - name: Verify attestation matches local build
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
         env:
@@ -570,13 +635,22 @@ jobs:
           echo "| Origin Cert Not Before | ${{ steps.origin_cert.outputs.not_before }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Origin Cert Not After | ${{ steps.origin_cert.outputs.not_after }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Origin Cert SHA256 | ${{ steps.origin_cert.outputs.fingerprint_sha256 }} |" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.origin_cert.outputs.cert_status }}" != "letsencrypt" ] && [ -n "${{ steps.origin_cert.outputs.cert_status }}" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ACME Debug" >> $GITHUB_STEP_SUMMARY
+            echo "Origin cert is **${{ steps.origin_cert.outputs.cert_status }}** (not Let's Encrypt). Check the 'Fetch container logs (ACME debug)' step for details." >> $GITHUB_STEP_SUMMARY
+          fi
 
   # Independent verification job - rebuilds from source and verifies against deployed attestation
   verify:
     name: Verify Attestation
     runs-on: ubuntu-latest
-    needs: build-and-deploy
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
+    needs: [detect-changes, build-and-deploy]
+    if: |
+      always() &&
+      needs.build-and-deploy.result == 'success' &&
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main'
     
     steps:
       - name: Checkout repository
