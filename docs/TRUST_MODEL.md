@@ -165,7 +165,7 @@ unlinkability were somehow weakened, inference remains unlinkable -- no OA syste
 prompts or responses (direct browser-to-provider), and the provider sees anonymous
 ephemeral keys. The worst case for the org is knowing "some user obtained an API key"
 but never what was sent with it. See
-[PRIVACY_MODEL.md](https://github.com/openanonymity/oa-chat/blob/main/docs/PRIVACY_MODEL.md)
+[PRIVACY_MODEL.md](https://github.com/openanonymity/oa-fastchat/blob/main/docs/PRIVACY_MODEL.md)
 for the full malicious-component analysis.
 
 ## System-Level Unlinkability Model

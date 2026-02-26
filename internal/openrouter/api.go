@@ -668,7 +668,7 @@ func VerifyKeyOwnership(provisioningKey, keyHash string) (OwnershipCheckResult, 
 func FetchOrgPublicKey() (string, error) {
 	registryURL := config.RegistryURL()
 	if registryURL == "" {
-		return "", fmt.Errorf("REGISTRY_URL not configured")
+		return "", fmt.Errorf("STATION_REGISTRY_URL not configured")
 	}
 
 	cfg := netretry.DefaultConfig(3)

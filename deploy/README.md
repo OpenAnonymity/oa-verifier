@@ -24,7 +24,7 @@ The build-and-sign workflow handles everything automatically:
 
 ### Trigger Deployment
 
-Push to `main` or `attestation` branch, or manually trigger:
+Push to `main`, or manually trigger:
 
 ```bash
 # Via GitHub CLI
@@ -55,7 +55,7 @@ gh workflow run build-and-sign.yml
 | `TLS_DOMAIN` | Custom domain for Let's Encrypt cert |
 | `ACME_EMAIL` | Email for Let's Encrypt notifications |
 | `ACME_DNS_PROVIDER` | DNS provider (e.g., `cloudflare`) |
-| `CF_API_TOKEN` | Cloudflare API token |
+| `CF_API_TOKEN` | Cloudflare DNS API token |
 
 ### Creating Azure Credentials
 
@@ -77,6 +77,8 @@ cosign verify ghcr.io/OWNER/oa-verifier@sha256:DIGEST \
 # Verify GitHub attestation
 gh attestation verify oci://ghcr.io/OWNER/oa-verifier@sha256:DIGEST --owner OWNER
 ```
+
+Note: CI compares attested policy hash against the source-built policy hash. Full JWT signature verification should still be performed by external auditors using the `verify_at` certificates from `/attestation`.
 
 ## Trust Chain
 

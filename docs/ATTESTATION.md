@@ -206,7 +206,7 @@ docker stop registry && docker rm registry
 NONCE=$(date +%s)
 
 # Fetch attestation from the service
-curl -sk "https://oa-verifier.eastus.azurecontainer.io/attestation?nonce=$NONCE" > attestation.json
+curl -sS "https://verifier.openanonymity.ai/attestation?nonce=$NONCE" > attestation.json
 
 # Pretty print to inspect
 cat attestation.json | jq
@@ -273,7 +273,7 @@ echo "=== Attestation Integrity Check (non-strict) ==="
 
 # Step 1: Fetch attestation
 NONCE=$(date +%s)
-curl -sk "https://oa-verifier.eastus.azurecontainer.io/attestation?nonce=$NONCE" > attestation.json
+curl -sS "https://verifier.openanonymity.ai/attestation?nonce=$NONCE" > attestation.json
 
 # Step 2: Verify policy hash (hardware verification)
 COMPUTED=$(jq -r '.policy.base64' attestation.json | base64 -d | sha256sum | cut -d' ' -f1)
@@ -324,15 +324,21 @@ echo "=== Verification Complete (signature verification not included in this scr
 If you trust GitHub Actions built the image correctly (don't need full zero-trust):
 
 ```bash
-# Fetch and verify policy hash only
-curl -sk "https://oa-verifier.eastus.azurecontainer.io/attestation?nonce=$(date +%s)" | \
-  jq '{
-    policy_verified: (.summary.host_data == (.policy.base64 | @base64d | @text | gsub("[\\n]"; "") | .)),
-    image: (.policy.decoded | capture("\"id\":\"(?<img>[^\"]+)\"") | .img),
-    hardware: .summary.host_data,
-    debug_disabled: .summary.debug_disabled,
-    attestation_type: .summary.attestation_type
-  }'
+# Fetch attestation
+ATT="$(curl -sS "https://verifier.openanonymity.ai/attestation?nonce=$(date +%s)")"
+
+# Verify policy hash
+COMPUTED="$(echo "$ATT" | jq -r '.policy.base64' | base64 -d | sha256sum | cut -d" " -f1)"
+HARDWARE="$(echo "$ATT" | jq -r '.summary.host_data')"
+
+echo "$ATT" | jq --arg computed "$COMPUTED" --arg hardware "$HARDWARE" '{
+  policy_verified: ($computed == $hardware),
+  computed_policy_hash: $computed,
+  hardware_policy_hash: $hardware,
+  image: (.policy.decoded | capture("\"id\":\"(?<img>[^\"]+)\"") | .img),
+  debug_disabled: .summary.debug_disabled,
+  attestation_type: .summary.attestation_type
+}'
 ```
 
 ---
@@ -356,7 +362,7 @@ The CCE policy (returned in `policy.decoded`) defines:
 
 ```rego
 containers := [{
-  "id": "ghcr.io/erikchi/oa-verifier@sha256:...",  # Exact image allowed
+  "id": "ghcr.io/openanonymity/oa-verifier@sha256:...",  # Exact image allowed
   "command": ["/bin/oa-verifier"],                  # Exact command
   "layers": ["eee2cb9809bdf33ce..."],               # Layer hashes
   "env_rules": [...],                               # Allowed environment variables
@@ -430,6 +436,6 @@ If verification passes:
 
 ## Reference
 
-- **Attestation Endpoint**: `https://oa-verifier.eastus.azurecontainer.io/attestation?nonce=<your-nonce>`
+- **Attestation Endpoint**: `https://verifier.openanonymity.ai/attestation?nonce=<your-nonce>`
 - **Azure Keys**: `https://sharedeus.eus.attest.azure.net/certs`
 - **Source Code**: `https://github.com/openanonymity/oa-verifier`
