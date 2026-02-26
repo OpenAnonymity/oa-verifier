@@ -502,8 +502,32 @@ jobs:
             exit 1
           fi
 
-          python3 -c 'import sys,urllib.parse,jwt; token,verify_at,expected_nonce=sys.argv[1:4]; header=jwt.get_unverified_header(token); jku=header.get("jku"); key_url=jku or verify_at; if jku and verify_at and jku!=verify_at: raise SystemExit(f"jku mismatch: header={jku} verify_at={verify_at}"); p=urllib.parse.urlparse(key_url); if p.scheme!="https" or not p.netloc.endswith(".attest.azure.net") or p.path!="/certs": raise SystemExit(f"untrusted key URL: {key_url}"); signing_key=jwt.PyJWKClient(key_url).get_signing_key_from_jwt(token).key; claims=jwt.decode(token, signing_key, algorithms=["RS256","RS384","RS512","ES256","ES384","ES512"], options={"verify_aud": False}); runtime=claims.get("x-ms-runtime"); nonce=((runtime.get("client-payload") or {}).get("nonce") if isinstance(runtime, dict) and isinstance(runtime.get("client-payload"), dict) else None); if expected_nonce and nonce is None: raise SystemExit("nonce missing from JWT runtime payload"); if expected_nonce and nonce!=expected_nonce: raise SystemExit(f"nonce mismatch: expected {expected_nonce}, got {nonce}"); print("JWT signature and nonce verified")' "$TOKEN" "$VERIFY_AT" "$NONCE"
-          
+          python3 <<'PYEOF' "$TOKEN" "$VERIFY_AT" "$NONCE"
+          import sys, urllib.parse, jwt
+          token, verify_at, expected_nonce = sys.argv[1:4]
+          header = jwt.get_unverified_header(token)
+          jku = header.get("jku")
+          key_url = jku or verify_at
+          if jku and verify_at and jku != verify_at:
+              raise SystemExit(f"jku mismatch: header={jku} verify_at={verify_at}")
+          p = urllib.parse.urlparse(key_url)
+          if p.scheme != "https" or not p.netloc.endswith(".attest.azure.net") or p.path != "/certs":
+              raise SystemExit(f"untrusted key URL: {key_url}")
+          signing_key = jwt.PyJWKClient(key_url).get_signing_key_from_jwt(token).key
+          claims = jwt.decode(token, signing_key, algorithms=["RS256","RS384","RS512","ES256","ES384","ES512"], options={"verify_aud": False})
+          runtime = claims.get("x-ms-runtime")
+          nonce = (
+              (runtime.get("client-payload") or {}).get("nonce")
+              if isinstance(runtime, dict) and isinstance(runtime.get("client-payload"), dict)
+              else None
+          )
+          if expected_nonce and nonce is None:
+              raise SystemExit("nonce missing from JWT runtime payload")
+          if expected_nonce and nonce != expected_nonce:
+              raise SystemExit(f"nonce mismatch: expected {expected_nonce}, got {nonce}")
+          print("JWT signature and nonce verified")
+          PYEOF
+
           REMOTE_HASH=$(echo "$ATTESTATION" | jq -r '.summary.cce_policy_hash // .summary.host_data')
           echo ""
           echo "=========================================="
@@ -772,7 +796,31 @@ jobs:
             exit 1
           fi
 
-          python3 -c 'import sys,urllib.parse,jwt; token,verify_at,expected_nonce=sys.argv[1:4]; header=jwt.get_unverified_header(token); jku=header.get("jku"); key_url=jku or verify_at; if jku and verify_at and jku!=verify_at: raise SystemExit(f"jku mismatch: header={jku} verify_at={verify_at}"); p=urllib.parse.urlparse(key_url); if p.scheme!="https" or not p.netloc.endswith(".attest.azure.net") or p.path!="/certs": raise SystemExit(f"untrusted key URL: {key_url}"); signing_key=jwt.PyJWKClient(key_url).get_signing_key_from_jwt(token).key; claims=jwt.decode(token, signing_key, algorithms=["RS256","RS384","RS512","ES256","ES384","ES512"], options={"verify_aud": False}); runtime=claims.get("x-ms-runtime"); nonce=((runtime.get("client-payload") or {}).get("nonce") if isinstance(runtime, dict) and isinstance(runtime.get("client-payload"), dict) else None); if expected_nonce and nonce is None: raise SystemExit("nonce missing from JWT runtime payload"); if expected_nonce and nonce!=expected_nonce: raise SystemExit(f"nonce mismatch: expected {expected_nonce}, got {nonce}"); print("JWT signature and nonce verified")' "$TOKEN" "$VERIFY_AT" "$NONCE"
+          python3 <<'PYEOF' "$TOKEN" "$VERIFY_AT" "$NONCE"
+          import sys, urllib.parse, jwt
+          token, verify_at, expected_nonce = sys.argv[1:4]
+          header = jwt.get_unverified_header(token)
+          jku = header.get("jku")
+          key_url = jku or verify_at
+          if jku and verify_at and jku != verify_at:
+              raise SystemExit(f"jku mismatch: header={jku} verify_at={verify_at}")
+          p = urllib.parse.urlparse(key_url)
+          if p.scheme != "https" or not p.netloc.endswith(".attest.azure.net") or p.path != "/certs":
+              raise SystemExit(f"untrusted key URL: {key_url}")
+          signing_key = jwt.PyJWKClient(key_url).get_signing_key_from_jwt(token).key
+          claims = jwt.decode(token, signing_key, algorithms=["RS256","RS384","RS512","ES256","ES384","ES512"], options={"verify_aud": False})
+          runtime = claims.get("x-ms-runtime")
+          nonce = (
+              (runtime.get("client-payload") or {}).get("nonce")
+              if isinstance(runtime, dict) and isinstance(runtime.get("client-payload"), dict)
+              else None
+          )
+          if expected_nonce and nonce is None:
+              raise SystemExit("nonce missing from JWT runtime payload")
+          if expected_nonce and nonce != expected_nonce:
+              raise SystemExit(f"nonce mismatch: expected {expected_nonce}, got {nonce}")
+          print("JWT signature and nonce verified")
+          PYEOF
           
           REMOTE_HASH=$(echo "$ATTESTATION" | jq -r '.summary.cce_policy_hash // .summary.host_data')
           
