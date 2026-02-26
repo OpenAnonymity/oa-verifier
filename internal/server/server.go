@@ -283,9 +283,8 @@ func validatePublicKey(pkHex string) bool {
 }
 
 func generateProvLabel(stationID string) string {
-	mac := hmac.New(sha256.New, config.ProvisioningKeySalt())
-	mac.Write([]byte(stationID))
-	return hex.EncodeToString(mac.Sum(nil))[:16]
+	sum := sha256.Sum256([]byte(stationID))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 func extractEmail(data map[string]any) string {

@@ -71,16 +71,14 @@ import (
 )
 
 const (
-	clerkJSURL                 = "https://clerk.openrouter.ai/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
-	clerkAPI                   = "https://clerk.openrouter.ai/v1/client/sessions/%s/tokens"
-	managementKeysPagePath     = "/settings/management-keys"
-	provisioningKeysLegacyPath = "/settings/provisioning-keys"
+	clerkJSURL             = "https://clerk.openrouter.ai/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+	clerkAPI               = "https://clerk.openrouter.ai/v1/client/sessions/%s/tokens"
+	managementKeysPagePath = "/settings/management-keys"
 )
 
 var pages = map[string]string{
-	"activity":                 "/activity",
-	"management_keys":          managementKeysPagePath,
-	"provisioning_keys_legacy": provisioningKeysLegacyPath,
+	"activity":        "/activity",
+	"management_keys": managementKeysPagePath,
 }
 
 var actionNameMap = map[string]string{
