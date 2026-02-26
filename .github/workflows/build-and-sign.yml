@@ -598,7 +598,7 @@ jobs:
           echo "Fetching attestation from: https://$FQDN"
 
           NONCE="verify-$(date +%s)"
-          ATTESTATION=$(curl -sf "https://$FQDN/attestation?nonce=$NONCE" 2>/dev/null || echo "{}")
+          ATTESTATION=$(curl -sfk "https://$FQDN/attestation?nonce=$NONCE" 2>/dev/null || echo "{}")
 
           if [ -z "$ATTESTATION" ] || [ "$ATTESTATION" = "{}" ]; then
             echo "⚠️ Could not fetch attestation - container may still be starting"
