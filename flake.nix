@@ -21,7 +21,7 @@
           src = ./.;
           
           subPackages = [ "cmd/verifier" ];
-          vendorHash = "sha256-bC7/E9aeC2GEixomazMFe1ej93Avq8ZmFbZmqbfSihw=";
+          vendorHash = "sha256-Gw49LP2f8VWvUqViQayxKH+fMuj4OCjCHIgFSBGPvuw=";
           
           CGO_ENABLED = 0;
           
