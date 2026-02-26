@@ -29,7 +29,39 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check for code changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            code:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - '**/*.nix'
+              - 'flake.lock'
+              - 'cmd/**'
+              - 'internal/**'
+
+      - name: Decide whether to build
+        id: should-build
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "Manual dispatch -- always build"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "Tag push -- always build"
+          elif [[ "${{ steps.changes.outputs.code }}" == "true" ]]; then
+            echo "build=true" >> $GITHUB_OUTPUT
+            echo "Code files changed -- building"
+          else
+            echo "build=false" >> $GITHUB_OUTPUT
+            echo "No code changes -- will reuse existing image"
+          fi
+
       - name: Install Nix
+        if: steps.should-build.outputs.build == 'true'
         uses: cachix/install-nix-action@v27
         with:
           nix_path: nixpkgs=channel:nixos-24.05
@@ -37,6 +69,7 @@ jobs:
             experimental-features = nix-command flakes
 
       - name: Build container with Nix (reproducible)
+        if: steps.should-build.outputs.build == 'true'
         id: build
         run: |
           echo "Building container with Nix..."
@@ -51,11 +84,12 @@ jobs:
           echo "✅ Nix build complete. Image ID: $IMAGE_ID"
 
       - name: Install Cosign
+        if: steps.should-build.outputs.build == 'true'
         uses: sigstore/cosign-installer@v3.7.0
 
       # --- Try GHCR first (works for public repos) ---
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.should-build.outputs.build == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.GHCR_REGISTRY }}
@@ -63,7 +97,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push to GHCR
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.should-build.outputs.build == 'true'
         id: push-ghcr
         continue-on-error: true  # May fail on private repos
         run: |
@@ -83,7 +117,7 @@ jobs:
           echo "✅ Pushed to GHCR with digest: $DIGEST"
 
       - name: Sign GHCR image with Cosign
-        if: github.event_name != 'pull_request' && steps.push-ghcr.outcome == 'success'
+        if: github.event_name != 'pull_request' && steps.should-build.outputs.build == 'true' && steps.push-ghcr.outcome == 'success'
         id: sign-ghcr
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
@@ -123,7 +157,7 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Push to ACR
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.should-build.outputs.build == 'true'
         id: push-acr
         run: |
           # Tag and push to ACR
@@ -139,11 +173,25 @@ jobs:
           echo "✅ Pushed to ACR with digest: $DIGEST"
 
       - name: Sign ACR image with Cosign
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && steps.should-build.outputs.build == 'true'
         run: |
           IMAGE="${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push-acr.outputs.digest }}"
           echo "Signing: $IMAGE"
           cosign sign --yes "$IMAGE"
+
+      # --- Pull existing image when skipping build ---
+      - name: Pull existing image (no code changes)
+        if: github.event_name != 'pull_request' && steps.should-build.outputs.build != 'true'
+        id: pull-existing
+        run: |
+          docker pull ${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker tag ${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest oa-verifier:latest
+
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}:latest | cut -d'@' -f2)
+          IMAGE_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}')
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
+          echo "Reusing existing image: $IMAGE_ID (digest: $DIGEST)"
 
       # --- Determine which registry to use for deployment ---
       - name: Select registry for deployment
@@ -151,21 +199,29 @@ jobs:
         id: registry
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          if [ "${{ steps.push-ghcr.outcome }}" = "success" ]; then
+
+          if [ "${{ steps.should-build.outputs.build }}" != "true" ]; then
+            echo "Reusing existing ACR image (no code changes)"
+            echo "registry=${{ env.ACR_REGISTRY }}" >> $GITHUB_OUTPUT
+            echo "digest=${{ steps.pull-existing.outputs.digest }}" >> $GITHUB_OUTPUT
+            echo "use_ghcr=false" >> $GITHUB_OUTPUT
+            echo "rekor_log_index=" >> $GITHUB_OUTPUT
+            echo "signing_payload_hash=" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.push-ghcr.outcome }}" = "success" ]; then
             echo "Using GHCR for deployment (public repo)"
             echo "registry=${{ env.GHCR_REGISTRY }}/${OWNER}" >> $GITHUB_OUTPUT
             echo "digest=${{ steps.push-ghcr.outputs.digest }}" >> $GITHUB_OUTPUT
             echo "use_ghcr=true" >> $GITHUB_OUTPUT
+            echo "rekor_log_index=${{ steps.sign-ghcr.outputs.rekor_log_index }}" >> $GITHUB_OUTPUT
+            echo "signing_payload_hash=${{ steps.sign-ghcr.outputs.signing_payload_hash }}" >> $GITHUB_OUTPUT
           else
             echo "Using ACR for deployment (private repo fallback)"
             echo "registry=${{ env.ACR_REGISTRY }}" >> $GITHUB_OUTPUT
             echo "digest=${{ steps.push-acr.outputs.digest }}" >> $GITHUB_OUTPUT
             echo "use_ghcr=false" >> $GITHUB_OUTPUT
+            echo "rekor_log_index=${{ steps.sign-ghcr.outputs.rekor_log_index }}" >> $GITHUB_OUTPUT
+            echo "signing_payload_hash=${{ steps.sign-ghcr.outputs.signing_payload_hash }}" >> $GITHUB_OUTPUT
           fi
-
-          # Forward Sigstore info (from GHCR signing step)
-          echo "rekor_log_index=${{ steps.sign-ghcr.outputs.rekor_log_index }}" >> $GITHUB_OUTPUT
-          echo "signing_payload_hash=${{ steps.sign-ghcr.outputs.signing_payload_hash }}" >> $GITHUB_OUTPUT
 
       # --- DEPLOY SECTION (same job, same runner, image already loaded) ---
       
@@ -359,7 +415,7 @@ jobs:
                       {"name": "TLS_DOMAIN", "value": "${{ secrets.TLS_DOMAIN }}"},
                       {"name": "ACME_EMAIL", "value": "${{ secrets.ACME_EMAIL }}"},
                       {"name": "ACME_DNS_PROVIDER", "value": "${{ secrets.ACME_DNS_PROVIDER }}"},
-                      {"name": "CF_DNS_API_TOKEN", "secureValue": "${{ secrets.CF_API_TOKEN }}"},
+                      {"name": "CF_DNS_API_TOKEN", "secureValue": "${{ secrets.CF_DNS_API_TOKEN }}"},
                       {"name": "REKOR_LOG_INDEX", "value": "${REKOR_LOG_INDEX}"},
                       {"name": "SIGSTORE_PAYLOAD_HASH", "value": "${SIGSTORE_PAYLOAD_HASH}"}
                     ],
