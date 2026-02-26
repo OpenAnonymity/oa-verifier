@@ -18,6 +18,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -914,8 +916,11 @@ func (s *Server) checkAdminAuth(r *http.Request) bool {
 	if registrySecret == "" {
 		return false
 	}
-	auth := r.Header.Get("Authorization")
-	return auth == "Bearer "+registrySecret
+	token := bearerToken(r.Header.Get("Authorization"))
+	if token == "" {
+		return false
+	}
+	return constantTimeTokenEqual(token, registrySecret)
 }
 
 func (s *Server) handleReloadConfig(w http.ResponseWriter, r *http.Request) {
@@ -925,9 +930,7 @@ func (s *Server) handleReloadConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auth := r.Header.Get("Authorization")
-	expected := "Bearer " + registrySecret
-	if auth != expected {
+	if !s.checkAdminAuth(r) {
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
 		return
 	}
@@ -942,6 +945,24 @@ func (s *Server) handleReloadConfig(w http.ResponseWriter, r *http.Request) {
 			"max_seconds": config.ChallengeMaxInterval(),
 		},
 	})
+}
+
+func bearerToken(header string) string {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return ""
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(header, prefix))
+	if token == "" {
+		return ""
+	}
+	return token
+}
+
+func constantTimeTokenEqual(a, b string) bool {
+	sumA := sha256.Sum256([]byte(a))
+	sumB := sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(sumA[:], sumB[:]) == 1
 }
 
 // decodeJWTPayload decodes JWT payload without signature verification.
