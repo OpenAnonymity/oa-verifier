@@ -37,7 +37,7 @@
           
           meta = with pkgs.lib; {
             description = "OA-Verifier attestation service";
-            license = licenses.mit;
+            license = licenses.agpl3Plus;
             mainProgram = "oa-verifier";
           };
         };

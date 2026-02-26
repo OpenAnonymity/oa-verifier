@@ -6,6 +6,7 @@ import (
 	"crypto"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -148,15 +149,36 @@ func computePubKeyHash(cert *tls.Certificate) string {
 	if len(cert.Certificate) == 0 {
 		return ""
 	}
-	// Hash the public key from the leaf certificate
-	hash := sha256.Sum256(cert.Certificate[0])
+
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return ""
+	}
+	pubKeyBytes, err := x509.MarshalPKIXPublicKey(leaf.PublicKey)
+	if err != nil {
+		return ""
+	}
+	hash := sha256.Sum256(pubKeyBytes)
 	return hex.EncodeToString(hash[:])
 }
 
-// StartRenewalLoop starts a background goroutine that renews the certificate before expiry.
-func StartRenewalLoop(ctx context.Context, cfg *Config, updateCert func(tls.Certificate, string)) {
+// StartRenewalLoop starts a background goroutine that renews the certificate
+// before expiry and calls updateCert with the new certificate and public key hash.
+func StartRenewalLoop(ctx context.Context, cfg *Config, cert tls.Certificate, updateCert func(tls.Certificate, string)) {
+	// Parse leaf to get expiry time.
+	var notAfter time.Time
+	if len(cert.Certificate) > 0 {
+		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil {
+			notAfter = leaf.NotAfter
+		}
+	}
+	if notAfter.IsZero() {
+		slog.Warn("could not determine certificate expiry, renewal loop will not run")
+		return
+	}
+
 	go func() {
-		// Check every 12 hours
+		const renewBefore = 30 * 24 * time.Hour // renew 30 days before expiry
 		ticker := time.NewTicker(12 * time.Hour)
 		defer ticker.Stop()
 
@@ -165,9 +187,29 @@ func StartRenewalLoop(ctx context.Context, cfg *Config, updateCert func(tls.Cert
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				// Renew if less than 30 days until expiry
-				// For now, just log - full renewal would need certificate expiry tracking
-				slog.Info("certificate renewal check", "domain", cfg.Domain)
+				remaining := time.Until(notAfter)
+				slog.Info("certificate renewal check", "domain", cfg.Domain, "expires_in", remaining.Round(time.Hour))
+
+				if remaining > renewBefore {
+					continue
+				}
+
+				slog.Info("certificate expiring soon, renewing", "domain", cfg.Domain, "expires_in", remaining.Round(time.Hour))
+				newCert, newHash, err := ObtainCertificate(ctx, cfg)
+				if err != nil {
+					slog.Error("certificate renewal failed", "domain", cfg.Domain, "error", err)
+					continue
+				}
+
+				// Update expiry for next check.
+				if len(newCert.Certificate) > 0 {
+					if leaf, err := x509.ParseCertificate(newCert.Certificate[0]); err == nil {
+						notAfter = leaf.NotAfter
+					}
+				}
+
+				slog.Info("certificate renewed", "domain", cfg.Domain, "new_hash", newHash)
+				updateCert(newCert, newHash)
 			}
 		}
 	}()

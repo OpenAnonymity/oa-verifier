@@ -1,6 +1,6 @@
 package server
 
-import "github.com/oa-verifier/internal/openrouter"
+import "github.com/openanonymity/oa-verifier/internal/openrouter"
 
 func openrouterErrorDetails(err error) map[string]any {
 	ctx := openrouter.ErrorContext(err)

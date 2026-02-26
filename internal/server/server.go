@@ -4,8 +4,8 @@ package server
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -21,13 +21,11 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"golang.org/x/crypto/ed25519"
 
-	"github.com/oa-verifier/internal/acme"
-	"github.com/oa-verifier/internal/banned"
-	"github.com/oa-verifier/internal/challenge"
-	"github.com/oa-verifier/internal/config"
-	"github.com/oa-verifier/internal/models"
+	"github.com/openanonymity/oa-verifier/internal/acme"
+	"github.com/openanonymity/oa-verifier/internal/banned"
+	"github.com/openanonymity/oa-verifier/internal/challenge"
+	"github.com/openanonymity/oa-verifier/internal/models"
 )
 
 // Server holds all server state.
@@ -48,7 +46,9 @@ type Server struct {
 
 	attestationEnabled bool
 
-	// TLS public key hash for channel binding (set when RunTLS is called)
+	// TLS certificate and public key hash, swappable for ACME renewal.
+	tlsCertMu     sync.RWMutex
+	tlsCert       *tls.Certificate
 	tlsPubKeyHash string
 }
 
@@ -136,11 +136,11 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 	return srv.ListenAndServe()
 }
 
-// RunTLS starts HTTPS on port 443.
+// RunTLS starts HTTPS.
 // If ACME is configured (TLS_DOMAIN, ACME_EMAIL, ACME_DNS_PROVIDER), obtains a Let's Encrypt certificate.
 // Otherwise, generates a self-signed certificate.
 // TLS terminates at this server (inside the enclave), not at Azure.
-func (s *Server) RunTLS(ctx context.Context) error {
+func (s *Server) RunTLS(ctx context.Context, addr string) error {
 	var cert tls.Certificate
 	var pubKeyHash string
 	var err error
@@ -163,10 +163,12 @@ func (s *Server) RunTLS(ctx context.Context) error {
 			certType = "self-signed (ACME fallback)"
 		} else {
 			certType = "Let's Encrypt"
-			// Start renewal loop for ACME certs
-			acme.StartRenewalLoop(ctx, acmeCfg, func(newCert tls.Certificate, newHash string) {
-				// TODO: implement hot-reload of certificate
-				slog.Info("certificate renewed", "hash", newHash)
+			// Start renewal loop — callback swaps the live cert under a mutex.
+			acme.StartRenewalLoop(ctx, acmeCfg, cert, func(newCert tls.Certificate, newHash string) {
+				s.tlsCertMu.Lock()
+				s.tlsCert = &newCert
+				s.tlsPubKeyHash = newHash
+				s.tlsCertMu.Unlock()
 			})
 		}
 	} else {
@@ -177,8 +179,12 @@ func (s *Server) RunTLS(ctx context.Context) error {
 		certType = "self-signed"
 	}
 
-	// Store TLS public key hash for channel binding in attestation
+	// Store initial certificate behind mutex for hot-reload support.
+	s.tlsCertMu.Lock()
+	s.tlsCert = &cert
 	s.tlsPubKeyHash = pubKeyHash
+	s.tlsCertMu.Unlock()
+
 	customDomain := os.Getenv("TLS_DOMAIN")
 	slog.Info("TLS certificate ready",
 		"type", certType,
@@ -186,15 +192,19 @@ func (s *Server) RunTLS(ctx context.Context) error {
 		"domain", customDomain)
 
 	tlsSrv := &http.Server{
-		Addr:              ":443",
+		Addr:              addr,
 		Handler:           s.Router(),
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
 		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
+			GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+				s.tlsCertMu.RLock()
+				defer s.tlsCertMu.RUnlock()
+				return s.tlsCert, nil
+			},
+			MinVersion: tls.VersionTLS12,
 		},
 	}
 
@@ -207,7 +217,7 @@ func (s *Server) RunTLS(ctx context.Context) error {
 		_ = tlsSrv.Shutdown(shutdownCtx)
 	}()
 
-	slog.Info("starting HTTPS server", "addr", ":443", "cert_type", certType)
+	slog.Info("starting HTTPS server", "addr", addr, "cert_type", certType)
 	return tlsSrv.ListenAndServeTLS("", "")
 }
 
@@ -266,6 +276,13 @@ func generateSelfSignedCert() (tls.Certificate, string, error) {
 	}, pubKeyHashHex, nil
 }
 
+// getTLSPubKeyHash returns the current TLS public key hash (thread-safe).
+func (s *Server) getTLSPubKeyHash() string {
+	s.tlsCertMu.RLock()
+	defer s.tlsCertMu.RUnlock()
+	return s.tlsPubKeyHash
+}
+
 // Helper functions
 
 func (s *Server) getNextChallengeTime() time.Time {
@@ -285,9 +302,8 @@ func validatePublicKey(pkHex string) bool {
 }
 
 func generateProvLabel(stationID string) string {
-	mac := hmac.New(sha256.New, config.ProvisioningKeySalt())
-	mac.Write([]byte(stationID))
-	return hex.EncodeToString(mac.Sum(nil))[:16]
+	sum := sha256.Sum256([]byte(stationID))
+	return hex.EncodeToString(sum[:])[:16]
 }
 
 func extractEmail(data map[string]any) string {

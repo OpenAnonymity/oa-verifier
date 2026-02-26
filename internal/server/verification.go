@@ -4,24 +4,24 @@
 // - This loop is the core station-compliance enforcement path for privacy toggles.
 //
 // Enforcement behavior:
-// - It continuously re-checks station operator account-state against
-//   `OpenRouterRequiredToggles` and updates verification outcomes
-//   (verified, transiently unverified, banned/unregistered).
-// - Check intervals are cryptographically random (see challenge.GetRandomInterval),
-//   making it impossible for stations to predict when checks occur and cheat
-//   by temporarily toggling settings.
-// - Checks use provider-exposed account metadata fetched by verifier; station
-//   self-assertions are not accepted as sufficient evidence.
+//   - It continuously re-checks station operator account-state against
+//     `OpenRouterRequiredToggles` and updates verification outcomes
+//     (verified, transiently unverified, banned/unregistered).
+//   - Check intervals are cryptographically random (see challenge.GetRandomInterval),
+//     making it impossible for stations to predict when checks occur and cheat
+//     by temporarily toggling settings.
+//   - Checks use provider-exposed account metadata fetched by verifier; station
+//     self-assertions are not accepted as sufficient evidence.
 //
 // Data-path boundary:
-// - End-user prompts/responses do not transit this loop; it only consumes station
-//   governance metadata (cookie-authenticated provider account state).
-// - This loop operates exclusively on station-operator account data. It never
-//   receives, processes, or stores any end-user identity material.
+//   - End-user prompts/responses do not transit this loop; it only consumes station
+//     governance metadata (cookie-authenticated provider account state).
+//   - This loop operates exclusively on station-operator account data. It never
+//     receives, processes, or stores any end-user identity material.
 //
 // Trust chain (runtime view):
-// - Attested verifier runtime -> enforced toggle checks -> station verification-state updates
-//   -> client key acceptance/rejection behavior.
+//   - Attested verifier runtime -> enforced toggle checks -> station verification-state updates
+//     -> client key acceptance/rejection behavior.
 package server
 
 import (
@@ -32,10 +32,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oa-verifier/internal/challenge"
-	"github.com/oa-verifier/internal/config"
-	"github.com/oa-verifier/internal/models"
-	"github.com/oa-verifier/internal/openrouter"
+	"github.com/openanonymity/oa-verifier/internal/challenge"
+	"github.com/openanonymity/oa-verifier/internal/config"
+	"github.com/openanonymity/oa-verifier/internal/models"
+	"github.com/openanonymity/oa-verifier/internal/openrouter"
 )
 
 // verificationLoop runs in a dedicated goroutine, completely independent
@@ -97,7 +97,7 @@ func (s *Server) checkDueStations(ctx context.Context) {
 
 // challengeOneStation challenges a single station by checking privacy toggles.
 // Runs in its own goroutine, fully concurrent with other challenges and HTTP handlers.
-func (s *Server) challengeOneStation(ctx context.Context, pk string, station models.Station) {
+func (s *Server) challengeOneStation(_ context.Context, pk string, station models.Station) {
 	stationID := station.StationID
 	if stationID == "" {
 		stationID = pk[:16]
@@ -201,7 +201,7 @@ func (s *Server) challengeOneStation(ctx context.Context, pk string, station mod
 
 	failureCount := 0
 	if transientFailure {
-		withinGrace = s.markTransientFailure(pk, unregisterReason, 0, unregisterDetail)
+		withinGrace = s.markTransientFailure(pk, unregisterReason, transientStatusCode, unregisterDetail)
 		failureCount = s.getFailureCount(pk)
 		s.notifyOrgEvent(orgEvent{
 			event:                   transientEvent,
@@ -240,7 +240,7 @@ func (s *Server) challengeOneStation(ctx context.Context, pk string, station mod
 
 	if unregister {
 		slog.Warn("unregistering station due to verification failure", "station_id", stationID, "reason", unregisterReason)
-		s.unregisterStation(station.StationID, pk, stationEmail, unregisterReason, 0, unregisterDetail, unregisterOperation, failureCount, false)
+		s.unregisterStation(station.StationID, pk, stationEmail, unregisterReason, transientStatusCode, unregisterDetail, unregisterOperation, failureCount, false)
 		return
 	}
 

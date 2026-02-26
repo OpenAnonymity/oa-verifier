@@ -27,8 +27,7 @@ See:
 | Station Type | Verification |
 |-------------|--------------|
 | **OpenRouter Stations** | Privacy toggles, API key ownership, account binding |
-| **Proxy Stations** | Enclave attestation proving no-logging guarantees |
-| *Future* | Extensible for other enclave-based services |
+| *Future Station Types* | Planned extension for other provider/enclave-based services |
 
 ## Verification
 
@@ -38,7 +37,7 @@ Anyone can verify the service is running expected code:
 
 ```bash
 # Fetch attestation from live service
-curl -sk https://oa-verifier.eastus.azurecontainer.io/attestation | jq .summary
+curl -sS "https://verifier.openanonymity.ai/attestation?nonce=$(date +%s)" | jq .summary
 
 # Returns hardware-signed proof including:
 # - cce_policy_hash: SHA256 of the container policy (what code can run)
@@ -52,10 +51,11 @@ curl -sk https://oa-verifier.eastus.azurecontainer.io/attestation | jq .summary
 # Clone and run local verification script
 git clone https://github.com/openanonymity/oa-verifier
 cd oa-verifier
-./scripts/verify-local.sh https://oa-verifier.eastus.azurecontainer.io
+./scripts/verify-local.sh https://verifier.openanonymity.ai
 ```
 
 This rebuilds the container locally with Nix and compares the policy hash against what Azure hardware attests.
+For strict zero-trust conclusions, also verify the JWT signature using the `verify_at` key endpoint returned by `/attestation`.
 
 ## Trust Chain
 
@@ -78,7 +78,7 @@ Proof: "This exact code is running in an isolated enclave"
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/attestation` | GET | Hardware attestation JWT with policy hash |
-| `/attestation/raw` | GET | Raw JWT token only |
+| `/attestation/raw` | GET | JSON response containing `token` |
 | `/broadcast` | GET | List of verified and banned stations |
 
 ### Station Management
@@ -87,7 +87,7 @@ Proof: "This exact code is running in an isolated enclave"
 |----------|--------|-------------|
 | `/register` | POST | Register station with Ed25519 public key |
 | `/submit_key` | POST | Submit double-signed API key for verification |
-| `/station/{pk}` | GET | Get station info by public key |
+| `/station/{public_key}` | GET | Get station info by public key |
 | `/banned-stations` | GET | List banned stations |
 
 ## Security Model
@@ -106,6 +106,7 @@ Proof: "This exact code is running in an isolated enclave"
 - **No stdio**: Container cannot write to stdout/stderr (policy enforced)
 - **No debugging**: Debug mode disabled in hardware
 - **Measured boot**: Only the attested container can run
+- **TLS channel binding**: The TLS certificate is generated inside the enclave and its public key hash is included in the hardware attestation. This means MITM is impossible -- you can verify the TLS public key hash from `/attestation` matches the certificate presented by the server, proving your connection terminates inside the attested enclave
 
 ## Development
 
@@ -146,6 +147,7 @@ See [deploy/README.md](deploy/README.md) for details.
 | `CHALLENGE_MIN_INTERVAL` | Min seconds between privacy checks |
 | `CHALLENGE_MAX_INTERVAL` | Max seconds between privacy checks |
 | `SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS` | Grace window for ownership checks |
+| `STATION_FAILURE_GRACE_SECONDS` | Grace window before unregistering on transient failures |
 
 ## Documentation
 

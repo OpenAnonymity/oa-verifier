@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"strings"
 
-	"github.com/oa-verifier/internal/openrouter"
+	"github.com/openanonymity/oa-verifier/internal/openrouter"
 )
 
 type orgEvent struct {

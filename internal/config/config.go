@@ -118,17 +118,6 @@ func RegistrySecret() string {
 	return os.Getenv("STATION_REGISTRY_SECRET")
 }
 
-// ProvisioningKeySalt returns PROVISIONING_KEY_SALT as bytes.
-func ProvisioningKeySalt() []byte {
-	mu.RLock()
-	defer mu.RUnlock()
-	salt := os.Getenv("PROVISIONING_KEY_SALT")
-	if salt == "" {
-		return []byte("default_dev_salt")
-	}
-	return []byte(salt)
-}
-
 // ChallengeMinInterval returns CHALLENGE_MIN_INTERVAL (default 300).
 func ChallengeMinInterval() int {
 	mu.RLock()

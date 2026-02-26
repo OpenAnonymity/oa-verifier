@@ -3,7 +3,7 @@ package server
 import (
 	"time"
 
-	"github.com/oa-verifier/internal/config"
+	"github.com/openanonymity/oa-verifier/internal/config"
 )
 
 func (s *Server) markTransientFailure(pk, reason string, statusCode int, detail string) bool {

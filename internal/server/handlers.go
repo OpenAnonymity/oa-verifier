@@ -18,6 +18,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -30,12 +32,12 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/oa-verifier/internal/challenge"
-	"github.com/oa-verifier/internal/config"
-	"github.com/oa-verifier/internal/models"
-	"github.com/oa-verifier/internal/netretry"
-	"github.com/oa-verifier/internal/openrouter"
-	"github.com/oa-verifier/internal/registry"
+	"github.com/openanonymity/oa-verifier/internal/challenge"
+	"github.com/openanonymity/oa-verifier/internal/config"
+	"github.com/openanonymity/oa-verifier/internal/models"
+	"github.com/openanonymity/oa-verifier/internal/netretry"
+	"github.com/openanonymity/oa-verifier/internal/openrouter"
+	"github.com/openanonymity/oa-verifier/internal/registry"
 )
 
 // ACI Confidential Containers attestation endpoint (SKR sidecar)
@@ -137,6 +139,18 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if already banned by public key
+	if s.banned.IsBanned("", req.PublicKey) {
+		bannedID := s.banned.GetStationIDByPK(req.PublicKey)
+		if bannedID == "" {
+			bannedID = "pk:" + req.PublicKey[:16]
+		}
+		slog.Warn("registration rejected: station is BANNED", "station_id", bannedID)
+		go func() { _ = openrouter.NotifyOrgBanned(bannedID, "banned_reregister_attempt") }()
+		writeError(w, http.StatusForbidden, "Station is banned")
+		return
+	}
+
 	// Early return if already registered with same public key
 	s.mu.RLock()
 	if existing, ok := s.stations[req.PublicKey]; ok {
@@ -149,18 +163,6 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.RUnlock()
-
-	// Check if already banned by public key
-	if s.banned.IsBanned("", req.PublicKey) {
-		bannedID := s.banned.GetStationIDByPK(req.PublicKey)
-		if bannedID == "" {
-			bannedID = "pk:" + req.PublicKey[:16]
-		}
-		slog.Warn("registration rejected: station is BANNED", "station_id", bannedID)
-		go func() { _ = openrouter.NotifyOrgBanned(bannedID, "banned_reregister_attempt") }()
-		writeError(w, http.StatusForbidden, "Station is banned")
-		return
-	}
 
 	registerIdentity := normalizeOpFailureIdentity("", req.PublicKey)
 
@@ -792,7 +794,6 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 		"detail":     "ownership_check_error",
 		"retryable":  true,
 	})
-	return
 }
 
 func (s *Server) getOrgPublicKey() (string, error) {
@@ -914,8 +915,11 @@ func (s *Server) checkAdminAuth(r *http.Request) bool {
 	if registrySecret == "" {
 		return false
 	}
-	auth := r.Header.Get("Authorization")
-	return auth == "Bearer "+registrySecret
+	token := bearerToken(r.Header.Get("Authorization"))
+	if token == "" {
+		return false
+	}
+	return constantTimeTokenEqual(token, registrySecret)
 }
 
 func (s *Server) handleReloadConfig(w http.ResponseWriter, r *http.Request) {
@@ -925,9 +929,7 @@ func (s *Server) handleReloadConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	auth := r.Header.Get("Authorization")
-	expected := "Bearer " + registrySecret
-	if auth != expected {
+	if !s.checkAdminAuth(r) {
 		writeError(w, http.StatusUnauthorized, "Unauthorized")
 		return
 	}
@@ -942,6 +944,24 @@ func (s *Server) handleReloadConfig(w http.ResponseWriter, r *http.Request) {
 			"max_seconds": config.ChallengeMaxInterval(),
 		},
 	})
+}
+
+func bearerToken(header string) string {
+	const prefix = "Bearer "
+	if !strings.HasPrefix(header, prefix) {
+		return ""
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(header, prefix))
+	if token == "" {
+		return ""
+	}
+	return token
+}
+
+func constantTimeTokenEqual(a, b string) bool {
+	sumA := sha256.Sum256([]byte(a))
+	sumB := sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(sumA[:], sumB[:]) == 1
 }
 
 // decodeJWTPayload decodes JWT payload without signature verification.
@@ -978,6 +998,14 @@ type maaAttestRequest struct {
 	RuntimeData string `json:"runtime_data"` // base64-encoded nonce data
 }
 
+func resolveAttestationNonce(raw string) string {
+	nonce := strings.TrimSpace(raw)
+	if nonce != "" {
+		return nonce
+	}
+	return fmt.Sprintf("server-%d", time.Now().UnixNano())
+}
+
 // getAttestationToken calls the ACI MAA sidecar to get an attestation token.
 // tlsHash is the SHA256 hash of the TLS public key for channel binding.
 func getAttestationToken(nonce, tlsHash string) (string, error) {
@@ -993,11 +1021,6 @@ func getAttestationToken(nonce, tlsHash string) (string, error) {
 	maaProvider := os.Getenv("MAA_PROVIDER_URL")
 	if maaProvider == "" {
 		maaProvider = defaultMAAProviderURL
-	}
-
-	// Ensure nonce is not empty - required by the sidecar
-	if nonce == "" {
-		nonce = "default-nonce"
 	}
 
 	// runtime_data must be valid JSON for MAA
@@ -1064,13 +1087,15 @@ func getAttestationToken(nonce, tlsHash string) (string, error) {
 }
 
 func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
-	nonce := r.URL.Query().Get("nonce")
+	nonce := resolveAttestationNonce(r.URL.Query().Get("nonce"))
+
+	tlsHash := s.getTLSPubKeyHash()
 
 	// Pass TLS public key hash for channel binding
-	token, err := getAttestationToken(nonce, s.tlsPubKeyHash)
+	token, err := getAttestationToken(nonce, tlsHash)
 	if err != nil {
 		slog.Error("attestation failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "Attestation failed: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "Attestation failed")
 		return
 	}
 
@@ -1120,8 +1145,8 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 	issuer, _ := claims["iss"].(string)
 
 	// Include TLS hash in summary for channel binding verification
-	if s.tlsPubKeyHash != "" {
-		summary["tls_pubkey_hash"] = s.tlsPubKeyHash
+	if tlsHash != "" {
+		summary["tls_pubkey_hash"] = tlsHash
 	}
 
 	// Get CCE policy from environment (set at deployment time)
@@ -1166,10 +1191,10 @@ func (s *Server) handleAttestation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAttestationRaw(w http.ResponseWriter, r *http.Request) {
-	nonce := r.URL.Query().Get("nonce")
+	nonce := resolveAttestationNonce(r.URL.Query().Get("nonce"))
 
 	// Pass TLS public key hash for channel binding
-	token, err := getAttestationToken(nonce, s.tlsPubKeyHash)
+	token, err := getAttestationToken(nonce, s.getTLSPubKeyHash())
 	if err != nil {
 		slog.Error("attestation failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "Attestation failed")

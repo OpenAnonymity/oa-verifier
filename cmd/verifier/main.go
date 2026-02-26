@@ -56,7 +56,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/oa-verifier/internal/server"
+	"github.com/openanonymity/oa-verifier/internal/server"
 )
 
 func main() {
@@ -114,7 +114,7 @@ func main() {
 	} else {
 		// TLS terminates inside the enclave (not at Azure)
 		slog.Info("starting Enclave Verifier with TLS", "addr", addr, "attestation", *attestation)
-		err = srv.RunTLS(ctx)
+		err = srv.RunTLS(ctx, addr)
 	}
 
 	if err != nil && err != http.ErrServerClosed {

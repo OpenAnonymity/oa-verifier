@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/oa-verifier/internal/config"
-	"github.com/oa-verifier/internal/netretry"
+	"github.com/openanonymity/oa-verifier/internal/config"
+	"github.com/openanonymity/oa-verifier/internal/netretry"
 )
 
 const (
@@ -668,7 +668,7 @@ func VerifyKeyOwnership(provisioningKey, keyHash string) (OwnershipCheckResult, 
 func FetchOrgPublicKey() (string, error) {
 	registryURL := config.RegistryURL()
 	if registryURL == "" {
-		return "", fmt.Errorf("REGISTRY_URL not configured")
+		return "", fmt.Errorf("STATION_REGISTRY_URL not configured")
 	}
 
 	cfg := netretry.DefaultConfig(3)

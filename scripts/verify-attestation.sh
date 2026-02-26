@@ -3,6 +3,7 @@
 set -e
 
 STRICT_TLS_BINDING=true
+INSECURE_SKIP_TLS_VERIFY=false
 ENDPOINT=""
 
 usage() {
@@ -11,12 +12,14 @@ Usage: $0 [--strict-tls-binding] [ENDPOINT]
 
 Options:
   --strict-tls-binding  Fail if tls_pubkey_hash does not match live endpoint cert/public key.
+  --no-strict-tls-binding  Continue even if TLS channel binding cannot be strictly validated.
+  --insecure-skip-tls-verify  Allow curl -k when fetching attestation (not zero-trust safe).
   -h, --help            Show this help.
 
 Examples:
   $0
   $0 https://verifier.openanonymity.ai
-  $0 --strict-tls-binding https://oa-verifier.eastus.azurecontainer.io
+  $0 --strict-tls-binding https://verifier.openanonymity.ai
 EOF
 }
 
@@ -24,6 +27,14 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --strict-tls-binding)
             STRICT_TLS_BINDING=true
+            shift
+            ;;
+        --no-strict-tls-binding)
+            STRICT_TLS_BINDING=false
+            shift
+            ;;
+        --insecure-skip-tls-verify)
+            INSECURE_SKIP_TLS_VERIFY=true
             shift
             ;;
         -h|--help)
@@ -42,7 +53,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ENDPOINT="${ENDPOINT:-https://oa-verifier.eastus.azurecontainer.io}"
 ENDPOINT="${ENDPOINT:-https://verifier.openanonymity.ai}"
 TMPDIR=$(mktemp -d) && trap "rm -rf $TMPDIR" EXIT
 
@@ -58,12 +68,18 @@ endpoint_for_path="${ENDPOINT%/}"
 echo "=== Zero-Trust Attestation Verification ==="
 echo "Endpoint: $endpoint_for_path"
 echo "Strict TLS binding: $STRICT_TLS_BINDING"
+echo "Insecure TLS fetch: $INSECURE_SKIP_TLS_VERIFY"
 echo ""
 
 # Step 1: Fetch attestation
 echo "[1/5] Fetching attestation..."
 NONCE=$(date +%s | sha256sum | head -c 16)
-curl -sfk "${endpoint_for_path}/attestation?nonce=${NONCE}" > "$TMPDIR/att.json" || { echo "❌ Failed to fetch"; exit 1; }
+if [[ "$INSECURE_SKIP_TLS_VERIFY" == "true" ]]; then
+  CURL_FLAGS="-sfk"
+else
+  CURL_FLAGS="-sf"
+fi
+curl $CURL_FLAGS "${endpoint_for_path}/attestation?nonce=${NONCE}" > "$TMPDIR/att.json" || { echo "❌ Failed to fetch"; exit 1; }
 echo "✓ Attestation fetched"
 
 # Step 2: Verify policy hash matches hardware measurement
@@ -81,8 +97,8 @@ if [ "$COMPUTED" != "$HOST_DATA" ]; then
 fi
 echo "✓ Policy verified by hardware"
 
-# Step 3: Verify JWT is from Azure Attestation
-echo "[3/5] Verifying JWT source..."
+# Step 3: Check JWT source hint (this is NOT full signature verification)
+echo "[3/5] Checking JWT source hint..."
 TOKEN=$(jq -r '.token' "$TMPDIR/att.json")
 HEADER=$(echo "$TOKEN" | cut -d'.' -f1 | tr '_-' '/+')
 case $((${#HEADER} % 4)) in 2) HEADER="${HEADER}==";; 3) HEADER="${HEADER}=";; esac
@@ -90,6 +106,8 @@ JKU=$(echo "$HEADER" | base64 -d 2>/dev/null | jq -r '.jku // empty')
 
 if [[ "$JKU" =~ \.attest\.azure\.net/certs$ ]]; then
     echo "✓ JWT from Azure Attestation: $JKU"
+    echo "  NOTE: This script checks the issuer key URL only."
+    echo "  For strict zero-trust verification, you must cryptographically verify the JWT signature."
 else
     echo "❌ Invalid JWT source: $JKU"
     exit 1
@@ -148,13 +166,7 @@ else
             elif [[ "$ATTESTED_TLS_HASH" == "$LIVE_CERT_DER_HASH" ]]; then
                 echo "✓ Channel binding match (leaf cert DER hash)"
             else
-                CF_RAY=$(curl -skI "${endpoint_for_path}/health" 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="cf-ray"{print $2}')
-                if [[ -n "$CF_RAY" ]]; then
-                    echo "⚠️  TLS hash mismatch and Cloudflare headers detected (cf-ray: $CF_RAY)"
-                    echo "   This is expected when DNS proxy is ON: user TLS terminates at Cloudflare."
-                else
-                    echo "⚠️  TLS hash mismatch: endpoint cert does not match attested hash."
-                fi
+                echo "⚠️  TLS hash mismatch: endpoint certificate/public key does not match attested hash."
                 if [[ "$STRICT_TLS_BINDING" == "true" ]]; then
                     echo "❌ Strict mode enabled: channel binding failed"
                     exit 1
@@ -175,4 +187,4 @@ echo "=== SUMMARY ==="
 jq -r '"Type: \(.summary.attestation_type // "N/A")\nDebug: \(.summary.debug_disabled // "N/A")\nCompliance: \(.summary.compliance_status // "N/A")"' "$TMPDIR/att.json"
 echo "Policy Hash: ${HOST_DATA:0:16}..."
 echo ""
-echo "✅ HARDWARE ATTESTATION VERIFIED"
+echo "✅ INTEGRITY CHECKS PASSED (JWT signature verification not performed by this script)"
