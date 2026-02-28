@@ -13,7 +13,7 @@ env:
   ACR_REGISTRY: oaverifieracr.azurecr.io
   IMAGE_NAME: oa-verifier
   RESOURCE_GROUP: oa-verifier
-  CONTAINER_NAME: oa-verifier
+  CONTAINER_NAME: oa-verifier-2
   LOCATION: eastus
 
 permissions:
@@ -272,7 +272,7 @@ jobs:
             "resources": [{
               "type": "Microsoft.ContainerInstance/containerGroups",
               "apiVersion": "2023-05-01",
-              "name": "oa-verifier",
+              "name": "oa-verifier-2",
               "location": "eastus",
               "properties": {
                 "sku": "Confidential",
@@ -300,7 +300,7 @@ jobs:
                 "ipAddress": {
                   "type": "Public",
                   "ports": [{"port": 443, "protocol": "TCP"}],
-                  "dnsNameLabel": "oa-verifier"
+                  "dnsNameLabel": "oa-verifier-2"
                 },
                 "osType": "Linux",
                 "restartPolicy": "Always",
@@ -311,7 +311,7 @@ jobs:
           EOF
           
           # Step 2: Generate base CCE policy from minimal template (no secrets!)
-          az confcom acipolicygen -a /tmp/aci-policy-template.json --approve-wildcards --disable-stdio
+          az confcom acipolicygen -a /tmp/aci-policy-template.json --approve-wildcards
           
           # Step 3: Extract and modify policy to add regex rules for dynamic env vars
           BASE_POLICY_B64=$(jq -r '.resources[0].properties.confidentialComputeProperties.ccePolicy' /tmp/aci-policy-template.json)
@@ -391,7 +391,7 @@ jobs:
             "resources": [{
               "type": "Microsoft.ContainerInstance/containerGroups",
               "apiVersion": "2023-05-01",
-              "name": "oa-verifier",
+              "name": "oa-verifier-2",
               "location": "eastus",
               "properties": {
                 "sku": "Confidential",
@@ -434,7 +434,7 @@ jobs:
                 "ipAddress": {
                   "type": "Public",
                   "ports": [{"port": 443, "protocol": "TCP"}],
-                  "dnsNameLabel": "oa-verifier"
+                  "dnsNameLabel": "oa-verifier-2"
                 },
                 "osType": "Linux",
                 "restartPolicy": "Always",
@@ -566,7 +566,7 @@ jobs:
           fi
 
       - name: Fetch container logs (ACME debug)
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main') && steps.origin_cert.outputs.cert_status != 'letsencrypt'
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
         run: |
           echo "=============================================="
           echo "  CONTAINER LOGS (ACME DEBUG)"
@@ -796,7 +796,7 @@ jobs:
           EOF
           
           # Generate base policy
-          az confcom acipolicygen -a /tmp/verify-template.json --approve-wildcards --disable-stdio
+          az confcom acipolicygen -a /tmp/verify-template.json --approve-wildcards
           
           # Modify policy to allow CCE_POLICY_B64 env var (same as deploy)
           BASE_POLICY_B64=$(jq -r '.resources[0].properties.confidentialComputeProperties.ccePolicy' /tmp/verify-template.json)
@@ -869,7 +869,7 @@ jobs:
             SERVICE_URL="https://${{ secrets.TLS_DOMAIN }}"
             CURL_FLAGS="-sf"
           else
-            SERVICE_URL="https://oa-verifier.eastus.azurecontainer.io"
+            SERVICE_URL="https://oa-verifier-2.eastus.azurecontainer.io"
             CURL_FLAGS="-sfk"
           fi
           echo "Fetching attestation from: $SERVICE_URL"

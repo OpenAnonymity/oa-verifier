@@ -87,7 +87,7 @@ jobs:
             echo "curl_flags=-sf" >> $GITHUB_OUTPUT
             echo "Using TLS_DOMAIN: ${{ secrets.TLS_DOMAIN }}"
           else
-            echo "url=https://oa-verifier.eastus.azurecontainer.io" >> $GITHUB_OUTPUT
+            echo "url=https://oa-verifier-2.eastus.azurecontainer.io" >> $GITHUB_OUTPUT
             echo "curl_flags=-sfk" >> $GITHUB_OUTPUT
             echo "Using default Azure FQDN"
           fi
