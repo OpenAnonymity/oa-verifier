@@ -153,7 +153,53 @@ func (s *Server) RunTLS(ctx context.Context, addr string) error {
 			"domain", acmeCfg.Domain,
 			"provider", acmeCfg.Provider)
 
-		cert, pubKeyHash, err = acme.ObtainCertificate(ctx, acmeCfg)
+		// Register once with ACME server (avoids rate limit on re-registration).
+		const maxRegRetries = 10
+		const regRetryDelay = 3 * time.Minute
+		var acmeClient *acme.Client
+		for attempt := 1; ; attempt++ {
+			acmeClient, err = acme.NewClient(acmeCfg)
+			if err == nil {
+				break
+			}
+			if attempt >= maxRegRetries {
+				slog.Error("ACME registration failed after all retries",
+					"attempts", maxRegRetries, "error", err)
+				break
+			}
+			slog.Warn("ACME registration failed, retrying",
+				"attempt", attempt, "max_retries", maxRegRetries, "error", err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(regRetryDelay):
+			}
+		}
+
+		if acmeClient != nil {
+			// Obtain certificate (retries don't re-register).
+			const maxCertRetries = 5
+			const certRetryDelay = 15 * time.Second
+			for attempt := 1; ; attempt++ {
+				cert, pubKeyHash, err = acmeClient.ObtainCertificate(ctx)
+				if err == nil {
+					break
+				}
+				if attempt >= maxCertRetries {
+					slog.Error("ACME certificate failed after all retries",
+						"attempts", maxCertRetries, "error", err)
+					break
+				}
+				slog.Warn("ACME certificate attempt failed, retrying",
+					"attempt", attempt, "max_retries", maxCertRetries, "error", err)
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(certRetryDelay):
+				}
+			}
+		}
+
 		if err != nil {
 			slog.Error("ACME certificate failed, falling back to self-signed", "error", err)
 			cert, pubKeyHash, err = generateSelfSignedCert()
@@ -164,7 +210,7 @@ func (s *Server) RunTLS(ctx context.Context, addr string) error {
 		} else {
 			certType = "Let's Encrypt"
 			// Start renewal loop — callback swaps the live cert under a mutex.
-			acme.StartRenewalLoop(ctx, acmeCfg, cert, func(newCert tls.Certificate, newHash string) {
+			acme.StartRenewalLoop(ctx, acmeCfg, acmeClient, cert, func(newCert tls.Certificate, newHash string) {
 				s.tlsCertMu.Lock()
 				s.tlsCert = &newCert
 				s.tlsPubKeyHash = newHash

@@ -53,15 +53,20 @@ func (u *User) GetEmail() string                        { return u.Email }
 func (u *User) GetRegistration() *registration.Resource { return u.Registration }
 func (u *User) GetPrivateKey() crypto.PrivateKey        { return u.key }
 
-// ObtainCertificate obtains a certificate via DNS-01 challenge.
-// Returns the certificate, public key hash (for attestation), and any error.
-func ObtainCertificate(ctx context.Context, cfg *Config) (tls.Certificate, string, error) {
-	slog.Info("obtaining ACME certificate", "domain", cfg.Domain, "provider", cfg.Provider)
+// Client holds a registered ACME client that can be reused across retries.
+type Client struct {
+	client *lego.Client
+	user   *User
+	cfg    *Config
+}
 
-	// Generate a new private key for this certificate
+// NewClient creates an ACME client, generates an account key, and registers
+// with the ACME server. The returned Client can be reused for multiple
+// ObtainCertificate calls without re-registering (avoiding rate limits).
+func NewClient(cfg *Config) (*Client, error) {
 	privateKey, err := certcrypto.GeneratePrivateKey(certcrypto.EC256)
 	if err != nil {
-		return tls.Certificate{}, "", fmt.Errorf("failed to generate private key: %w", err)
+		return nil, fmt.Errorf("failed to generate account key: %w", err)
 	}
 
 	user := &User{
@@ -69,13 +74,9 @@ func ObtainCertificate(ctx context.Context, cfg *Config) (tls.Certificate, strin
 		key:   privateKey,
 	}
 
-	// Create ACME client config
 	config := lego.NewConfig(user)
 	config.Certificate.KeyType = certcrypto.EC256
 
-	// Use Let's Encrypt production (or staging for testing)
-	// Production: lego.LEDirectoryProduction
-	// Staging: lego.LEDirectoryStaging
 	if os.Getenv("ACME_STAGING") == "true" {
 		config.CADirURL = lego.LEDirectoryStaging
 		slog.Info("using Let's Encrypt staging environment")
@@ -85,51 +86,67 @@ func ObtainCertificate(ctx context.Context, cfg *Config) (tls.Certificate, strin
 
 	client, err := lego.NewClient(config)
 	if err != nil {
-		return tls.Certificate{}, "", fmt.Errorf("failed to create ACME client: %w", err)
+		return nil, fmt.Errorf("failed to create ACME client: %w", err)
 	}
 
-	// Set up DNS provider
 	provider, err := getDNSProvider(cfg.Provider)
 	if err != nil {
-		return tls.Certificate{}, "", fmt.Errorf("failed to create DNS provider: %w", err)
+		return nil, fmt.Errorf("failed to create DNS provider: %w", err)
 	}
 
 	err = client.Challenge.SetDNS01Provider(provider, dns01.AddRecursiveNameservers([]string{"1.1.1.1:53", "8.8.8.8:53"}))
 	if err != nil {
-		return tls.Certificate{}, "", fmt.Errorf("failed to set DNS provider: %w", err)
+		return nil, fmt.Errorf("failed to set DNS provider: %w", err)
 	}
 
-	// Register with ACME server
 	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
 	if err != nil {
-		return tls.Certificate{}, "", fmt.Errorf("failed to register with ACME: %w", err)
+		return nil, fmt.Errorf("failed to register with ACME: %w", err)
 	}
 	user.Registration = reg
 	slog.Info("registered with ACME server")
 
-	// Request certificate
+	return &Client{client: client, user: user, cfg: cfg}, nil
+}
+
+// ObtainCertificate obtains a certificate via DNS-01 challenge using
+// an already-registered ACME client. Does not re-register.
+func (ac *Client) ObtainCertificate(ctx context.Context) (tls.Certificate, string, error) {
+	slog.Info("requesting ACME certificate", "domain", ac.cfg.Domain)
+
 	request := certificate.ObtainRequest{
-		Domains: []string{cfg.Domain},
+		Domains: []string{ac.cfg.Domain},
 		Bundle:  true,
 	}
 
-	certificates, err := client.Certificate.Obtain(request)
+	certificates, err := ac.client.Certificate.Obtain(request)
 	if err != nil {
 		return tls.Certificate{}, "", fmt.Errorf("failed to obtain certificate: %w", err)
 	}
 
-	slog.Info("certificate obtained successfully", "domain", cfg.Domain)
+	slog.Info("certificate obtained successfully", "domain", ac.cfg.Domain)
 
-	// Parse the certificate
 	cert, err := tls.X509KeyPair(certificates.Certificate, certificates.PrivateKey)
 	if err != nil {
 		return tls.Certificate{}, "", fmt.Errorf("failed to parse certificate: %w", err)
 	}
 
-	// Compute public key hash for attestation
 	pubKeyHash := computePubKeyHash(&cert)
-
 	return cert, pubKeyHash, nil
+}
+
+// ObtainCertificate is a convenience wrapper that creates a new client,
+// registers, and obtains a certificate in one call. Use NewClient +
+// Client.ObtainCertificate separately if you need to retry without re-registering.
+func ObtainCertificate(ctx context.Context, cfg *Config) (tls.Certificate, string, error) {
+	slog.Info("obtaining ACME certificate", "domain", cfg.Domain, "provider", cfg.Provider)
+
+	ac, err := NewClient(cfg)
+	if err != nil {
+		return tls.Certificate{}, "", err
+	}
+
+	return ac.ObtainCertificate(ctx)
 }
 
 // getDNSProvider returns the appropriate DNS provider based on name.
@@ -164,7 +181,8 @@ func computePubKeyHash(cert *tls.Certificate) string {
 
 // StartRenewalLoop starts a background goroutine that renews the certificate
 // before expiry and calls updateCert with the new certificate and public key hash.
-func StartRenewalLoop(ctx context.Context, cfg *Config, cert tls.Certificate, updateCert func(tls.Certificate, string)) {
+// It uses the provided Client to avoid re-registering with the ACME server.
+func StartRenewalLoop(ctx context.Context, cfg *Config, acmeClient *Client, cert tls.Certificate, updateCert func(tls.Certificate, string)) {
 	// Parse leaf to get expiry time.
 	var notAfter time.Time
 	if len(cert.Certificate) > 0 {
@@ -195,7 +213,7 @@ func StartRenewalLoop(ctx context.Context, cfg *Config, cert tls.Certificate, up
 				}
 
 				slog.Info("certificate expiring soon, renewing", "domain", cfg.Domain, "expires_in", remaining.Round(time.Hour))
-				newCert, newHash, err := ObtainCertificate(ctx, cfg)
+				newCert, newHash, err := acmeClient.ObtainCertificate(ctx)
 				if err != nil {
 					slog.Error("certificate renewal failed", "domain", cfg.Domain, "error", err)
 					continue
