@@ -634,8 +634,26 @@ func VerifyKeyOwnership(provisioningKey, keyHash string) (OwnershipCheckResult, 
 	}
 
 	if resp.StatusCode == 404 {
-		slog.Warn("key not found", "hash", keyHash[:16])
-		result.NotOwned = true
+		// OpenRouter returns {"error":{"message":"API key not found","code":404}}
+		// when a key genuinely doesn't belong to the authenticated account.
+		// A transient infrastructure 404 would have a different body (or none).
+		//
+		// We set NotOwned only when the body confirms genuine non-ownership.
+		// The caller still retries all 404s (transient or not) before acting
+		// on this flag — see handleSubmitKey in handlers.go.
+		var errResp struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(body, &errResp) == nil &&
+			strings.EqualFold(errResp.Error.Message, "API key not found") {
+			slog.Warn("key not found (definitive)", "hash", keyHash[:16])
+			result.NotOwned = true
+		} else {
+			slog.Warn("key lookup 404 with unexpected body", "hash", keyHash[:16],
+				"body", string(body))
+		}
 		return result, nil
 	}
 

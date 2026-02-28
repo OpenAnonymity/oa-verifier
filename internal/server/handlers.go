@@ -635,18 +635,54 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case http.StatusNotFound:
-			if nearExpiry {
-				writeJSON(w, http.StatusOK, map[string]any{
-					"status":     "unverified",
-					"station_id": req.StationID,
-					"key_hash":   keyHashFull[:16],
-					"detail":     "key_near_expiry_not_owned",
-					"retryable":  false,
-				})
+			// 404 from OpenRouter's /keys/:hash endpoint.
+			//
+			// Two possible meanings:
+			//   (a) Definitive: body is {"error":{"message":"API key not found",...}}
+			//       → the key genuinely doesn't belong to this account.
+			//   (b) Ambiguous: different/empty body, likely a transient API issue.
+			//
+			// In both cases we retry up to 3 times first — even a definitive-
+			// looking response could be a momentary glitch. After retries exhaust
+			// we check result.NotOwned (set by openrouter.VerifyKeyOwnership when
+			// the body matches case (a)):
+			//   - NotOwned=true  → ban the station (genuine non-ownership).
+			//   - NotOwned=false → report the unexpected 404 format to the org
+			//                      and fall through to the 503/retryable path.
+			if attempt < 3 {
+				if err := netretry.Sleep(r.Context(), attempt, ownershipRetryCfg); err != nil {
+					break
+				}
+				continue
+			}
+			// All retries exhausted — check the last response.
+			if result.NotOwned {
+				if nearExpiry {
+					writeJSON(w, http.StatusOK, map[string]any{
+						"status":     "unverified",
+						"station_id": req.StationID,
+						"key_hash":   keyHashFull[:16],
+						"detail":     "key_near_expiry_not_owned",
+						"retryable":  false,
+					})
+					return
+				}
+				s.banStationForKeyNotOwned(w, req.StationID, publicKey, stationEmail, keyHashFull)
 				return
 			}
-			s.banStationForKeyNotOwned(w, req.StationID, publicKey, stationEmail, keyHashFull)
-			return
+			// Ambiguous 404 — notify org so they can investigate, then fall
+			// through to the post-loop 503/retryable path.
+			s.notifyOrgEvent(orgEvent{
+				event:       "unexpected_404_format",
+				stationID:   req.StationID,
+				publicKey:   publicKey,
+				email:       stationEmail,
+				reason:      "key_ownership_ambiguous_404",
+				statusCode:  404,
+				errorDetail: result.Body,
+				operation:   "ownership_check",
+				severity:    "warning",
+			})
 		case http.StatusUnauthorized:
 			if !refreshed {
 				newKey, refreshErr := s.refreshProvisioningKey(req.StationID, publicKey, stationEmail, stationData.CookieData)
