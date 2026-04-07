@@ -72,6 +72,11 @@ const (
 //     Must be false so the station operator is not broadcasting user request
 //     traces to third parties.
 //     Ref: https://openrouter.ai/docs/guides/features/broadcast/overview
+//
+//   - is_private_logging_enabled: OpenRouter IO Logging feature. When true,
+//     input/output data for API requests is logged to the account's
+//     observability dashboard. Must be false so the station operator is not
+//     storing user prompts and completions.
 var OpenRouterRequiredToggles = map[string]bool{
 	"enable_logging":                false,
 	"enable_training":               false,
@@ -80,6 +85,7 @@ var OpenRouterRequiredToggles = map[string]bool{
 	"enforce_zdr":                   false,
 	"always_enforce_allowed":        false,
 	"is_broadcast_enabled":          false,
+	"is_private_logging_enabled":    false,
 }
 
 // ---------------------------------------------------------------------------

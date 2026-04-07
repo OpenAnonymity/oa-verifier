@@ -22,6 +22,11 @@ const (
 	maxRetries = 5
 
 	managementKeysRouterState = "%5B%22%22%2C%7B%22children%22%3A%5B%22(user)%22%2C%7B%22children%22%3A%5B%22settings%22%2C%7B%22children%22%3A%5B%22management-keys%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
+
+	activityRouterState = "%5B%22%22%2C%7B%22children%22%3A%5B%22(user)%22%2C%7B%22children%22%3A%5B%22activity%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
+
+	observabilityPagePath    = "/workspaces/default/observability"
+	observabilityRouterState = "%5B%22%22%2C%7B%22children%22%3A%5B%22(user)%22%2C%7B%22children%22%3A%5B%22(dashboard)%22%2C%7B%22children%22%3A%5B%22workspaces%22%2C%7B%22children%22%3A%5B%5B%22workspaceId%22%2C%22default%22%2C%22d%22%5D%2C%7B%22children%22%3A%5B%22observability%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
 )
 
 var retryCfg = netretry.DefaultConfig(maxRetries)
@@ -123,26 +128,27 @@ var httpClient = &http.Client{
 	},
 }
 
-// FetchActivityData fetches user data including email and privacy toggles.
-func FetchActivityData(auth *Auth) (map[string]any, error) {
+// fetchUserDataFromEndpoint fetches user data from a Next.js server component endpoint.
+// Both /activity and /workspaces/default/observability return the same getCurrentUserSA
+// response containing email and privacy toggles.
+func fetchUserDataFromEndpoint(auth *Auth, pagePath, routerState, operation string) (map[string]any, error) {
 	actionHash := auth.GetActionHash("activity")
 	if actionHash == "" {
 		return nil, fmt.Errorf("no activity hash found, available: %v", auth.GetAllActionHashes())
 	}
 
 	cookies := auth.GetCookies()
-	routerState := "%5B%22%22%2C%7B%22children%22%3A%5B%22(user)%22%2C%7B%22children%22%3A%5B%22activity%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
 	reqBody := "[]"
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, _ := http.NewRequest("POST", config.BaseURL+"/activity", strings.NewReader(reqBody))
+		req, _ := http.NewRequest("POST", config.BaseURL+pagePath, strings.NewReader(reqBody))
 		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
 		req.Header.Set("Accept", "text/x-component")
 		req.Header.Set("Accept-Encoding", "identity")
 		req.Header.Set("Next-Action", actionHash)
 		req.Header.Set("Next-Router-State-Tree", routerState)
 		req.Header.Set("Origin", config.BaseURL)
-		req.Header.Set("Referer", config.BaseURL+"/activity")
+		req.Header.Set("Referer", config.BaseURL+pagePath)
 
 		for _, c := range cookies {
 			req.AddCookie(c)
@@ -150,13 +156,13 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			slog.Warn("fetch_activity_data error", "attempt", attempt, "error", err)
+			slog.Warn(operation+" error", "attempt", attempt, "path", pagePath, "error", err)
 			if attempt < maxRetries {
 				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 				continue
 			}
 			return nil, &RequestResponseError{
-				Operation:      "fetch_activity_data",
+				Operation:      operation,
 				Method:         req.Method,
 				URL:            req.URL.String(),
 				RequestHeaders: flattenHeaders(req.Header),
@@ -169,13 +175,13 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 		resp.Body.Close()
 
 		if resp.StatusCode != 200 {
-			slog.Warn("fetch_activity_data failed", "attempt", attempt, "status", resp.StatusCode)
+			slog.Warn(operation+" failed", "attempt", attempt, "path", pagePath, "status", resp.StatusCode)
 			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
 				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 				continue
 			}
 			return nil, &RequestResponseError{
-				Operation:       "fetch_activity_data",
+				Operation:       operation,
 				Method:          req.Method,
 				URL:             req.URL.String(),
 				RequestHeaders:  flattenHeaders(req.Header),
@@ -183,7 +189,7 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 				ResponseStatus:  resp.StatusCode,
 				ResponseHeaders: flattenHeaders(resp.Header),
 				ResponseBody:    string(body),
-				Err:             fmt.Errorf("fetch_activity_data failed: status %d", resp.StatusCode),
+				Err:             fmt.Errorf("%s failed: status %d", operation, resp.StatusCode),
 			}
 		}
 
@@ -207,13 +213,13 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 			}
 		}
 
-		slog.Warn("fetch_activity_data could not parse response", "attempt", attempt)
+		slog.Warn(operation+" could not parse response", "attempt", attempt, "path", pagePath)
 		if attempt < maxRetries {
 			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 			continue
 		}
 		return nil, &RequestResponseError{
-			Operation:       "fetch_activity_data_parse",
+			Operation:       operation + "_parse",
 			Method:          req.Method,
 			URL:             req.URL.String(),
 			RequestHeaders:  flattenHeaders(req.Header),
@@ -221,11 +227,33 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 			ResponseStatus:  resp.StatusCode,
 			ResponseHeaders: flattenHeaders(resp.Header),
 			ResponseBody:    string(body),
-			Err:             fmt.Errorf("fetch_activity_data parse failed"),
+			Err:             fmt.Errorf("%s parse failed", operation),
 		}
 	}
 
-	return nil, fmt.Errorf("fetch_activity_data failed after %d attempts", maxRetries)
+	return nil, fmt.Errorf("%s failed after %d attempts", operation, maxRetries)
+}
+
+// FetchActivityData fetches user data including email and privacy toggles.
+// It tries the /activity endpoint first, then falls back to /workspaces/default/observability.
+func FetchActivityData(auth *Auth) (map[string]any, error) {
+	data, err := fetchUserDataFromEndpoint(auth, "/activity", activityRouterState, "fetch_activity_data")
+	if err == nil && data != nil {
+		return data, nil
+	}
+
+	slog.Warn("activity endpoint failed, trying observability fallback", "error", err)
+	fallbackData, fallbackErr := fetchUserDataFromEndpoint(auth, observabilityPagePath, observabilityRouterState, "fetch_observability_data")
+	if fallbackErr == nil && fallbackData != nil {
+		slog.Info("observability fallback succeeded")
+		return fallbackData, nil
+	}
+
+	// Return the original activity error since that's the primary endpoint
+	if err != nil {
+		return nil, err
+	}
+	return nil, fallbackErr
 }
 
 // FetchProvisioningKeys fetches all provisioning keys.
