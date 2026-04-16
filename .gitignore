@@ -1,6 +1,7 @@
 # Go
 verifier
 oa-verifier
+diag
 *.exe
 
 # Cookies (sensitive)

@@ -171,7 +171,16 @@ func (s *Server) challengeOneStation(_ context.Context, pk string, station model
 					transientDetails = openrouterErrorDetails(err)
 				}
 			} else {
-				toggleResult, toggleDetails := challenge.CheckPrivacyToggles(activityData)
+				// Merge workspace data into activity data for toggle checking.
+				// Workspace-level toggles (e.g. is_data_discount_logging_enabled)
+				// are only available from the workspace settings endpoint.
+				wsData, wsErr := openrouter.FetchWorkspaceData(auth)
+				if wsErr != nil {
+					slog.Warn("workspace data fetch failed, checking with user data only", "station_id", stationID, "error", wsErr)
+				}
+				mergedData := mergeToggleData(activityData, wsData)
+
+				toggleResult, toggleDetails := challenge.CheckPrivacyToggles(mergedData)
 				switch toggleResult {
 				case challenge.ToggleOK:
 					passed = true

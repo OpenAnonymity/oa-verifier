@@ -133,10 +133,16 @@ func NewAuthFromCookieData(cookieData map[string]any) (*Auth, error) {
 		domain, _ := cookie["domain"].(string)
 
 		switch {
-		case name == "__client" && strings.Contains(domain, "clerk"):
+		// Clerk v4: __client on clerk domain
+		// Clerk v5: __client_<suffix> on clerk domain (suffix = last 8 chars of publishable key)
+		case (name == "__client" || (strings.HasPrefix(name, "__client_") && !strings.HasPrefix(name, "__client_uat"))) && strings.Contains(domain, "clerk"):
 			a.state["client_token"] = value
-		case name == "__client_uat":
+		case name == "__client_uat" || (strings.HasPrefix(name, "__client_uat_") && a.state["client_uat"] == ""):
 			a.state["client_uat"] = value
+			// Extract Clerk v5 suffix (e.g., "NO6jtgZM" from "__client_uat_NO6jtgZM")
+			if suffix := strings.TrimPrefix(name, "__client_uat_"); suffix != name && suffix != "" {
+				a.state["clerk_suffix"] = suffix
+			}
 		case name == "clerk_active_context":
 			parts := strings.Split(value, ":")
 			a.state["session_id"] = parts[0]
@@ -147,8 +153,26 @@ func NewAuthFromCookieData(cookieData map[string]any) (*Auth, error) {
 		}
 	}
 
+	// Clerk v5 fallback: if no __client cookie found on clerk domain,
+	// look for __refresh_<suffix> cookies on the openrouter.ai domain.
+	// These serve the same role as __client for session token refresh.
+	if a.state["client_token"] == "" {
+		for _, c := range cookies {
+			cookie, ok := c.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := cookie["name"].(string)
+			value, _ := cookie["value"].(string)
+			if strings.HasPrefix(name, "__refresh") && value != "" {
+				a.state["client_token"] = value
+				break
+			}
+		}
+	}
+
 	if a.state["session_id"] == "" || a.state["client_token"] == "" {
-		return nil, fmt.Errorf("invalid cookie_data - missing required session data")
+		return nil, fmt.Errorf("invalid cookie_data - missing required session data (session_id=%v, client_token=%v)", a.state["session_id"] != "", a.state["client_token"] != "")
 	}
 
 	a.fetchClerkVersions()
@@ -158,6 +182,39 @@ func NewAuthFromCookieData(cookieData map[string]any) (*Auth, error) {
 	a.fetchActionHashes()
 
 	return a, nil
+}
+
+// NewAuthFromRawCookieHeader creates an Auth instance from a raw HTTP Cookie header string.
+// This is a convenience method for testing/diagnostics. It converts the raw header
+// into the structured format expected by NewAuthFromCookieData.
+func NewAuthFromRawCookieHeader(rawHeader string) (*Auth, error) {
+	var cookieList []any
+	for _, pair := range strings.Split(rawHeader, ";") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		eqIdx := strings.Index(pair, "=")
+		if eqIdx < 0 {
+			continue
+		}
+		name := strings.TrimSpace(pair[:eqIdx])
+		value := strings.TrimSpace(pair[eqIdx+1:])
+
+		// Infer domain for clerk-related cookies
+		domain := "openrouter.ai"
+		if strings.HasPrefix(name, "__client") && !strings.HasPrefix(name, "__client_uat") {
+			domain = "clerk.openrouter.ai"
+		}
+
+		cookieList = append(cookieList, map[string]any{
+			"name":   name,
+			"value":  value,
+			"domain": domain,
+		})
+	}
+
+	return NewAuthFromCookieData(map[string]any{"cookies": cookieList})
 }
 
 func (a *Auth) fetchClerkVersions() {
@@ -222,8 +279,12 @@ func (a *Auth) refreshToken() error {
 		req.Header.Set("Referer", "https://openrouter.ai/")
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
+		// Clerk accepts both __client (v4) and __client_<suffix> (v5) cookies.
+		// The token value is what matters, not the cookie name.
 		req.AddCookie(&http.Cookie{Name: "__client", Value: a.state["client_token"]})
-		req.AddCookie(&http.Cookie{Name: "__client_uat", Value: a.state["client_uat"]})
+		if clientUAT := a.state["client_uat"]; clientUAT != "" {
+			req.AddCookie(&http.Cookie{Name: "__client_uat", Value: clientUAT})
+		}
 
 		resp, err := a.client.Do(req)
 		if err != nil {
@@ -402,14 +463,28 @@ func requiredActionHashCount() int {
 }
 
 // GetCookies returns cookies for HTTP requests.
+// Includes both standard and Clerk v5 suffixed cookie names to ensure
+// compatibility with OpenRouter's server-side cookie parsing.
 func (a *Auth) GetCookies() []*http.Cookie {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return []*http.Cookie{
+
+	cookies := []*http.Cookie{
 		{Name: "__client_uat", Value: a.state["client_uat"]},
 		{Name: "clerk_active_context", Value: a.state["clerk_active_context"]},
 		{Name: "__session", Value: a.sessionJWT},
 	}
+
+	// If we detected a Clerk suffix, also send suffixed cookie variants.
+	// OpenRouter's server may check either the standard or suffixed names.
+	if suffix := a.state["clerk_suffix"]; suffix != "" {
+		cookies = append(cookies,
+			&http.Cookie{Name: "__client_uat_" + suffix, Value: a.state["client_uat"]},
+			&http.Cookie{Name: "__session_" + suffix, Value: a.sessionJWT},
+		)
+	}
+
+	return cookies
 }
 
 // GetActionHash returns the next-action hash for a specific page.

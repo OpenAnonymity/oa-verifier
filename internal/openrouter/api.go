@@ -256,6 +256,153 @@ func FetchActivityData(auth *Auth) (map[string]any, error) {
 	return nil, fallbackErr
 }
 
+// FetchWorkspaceData fetches workspace settings from the SSR page response.
+// Workspace-level toggles like is_data_discount_logging_enabled are only available
+// in the workspace data, not in the getCurrentUserSA response.
+func FetchWorkspaceData(auth *Auth) (map[string]any, error) {
+	cookies := auth.GetCookies()
+	pagePath := "/workspaces/default/settings"
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		req, _ := http.NewRequest("GET", config.BaseURL+pagePath, nil)
+		// Request RSC stream format instead of HTML to get parseable JSON
+		req.Header.Set("RSC", "1")
+		req.Header.Set("Next-Url", pagePath)
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			slog.Warn("fetch_workspace_data error", "attempt", attempt, "error", err)
+			if attempt < maxRetries {
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
+			}
+			return nil, &RequestResponseError{
+				Operation:      "fetch_workspace_data",
+				Method:         req.Method,
+				URL:            req.URL.String(),
+				RequestHeaders: flattenHeaders(req.Header),
+				Err:            err,
+			}
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			slog.Warn("fetch_workspace_data failed", "attempt", attempt, "status", resp.StatusCode)
+			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
+			}
+			return nil, &RequestResponseError{
+				Operation:       "fetch_workspace_data",
+				Method:          req.Method,
+				URL:             req.URL.String(),
+				RequestHeaders:  flattenHeaders(req.Header),
+				ResponseStatus:  resp.StatusCode,
+				ResponseHeaders: flattenHeaders(resp.Header),
+				ResponseBody:    string(body),
+				Err:             fmt.Errorf("fetch_workspace_data failed: status %d", resp.StatusCode),
+			}
+		}
+
+		// Parse response - look for workspace data containing slug field.
+		// The response can be RSC stream (line-based) or HTML with embedded data.
+		bodyStr := string(body)
+
+		// Try RSC stream format: lines like 1:{"__kind":"OK","data":{...}}
+		for _, line := range strings.Split(bodyStr, "\n") {
+			if !strings.Contains(line, `"__kind":"OK"`) {
+				continue
+			}
+			idx := strings.Index(line, "{")
+			if idx < 0 {
+				continue
+			}
+			var obj map[string]any
+			if err := json.Unmarshal([]byte(line[idx:]), &obj); err != nil {
+				continue
+			}
+			if obj["__kind"] != "OK" {
+				continue
+			}
+			data, ok := obj["data"].(map[string]any)
+			if !ok {
+				continue
+			}
+			if _, hasSlug := data["slug"]; hasSlug {
+				return data, nil
+			}
+		}
+
+		// Try HTML format: workspace data embedded in script tags as escaped JSON
+		// Pattern: "slug":"default" with is_data_discount_logging_enabled nearby
+		wsRe := regexp.MustCompile(`\{[^{}]*"slug"\s*:\s*"default"[^}]*"is_data_discount_logging_enabled"\s*:\s*(true|false)[^}]*\}`)
+		if m := wsRe.FindString(bodyStr); m != "" {
+			// Unescape if needed
+			unescaped := strings.ReplaceAll(m, `\"`, `"`)
+			var data map[string]any
+			if err := json.Unmarshal([]byte(unescaped), &data); err == nil {
+				if _, hasSlug := data["slug"]; hasSlug {
+					return data, nil
+				}
+			}
+		}
+
+		// Try broader search: find any JSON object with slug and the toggle
+		// The RSC stream may have the data split across push() calls in HTML
+		slugIdx := strings.Index(bodyStr, `"slug":"default"`)
+		if slugIdx < 0 {
+			slugIdx = strings.Index(bodyStr, `\"slug\":\"default\"`)
+		}
+		if slugIdx >= 0 {
+			// Search backward for opening brace, forward for the toggle
+			searchStart := max(0, slugIdx-500)
+			searchEnd := min(len(bodyStr), slugIdx+2000)
+			window := bodyStr[searchStart:searchEnd]
+
+			// Look for the toggle value in this window
+			toggleRe := regexp.MustCompile(`"is_data_discount_logging_enabled"\s*:\s*(true|false)`)
+			escapedToggleRe := regexp.MustCompile(`\\"is_data_discount_logging_enabled\\":\s*(true|false)`)
+			if tm := toggleRe.FindStringSubmatch(window); len(tm) > 1 {
+				slog.Info("found workspace toggle in page data", "is_data_discount_logging_enabled", tm[1])
+				return map[string]any{
+					"slug":                              "default",
+					"is_data_discount_logging_enabled":  tm[1] == "true",
+				}, nil
+			}
+			if tm := escapedToggleRe.FindStringSubmatch(window); len(tm) > 1 {
+				slog.Info("found workspace toggle in escaped page data", "is_data_discount_logging_enabled", tm[1])
+				return map[string]any{
+					"slug":                              "default",
+					"is_data_discount_logging_enabled":  tm[1] == "true",
+				}, nil
+			}
+		}
+
+		slog.Warn("fetch_workspace_data could not parse response", "attempt", attempt)
+		if attempt < maxRetries {
+			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+			continue
+		}
+		return nil, &RequestResponseError{
+			Operation:       "fetch_workspace_data_parse",
+			Method:          req.Method,
+			URL:             req.URL.String(),
+			RequestHeaders:  flattenHeaders(req.Header),
+			ResponseStatus:  resp.StatusCode,
+			ResponseHeaders: flattenHeaders(resp.Header),
+			ResponseBody:    string(body),
+			Err:             fmt.Errorf("fetch_workspace_data parse failed"),
+		}
+	}
+
+	return nil, fmt.Errorf("fetch_workspace_data failed after %d attempts", maxRetries)
+}
+
 // FetchProvisioningKeys fetches all provisioning keys.
 func FetchProvisioningKeys(auth *Auth) ([]map[string]string, error) {
 	cookies := auth.GetCookies()
