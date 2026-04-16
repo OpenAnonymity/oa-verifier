@@ -306,8 +306,15 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		"public_key", req.PublicKey,
 		"display_name", req.DisplayName)
 
-	// Verify privacy toggles immediately
-	toggleResult, toggleDetails := challenge.CheckPrivacyToggles(data)
+	// Fetch workspace data for workspace-level toggles
+	wsData, wsErr := openrouter.FetchWorkspaceData(auth)
+	if wsErr != nil {
+		slog.Warn("registration: workspace data fetch failed, checking with user data only",
+			"email", email, "error", wsErr)
+	}
+
+	// Verify privacy toggles immediately (merged user + workspace data)
+	toggleResult, toggleDetails := challenge.CheckPrivacyToggles(mergeToggleData(data, wsData))
 	switch toggleResult {
 	case challenge.ToggleInvalid:
 		reason := fmt.Sprintf("privacy_toggles_invalid_on_register:[%s]", strings.Join(toggleDetails, ","))

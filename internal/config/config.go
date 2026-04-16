@@ -34,11 +34,6 @@ const (
 //
 // Toggle definitions (all must be false):
 //
-//   - enable_logging: OpenRouter prompt logging opt-in. When true, OpenRouter
-//     stores prompts/responses on the account. Must be false so the station
-//     operator's account is not logging user prompts.
-//     Ref: https://openrouter.ai/docs/guides/privacy/data-collection
-//
 //   - enable_training: Whether to allow routing to providers that may train on
 //     data (paid models). When false, OpenRouter will not route to providers
 //     that train on prompts.
@@ -77,8 +72,18 @@ const (
 //     input/output data for API requests is logged to the account's
 //     observability dashboard. Must be false so the station operator is not
 //     storing user prompts and completions.
-var OpenRouterRequiredToggles = map[string]bool{
-	"enable_logging":                false,
+//     Ref: https://openrouter.ai/docs/guides/privacy/data-collection
+//
+//   - is_data_discount_logging_enabled: OpenRouter data discount opt-in.
+//     When true, OpenRouter may use prompt/completion data for product
+//     improvement in exchange for a 1% usage discount. Must be false so
+//     user data is not used for training or product enhancement. This
+//     replaced the former enable_logging field. Note: this is a workspace-
+//     level setting fetched from workspace data, not from getCurrentUserSA.
+//     Ref: https://openrouter.ai/docs/guides/privacy/data-collection
+
+// UserRequiredToggles are checked against getCurrentUserSA response.
+var UserRequiredToggles = map[string]bool{
 	"enable_training":               false,
 	"enable_free_model_training":    false,
 	"enable_free_model_publication": false,
@@ -87,6 +92,24 @@ var OpenRouterRequiredToggles = map[string]bool{
 	"is_broadcast_enabled":          false,
 	"is_private_logging_enabled":    false,
 }
+
+// WorkspaceRequiredToggles are checked against workspace settings data.
+var WorkspaceRequiredToggles = map[string]bool{
+	"is_data_discount_logging_enabled": false,
+}
+
+// OpenRouterRequiredToggles is the combined set of all required toggles.
+// Used by CheckPrivacyToggles which searches any data map for matching keys.
+var OpenRouterRequiredToggles = func() map[string]bool {
+	merged := make(map[string]bool)
+	for k, v := range UserRequiredToggles {
+		merged[k] = v
+	}
+	for k, v := range WorkspaceRequiredToggles {
+		merged[k] = v
+	}
+	return merged
+}()
 
 // ---------------------------------------------------------------------------
 // Generic verifier config

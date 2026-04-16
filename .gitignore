@@ -1,10 +1,18 @@
 # Go
 verifier
 oa-verifier
+diag
 *.exe
 
 # Cookies (sensitive)
 cookies.json
+
+# Local-only drift diagnosis suite (skill + fixtures + drift tests + parser helpers).
+# May contain captured responses including session cookies.
+.claude/
+**/*_drift_local_test.go
+**/drift_parsers_local.go
+internal/openrouter/testdata/
 
 # IDE
 .idea/

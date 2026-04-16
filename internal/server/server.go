@@ -359,6 +359,22 @@ func extractEmail(data map[string]any) string {
 	return ""
 }
 
+// mergeToggleData combines user data and workspace data into a single map
+// for privacy toggle checking. Workspace-level toggles (like
+// is_data_discount_logging_enabled) are only in workspace data.
+func mergeToggleData(userData, workspaceData map[string]any) map[string]any {
+	merged := make(map[string]any, len(userData)+len(workspaceData))
+	for k, v := range userData {
+		merged[k] = v
+	}
+	for k, v := range workspaceData {
+		if _, exists := merged[k]; !exists {
+			merged[k] = v
+		}
+	}
+	return merged
+}
+
 func verifyEd25519Signature(publicKeyHex, message, signatureHex string) bool {
 	pubKeyBytes, err := hex.DecodeString(publicKeyHex)
 	if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
