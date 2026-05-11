@@ -57,10 +57,6 @@ const (
 //     protect user data at the OpenRouter layer.
 //     Ref: https://openrouter.ai/docs/guides/features/zdr
 //
-//   - always_enforce_allowed: Allowed-model enforcement toggle. Must be false
-//     to prevent the account from restricting to a model allowlist that could
-//     interfere with station operation.
-//
 //   - is_broadcast_enabled: OpenRouter Broadcast feature. When true, all API
 //     request traces (prompts, completions, token counts, timing) are sent to
 //     configured external observability platforms (Langfuse, Datadog, etc.).
@@ -83,12 +79,18 @@ const (
 //     Ref: https://openrouter.ai/docs/guides/privacy/data-collection
 
 // UserRequiredToggles are checked against getCurrentUserSA response.
+//
+// Removed 2026-04-27: `always_enforce_allowed` (model-allowlist enforcement).
+// OpenRouter retired the field — confirmed zero references in the public
+// JS bundle (67 chunks scanned), zero presence in any active settings page.
+// The underlying allowlist-enforcement feature appears removed entirely;
+// no replacement field controls this concept. Stations were hitting
+// ToggleMissing on this field and getting unregistered after grace.
 var UserRequiredToggles = map[string]bool{
 	"enable_training":               false,
 	"enable_free_model_training":    false,
 	"enable_free_model_publication": false,
 	"enforce_zdr":                   false,
-	"always_enforce_allowed":        false,
 	"is_broadcast_enabled":          false,
 	"is_private_logging_enabled":    false,
 }
