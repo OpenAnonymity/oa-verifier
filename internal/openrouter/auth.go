@@ -59,6 +59,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -72,9 +73,12 @@ import (
 
 const (
 	clerkJSURL             = "https://clerk.openrouter.ai/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
-	clerkAPI               = "https://clerk.openrouter.ai/v1/client/sessions/%s/tokens"
 	managementKeysPagePath = "/settings/management-keys"
 )
+
+// clerkAPI is the URL template for Clerk's session-token endpoint. Defined as
+// a var (not const) so tests can substitute an httptest server.
+var clerkAPI = "https://clerk.openrouter.ai/v1/client/sessions/%s/tokens"
 
 var pages = map[string]string{
 	"activity":        "/activity",
@@ -149,6 +153,13 @@ func NewAuthFromCookieData(cookieData map[string]any) (*Auth, error) {
 			a.state["clerk_active_context"] = value
 			if len(parts) > 1 && parts[1] != "" {
 				a.state["org_id"] = parts[1]
+			}
+		case name == "__session" || strings.HasPrefix(name, "__session_"):
+			// Capture the operator's session JWT from registration. Used only
+			// as a fallback `expired_token` parameter if Clerk demands one
+			// (status 422 missing_expired_token) — never as a current bearer.
+			if a.sessionJWT == "" {
+				a.sessionJWT = value
 			}
 		}
 	}
@@ -254,11 +265,24 @@ func (a *Auth) fetchClerkVersions() {
 func (a *Auth) refreshToken() error {
 	tokenURL := fmt.Sprintf(clerkAPI, a.state["session_id"])
 
-	data := url.Values{}
-	if orgID := a.state["org_id"]; orgID != "" {
-		data.Set("organization_id", orgID)
+	buildBody := func(includeExpiredToken bool) string {
+		data := url.Values{}
+		if orgID := a.state["org_id"]; orgID != "" {
+			data.Set("organization_id", orgID)
+		}
+		if includeExpiredToken {
+			a.mu.RLock()
+			prevJWT := a.sessionJWT
+			a.mu.RUnlock()
+			if prevJWT != "" {
+				data.Set("expired_token", prevJWT)
+			}
+		}
+		return data.Encode()
 	}
-	reqBody := data.Encode()
+
+	reqBody := buildBody(false)
+	expiredTokenRetryUsed := false
 
 	cfg := netretry.DefaultConfig(4)
 	var lastErr error
@@ -307,6 +331,26 @@ func (a *Auth) refreshToken() error {
 		resp.Body.Close()
 
 		if resp.StatusCode != 200 {
+			// Clerk's modern session-refresh path can demand the prior session
+			// JWT as `expired_token` (proof-of-possession / anti-replay) for
+			// some session states. The error returned is:
+			//   422 + body: {"errors":[{"code":"missing_expired_token", ...}]}
+			//
+			// We don't preemptively send expired_token because Clerk's contract
+			// is conditional and always-sending could break the working path.
+			// Instead, retry exactly once with expired_token included if we get
+			// this specific signal and we have a JWT to submit.
+			if resp.StatusCode == 422 && !expiredTokenRetryUsed &&
+				strings.Contains(string(body), "missing_expired_token") {
+				retryBody := buildBody(true)
+				if retryBody != reqBody {
+					reqBody = retryBody
+					expiredTokenRetryUsed = true
+					slog.Info("clerk demanded expired_token, retrying with prior session jwt", "session_id", a.state["session_id"])
+					continue
+				}
+			}
+
 			lastErr = fmt.Errorf("token refresh failed: status %d", resp.StatusCode)
 			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < cfg.Attempts {
 				_ = netretry.Sleep(context.Background(), attempt, cfg)
