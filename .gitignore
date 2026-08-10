@@ -6,6 +6,12 @@ diag
 
 # Cookies (sensitive)
 cookies.json
+**/cookies/
+
+# Local-only verifier harness. Duplicate copy of the drift suite that also
+# carries captured OpenRouter session credentials, which stay valid for months
+# because client_token is a Clerk refresh credential, not a session JWT.
+verifier-harness/
 
 # Local-only drift diagnosis suite (skill + fixtures + drift tests + parser helpers).
 # May contain captured responses including session cookies.
