@@ -403,3 +403,116 @@ func TestParseCookieData_SeedsSessionJWT(t *testing.T) {
 		t.Errorf("sessionJWT = %q, want the_initial_jwt", a.sessionJWT)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Action-hash discovery
+//
+// Regression guard for the 2026-08 outage: OpenRouter relocated the client
+// bundle from /_next/static/chunks/ to /_next/static/immutable/chunks/. The
+// old pattern matched nothing, so every station registered with zero action
+// hashes and failed with "no activity hash found, available: map[]".
+// ---------------------------------------------------------------------------
+
+func TestChunkPathRe_MatchesCurrentAndLegacyLayouts(t *testing.T) {
+	cases := []struct {
+		name string
+		html string
+		want string
+	}{
+		{
+			name: "current immutable layout",
+			html: `<script src="/_next/static/immutable/chunks/1yoblnpeamuzi.js" async=""></script>`,
+			want: "/_next/static/immutable/chunks/1yoblnpeamuzi.js",
+		},
+		{
+			name: "legacy layout still supported",
+			html: `<script src="/_next/static/chunks/main-app-1a2b3c.js"></script>`,
+			want: "/_next/static/chunks/main-app-1a2b3c.js",
+		},
+		{
+			name: "chunk name with underscores and dashes",
+			html: `<script src="/_next/static/immutable/chunks/0_er77wa20lmt.js"></script>`,
+			want: "/_next/static/immutable/chunks/0_er77wa20lmt.js",
+		},
+		{
+			name: "hypothetical deeper prefix",
+			html: `<script src="/_next/static/v2/immutable/chunks/abc.js"></script>`,
+			want: "/_next/static/v2/immutable/chunks/abc.js",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := chunkPathRe.FindAllString(tc.html, -1)
+			if len(got) != 1 {
+				t.Fatalf("matched %d paths, want 1: %v", len(got), got)
+			}
+			if got[0] != tc.want {
+				t.Errorf("got %q, want %q", got[0], tc.want)
+			}
+		})
+	}
+}
+
+func TestChunkPathRe_ReturnsFullFetchablePath(t *testing.T) {
+	// The matched value is concatenated onto config.BaseURL directly, so it must
+	// be the complete path. Reassembling it from a hardcoded prefix is exactly
+	// what broke in 2026-08.
+	html := `<script src="/_next/static/immutable/chunks/1yoblnpeamuzi.js"></script>`
+	got := chunkPathRe.FindString(html)
+	if !strings.HasPrefix(got, "/_next/static/") || !strings.HasSuffix(got, ".js") {
+		t.Fatalf("not a fetchable path: %q", got)
+	}
+	if !strings.Contains(got, "immutable") {
+		t.Errorf("dropped the intermediate segment: %q", got)
+	}
+}
+
+// liveChunkSnippet is a verbatim excerpt of OpenRouter's minified bundle,
+// captured 2026-08-10 from /_next/static/immutable/chunks/1yoblnpeamuzi.js.
+const liveChunkSnippet = `ModelChanged="model_changed",s.Error="error",s),y=e.i(165701);let L=(0,y.createServerReference)("003b43c49a1bfb8a3e6f7f6e74736da5a4e5bfc663",y.callServer,void 0,y.findSourceMapURL,"getCurrentUserSA")`
+
+func TestExtractActionHashes_LiveBundleShape(t *testing.T) {
+	got := map[string]string{}
+	extractActionHashes(liveChunkSnippet, got)
+
+	want := "003b43c49a1bfb8a3e6f7f6e74736da5a4e5bfc663"
+	if got["activity"] != want {
+		t.Errorf("activity hash = %q, want %q (all hashes: %v)", got["activity"], want, got)
+	}
+}
+
+func TestExtractActionHashes_IgnoresUnmappedActions(t *testing.T) {
+	js := `(0,y.createServerReference)("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",y.callServer,void 0,y.findSourceMapURL,"someUnrelatedSA")`
+	got := map[string]string{}
+	extractActionHashes(js, got)
+
+	if len(got) != 0 {
+		t.Errorf("recorded unmapped action: %v", got)
+	}
+}
+
+func TestExtractActionHashes_NameBeyondLookaheadIsIgnored(t *testing.T) {
+	// Guards the lookahead window: if a future build inserts enough arguments
+	// between the hash and the name, we want a visible miss rather than a hash
+	// silently bound to the wrong action.
+	js := `("003b43c49a1bfb8a3e6f7f6e74736da5a4e5bfc663",` + strings.Repeat("x", actionNameLookahead) + `,"getCurrentUserSA")`
+	got := map[string]string{}
+	extractActionHashes(js, got)
+
+	if _, ok := got["activity"]; ok {
+		t.Errorf("matched a name past the lookahead window: %v", got)
+	}
+}
+
+func TestHashDiscovery_StringDistinguishesFailureModes(t *testing.T) {
+	signedOut := hashDiscovery{pagesSignedOut: 2}.String()
+	if !strings.Contains(signedOut, "pages_signed_out=2") || !strings.Contains(signedOut, "pages_ok=0") {
+		t.Errorf("dead-session diagnostic unclear: %q", signedOut)
+	}
+
+	bundleMoved := hashDiscovery{pagesOK: 2, chunksSeen: 0}.String()
+	if !strings.Contains(bundleMoved, "pages_ok=2") || !strings.Contains(bundleMoved, "chunks_seen=0") {
+		t.Errorf("bundle-layout diagnostic unclear: %q", bundleMoved)
+	}
+}
