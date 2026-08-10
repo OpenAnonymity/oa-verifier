@@ -134,7 +134,7 @@ var httpClient = &http.Client{
 func fetchUserDataFromEndpoint(auth *Auth, pagePath, routerState, operation string) (map[string]any, error) {
 	actionHash := auth.GetActionHash("activity")
 	if actionHash == "" {
-		return nil, fmt.Errorf("no activity hash found, available: %v", auth.GetAllActionHashes())
+		return nil, fmt.Errorf("no activity hash found, available: %v (%s)", auth.GetAllActionHashes(), auth.DiscoveryDiagnostics())
 	}
 
 	cookies := auth.GetCookies()
