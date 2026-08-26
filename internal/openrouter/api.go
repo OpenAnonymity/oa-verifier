@@ -234,9 +234,124 @@ func fetchUserDataFromEndpoint(auth *Auth, pagePath, routerState, operation stri
 	return nil, fmt.Errorf("%s failed after %d attempts", operation, maxRetries)
 }
 
+// currentUserPath is OpenRouter's private frontend REST endpoint for the
+// signed-in user's account state. As of 2026-08 it replaces the getCurrentUserSA
+// server action, which was removed when OpenRouter migrated their private
+// frontend from Next.js Server Actions to REST + React Query. It returns
+// {"data": {...}} carrying email and the user-scope privacy toggles.
+const currentUserPath = "/api/frontend/v1/private/users/current"
+
+// fetchCurrentUser reads account state from the private frontend REST API.
+//
+// This is strictly preferable to the server-action path it replaces: it needs no
+// action hash, so it removes the dependency on scraping OpenRouter's minified
+// client bundle -- the layer that broke twice in 2026-08 (bundle relocation,
+// then the server-action removal itself).
+func fetchCurrentUser(auth *Auth) (map[string]any, error) {
+	cookies := auth.GetCookies()
+	url := config.BaseURL + currentUserPath
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		req, _ := http.NewRequest("GET", url, nil)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Referer", config.BaseURL+"/activity")
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			slog.Warn("fetch_current_user error", "attempt", attempt, "error", err)
+			if attempt < maxRetries {
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
+			}
+			return nil, &RequestResponseError{
+				Operation:      "fetch_current_user",
+				Method:         req.Method,
+				URL:            url,
+				RequestHeaders: flattenHeaders(req.Header),
+				Err:            err,
+			}
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			slog.Warn("fetch_current_user failed", "attempt", attempt, "status", resp.StatusCode)
+			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
+			}
+			return nil, &RequestResponseError{
+				Operation:       "fetch_current_user",
+				Method:          req.Method,
+				URL:             url,
+				RequestHeaders:  flattenHeaders(req.Header),
+				ResponseStatus:  resp.StatusCode,
+				ResponseHeaders: flattenHeaders(resp.Header),
+				ResponseBody:    string(body),
+				Err:             fmt.Errorf("fetch_current_user failed: status %d", resp.StatusCode),
+			}
+		}
+
+		data, err := parseCurrentUserResponse(body)
+		if err == nil && data != nil {
+			return data, nil
+		}
+		slog.Warn("fetch_current_user could not parse response", "attempt", attempt, "error", err)
+		if attempt < maxRetries {
+			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+			continue
+		}
+		return nil, &RequestResponseError{
+			Operation:       "fetch_current_user_parse",
+			Method:          req.Method,
+			URL:             url,
+			RequestHeaders:  flattenHeaders(req.Header),
+			ResponseStatus:  resp.StatusCode,
+			ResponseHeaders: flattenHeaders(resp.Header),
+			ResponseBody:    string(body),
+			Err:             err,
+		}
+	}
+
+	return nil, fmt.Errorf("fetch_current_user failed after %d attempts", maxRetries)
+}
+
+// parseCurrentUserResponse unwraps the {"data": {...}} envelope. Kept pure so
+// the response contract is unit-testable without a live session.
+func parseCurrentUserResponse(body []byte) (map[string]any, error) {
+	var envelope struct {
+		Data  map[string]any `json:"data"`
+		Error any            `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, fmt.Errorf("current_user response is not json: %w", err)
+	}
+	if envelope.Error != nil {
+		return nil, fmt.Errorf("current_user returned error: %v", envelope.Error)
+	}
+	if len(envelope.Data) == 0 {
+		return nil, fmt.Errorf("current_user response had no data")
+	}
+	return envelope.Data, nil
+}
+
 // FetchActivityData fetches user data including email and privacy toggles.
-// It tries the /activity endpoint first, then falls back to /workspaces/default/observability.
+//
+// Order: the private REST endpoint first, then the legacy server-action paths
+// (/activity, then /workspaces/default/observability) as fallbacks. The legacy
+// paths are retained because they cost nothing when the primary succeeds and
+// they are the only recourse if OpenRouter reverts the migration.
 func FetchActivityData(auth *Auth) (map[string]any, error) {
+	if data, restErr := fetchCurrentUser(auth); restErr == nil && data != nil {
+		return data, nil
+	} else if restErr != nil {
+		slog.Warn("current_user endpoint failed, trying legacy server-action paths", "error", restErr)
+	}
+
 	data, err := fetchUserDataFromEndpoint(auth, "/activity", activityRouterState, "fetch_activity_data")
 	if err == nil && data != nil {
 		return data, nil
