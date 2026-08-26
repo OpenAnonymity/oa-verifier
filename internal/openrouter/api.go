@@ -3,6 +3,7 @@ package openrouter
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,19 +21,23 @@ import (
 )
 
 const (
-	maxRetries = 5
-
-	managementKeysRouterState = "%5B%22%22%2C%7B%22children%22%3A%5B%22(user)%22%2C%7B%22children%22%3A%5B%22settings%22%2C%7B%22children%22%3A%5B%22management-keys%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
-
-	activityRouterState = "%5B%22%22%2C%7B%22children%22%3A%5B%22(user)%22%2C%7B%22children%22%3A%5B%22activity%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
-
-	observabilityPagePath    = "/workspaces/default/observability"
-	observabilityRouterState = "%5B%22%22%2C%7B%22children%22%3A%5B%22(user)%22%2C%7B%22children%22%3A%5B%22(dashboard)%22%2C%7B%22children%22%3A%5B%22workspaces%22%2C%7B%22children%22%3A%5B%5B%22workspaceId%22%2C%22default%22%2C%22d%22%5D%2C%7B%22children%22%3A%5B%22observability%22%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%5D%7D%2Cnull%2Cnull%2Ctrue%5D"
+	currentUserAPIPath        = "/api/frontend/v1/private/users/current"
+	userWorkspacesAPIPath     = "/api/frontend/v1/private/user/workspaces"
+	managementKeysAPIPath     = "/api/frontend/v1/private/management-keys"
+	workspaceAPIKeysAPIPath   = "/api/frontend/v1/private/workspace-api-keys"
+	privacySettingsPagePath   = "/settings/privacy"
+	managementKeysPagePath    = "/settings/management-keys"
+	workspaceSettingsPagePath = "/workspaces/default/settings"
+	maxFrontendResponseBytes  = 4 << 20
+	maxManagementKeyPages     = 200
 )
+
+const maxRetries = 5
 
 var retryCfg = netretry.DefaultConfig(maxRetries)
 
-// RequestResponseError captures full OpenRouter request/response context for failures.
+// RequestResponseError captures OpenRouter request/response metadata for failures.
+// Context deliberately summarizes bodies and redacts credential-bearing headers.
 type RequestResponseError struct {
 	Operation       string
 	Method          string
@@ -71,12 +77,12 @@ func (e *RequestResponseError) Context() map[string]any {
 			"method":  e.Method,
 			"url":     e.URL,
 			"headers": e.RequestHeaders,
-			"body":    e.RequestBody,
+			"body":    safeBodySummary(e.RequestBody),
 		},
 		"openrouter_response": map[string]any{
 			"status_code": e.ResponseStatus,
 			"headers":     e.ResponseHeaders,
-			"body":        e.ResponseBody,
+			"body":        safeBodySummary(e.ResponseBody),
 		},
 	}
 }
@@ -95,28 +101,42 @@ func ErrorContext(err error) map[string]any {
 	return nil
 }
 
+// IsSessionAuthError reports whether OpenRouter explicitly rejected the
+// refreshed browser session. Callers can distinguish this from endpoint/schema
+// drift and upstream failures instead of reporting every verifier error as a
+// bad cookie.
+func IsSessionAuthError(err error) bool {
+	var requestErr *RequestResponseError
+	if !errors.As(err, &requestErr) {
+		return false
+	}
+	return requestErr.ResponseStatus == http.StatusUnauthorized ||
+		requestErr.ResponseStatus == http.StatusForbidden
+}
+
 func flattenHeaders(h http.Header) map[string]string {
 	if h == nil {
 		return map[string]string{}
 	}
 	out := make(map[string]string, len(h))
 	for k, vals := range h {
-		out[k] = strings.Join(vals, ", ")
+		switch strings.ToLower(k) {
+		case "authorization", "cookie", "proxy-authorization", "set-cookie":
+			out[k] = "[REDACTED]"
+		default:
+			out[k] = strings.Join(vals, ", ")
+		}
 	}
 	return out
 }
 
-var (
-	escapedObjectRe = regexp.MustCompile(`\{[^{}]*\\"hash\\":\\"[0-9a-f]{64}\\"[^{}]*\}`)
-	escapedHashRe   = regexp.MustCompile(`\\"hash\\":\\"([0-9a-f]{64})\\"`)
-	escapedNameRe   = regexp.MustCompile(`\\"name\\":\\"([^"\\]+)\\"`)
-	escapedProvRe   = regexp.MustCompile(`\\"is_provisioning_key\\":(true|false)`)
-
-	plainObjectRe = regexp.MustCompile(`\{[^{}]*"hash":"[0-9a-f]{64}"[^{}]*\}`)
-	plainHashRe   = regexp.MustCompile(`"hash":"([0-9a-f]{64})"`)
-	plainNameRe   = regexp.MustCompile(`"name":"([^"]+)"`)
-	plainProvRe   = regexp.MustCompile(`"is_provisioning_key":(true|false)`)
-)
+func safeBodySummary(body string) string {
+	if body == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(body))
+	return fmt.Sprintf("[REDACTED: %d bytes, sha256:%x]", len(body), sum)
+}
 
 // Shared HTTP client with connection pooling
 var httpClient = &http.Client{
@@ -128,36 +148,60 @@ var httpClient = &http.Client{
 	},
 }
 
-// fetchUserDataFromEndpoint fetches user data from a Next.js server component endpoint.
-// Both /activity and /workspaces/default/observability return the same getCurrentUserSA
-// response containing email and privacy toggles.
-func fetchUserDataFromEndpoint(auth *Auth, pagePath, routerState, operation string) (map[string]any, error) {
-	actionHash := auth.GetActionHash("activity")
-	if actionHash == "" {
-		return nil, fmt.Errorf("no activity hash found, available: %v (%s)", auth.GetAllActionHashes(), auth.DiscoveryDiagnostics())
+// frontendBaseURL is replaceable by package tests. Production always uses the
+// attested OpenRouter origin from config.
+var frontendBaseURL = config.BaseURL
+
+// doFrontendJSON calls one of OpenRouter's cookie-authenticated frontend APIs.
+// GET and PATCH requests retry transient failures. POST is deliberately attempted
+// once because retrying an ambiguous management-key creation can orphan keys.
+func doFrontendJSON(auth *Auth, operation, method, path, refererPath string, payload any) ([]byte, error) {
+	var requestBody []byte
+	var err error
+	if payload != nil {
+		requestBody, err = json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("%s: encode request: %w", operation, err)
+		}
 	}
 
-	cookies := auth.GetCookies()
-	reqBody := "[]"
+	attempts := maxRetries
+	if method == http.MethodPost {
+		attempts = 1
+	}
 
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, _ := http.NewRequest("POST", config.BaseURL+pagePath, strings.NewReader(reqBody))
-		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
-		req.Header.Set("Accept", "text/x-component")
-		req.Header.Set("Accept-Encoding", "identity")
-		req.Header.Set("Next-Action", actionHash)
-		req.Header.Set("Next-Router-State-Tree", routerState)
-		req.Header.Set("Origin", config.BaseURL)
-		req.Header.Set("Referer", config.BaseURL+pagePath)
+	client := auth.client
+	if client == nil {
+		client = httpClient
+	}
 
-		for _, c := range cookies {
-			req.AddCookie(c)
+	requestURL := strings.TrimRight(frontendBaseURL, "/") + path
+	for attempt := 1; attempt <= attempts; attempt++ {
+		var bodyReader io.Reader
+		if requestBody != nil {
+			bodyReader = bytes.NewReader(requestBody)
 		}
 
-		resp, err := httpClient.Do(req)
+		req, err := http.NewRequest(method, requestURL, bodyReader)
 		if err != nil {
-			slog.Warn(operation+" error", "attempt", attempt, "path", pagePath, "error", err)
-			if attempt < maxRetries {
+			return nil, fmt.Errorf("%s: build request: %w", operation, err)
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Origin", strings.TrimRight(frontendBaseURL, "/"))
+		if refererPath != "" {
+			req.Header.Set("Referer", strings.TrimRight(frontendBaseURL, "/")+refererPath)
+		}
+		if requestBody != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		for _, cookie := range auth.GetCookies() {
+			req.AddCookie(cookie)
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			slog.Warn(operation+" request failed", "attempt", attempt, "error", err)
+			if attempt < attempts {
 				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 				continue
 			}
@@ -166,772 +210,301 @@ func fetchUserDataFromEndpoint(auth *Auth, pagePath, routerState, operation stri
 				Method:         req.Method,
 				URL:            req.URL.String(),
 				RequestHeaders: flattenHeaders(req.Header),
-				RequestBody:    reqBody,
+				RequestBody:    string(requestBody),
 				Err:            err,
 			}
 		}
 
-		body, _ := io.ReadAll(resp.Body)
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxFrontendResponseBytes+1))
 		resp.Body.Close()
+		finalURL := req.URL.String()
+		if resp.Request != nil && resp.Request.URL != nil {
+			finalURL = resp.Request.URL.String()
+		}
 
-		if resp.StatusCode != 200 {
-			slog.Warn(operation+" failed", "attempt", attempt, "path", pagePath, "status", resp.StatusCode)
-			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
+		if readErr != nil {
+			return nil, &RequestResponseError{
+				Operation:       operation,
+				Method:          req.Method,
+				URL:             finalURL,
+				RequestHeaders:  flattenHeaders(req.Header),
+				RequestBody:     string(requestBody),
+				ResponseStatus:  resp.StatusCode,
+				ResponseHeaders: flattenHeaders(resp.Header),
+				Err:             fmt.Errorf("read response: %w", readErr),
+			}
+		}
+		if len(responseBody) > maxFrontendResponseBytes {
+			return nil, &RequestResponseError{
+				Operation:       operation,
+				Method:          req.Method,
+				URL:             finalURL,
+				RequestHeaders:  flattenHeaders(req.Header),
+				RequestBody:     string(requestBody),
+				ResponseStatus:  resp.StatusCode,
+				ResponseHeaders: flattenHeaders(resp.Header),
+				ResponseBody:    string(responseBody[:maxFrontendResponseBytes]),
+				Err:             fmt.Errorf("response exceeds %d bytes", maxFrontendResponseBytes),
+			}
+		}
+
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			var statusErr error
+			switch resp.StatusCode {
+			case http.StatusUnauthorized, http.StatusForbidden:
+				statusErr = fmt.Errorf("OpenRouter session rejected with status %d", resp.StatusCode)
+			case http.StatusNotFound:
+				statusErr = fmt.Errorf("OpenRouter frontend API contract missing (status 404)")
+			default:
+				statusErr = fmt.Errorf("OpenRouter frontend API returned status %d", resp.StatusCode)
+			}
+			if method != http.MethodPost && netretry.ShouldRetry(resp.StatusCode, nil) && attempt < attempts {
 				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
 				continue
 			}
 			return nil, &RequestResponseError{
 				Operation:       operation,
 				Method:          req.Method,
-				URL:             req.URL.String(),
+				URL:             finalURL,
 				RequestHeaders:  flattenHeaders(req.Header),
-				RequestBody:     reqBody,
+				RequestBody:     string(requestBody),
 				ResponseStatus:  resp.StatusCode,
 				ResponseHeaders: flattenHeaders(resp.Header),
-				ResponseBody:    string(body),
-				Err:             fmt.Errorf("%s failed: status %d", operation, resp.StatusCode),
+				ResponseBody:    string(responseBody),
+				Err:             statusErr,
 			}
 		}
 
-		// Parse response
-		for _, line := range strings.Split(string(body), "\n") {
-			if strings.Contains(line, `{"__kind":"OK"`) || strings.Contains(line, `"email"`) {
-				idx := strings.Index(line, "{")
-				if idx >= 0 {
-					var obj map[string]any
-					if err := json.Unmarshal([]byte(line[idx:]), &obj); err == nil {
-						if obj["__kind"] == "OK" {
-							if data, ok := obj["data"].(map[string]any); ok {
-								return data, nil
-							}
-						}
-						if _, hasEmail := obj["email"]; hasEmail {
-							return obj, nil
-						}
-					}
-				}
-			}
-		}
-
-		slog.Warn(operation+" could not parse response", "attempt", attempt, "path", pagePath)
-		if attempt < maxRetries {
-			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-			continue
-		}
-		return nil, &RequestResponseError{
-			Operation:       operation + "_parse",
-			Method:          req.Method,
-			URL:             req.URL.String(),
-			RequestHeaders:  flattenHeaders(req.Header),
-			RequestBody:     reqBody,
-			ResponseStatus:  resp.StatusCode,
-			ResponseHeaders: flattenHeaders(resp.Header),
-			ResponseBody:    string(body),
-			Err:             fmt.Errorf("%s parse failed", operation),
-		}
-	}
-
-	return nil, fmt.Errorf("%s failed after %d attempts", operation, maxRetries)
-}
-
-// currentUserPath is OpenRouter's private frontend REST endpoint for the
-// signed-in user's account state. As of 2026-08 it replaces the getCurrentUserSA
-// server action, which was removed when OpenRouter migrated their private
-// frontend from Next.js Server Actions to REST + React Query. It returns
-// {"data": {...}} carrying email and the user-scope privacy toggles.
-const currentUserPath = "/api/frontend/v1/private/users/current"
-
-// fetchCurrentUser reads account state from the private frontend REST API.
-//
-// This is strictly preferable to the server-action path it replaces: it needs no
-// action hash, so it removes the dependency on scraping OpenRouter's minified
-// client bundle -- the layer that broke twice in 2026-08 (bundle relocation,
-// then the server-action removal itself).
-func fetchCurrentUser(auth *Auth) (map[string]any, error) {
-	cookies := auth.GetCookies()
-	url := config.BaseURL + currentUserPath
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, _ := http.NewRequest("GET", url, nil)
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Referer", config.BaseURL+"/activity")
-		for _, c := range cookies {
-			req.AddCookie(c)
-		}
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			slog.Warn("fetch_current_user error", "attempt", attempt, "error", err)
-			if attempt < maxRetries {
-				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-				continue
-			}
+		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+		if len(bytes.TrimSpace(responseBody)) > 0 && !strings.Contains(contentType, "application/json") {
 			return nil, &RequestResponseError{
-				Operation:      "fetch_current_user",
-				Method:         req.Method,
-				URL:            url,
-				RequestHeaders: flattenHeaders(req.Header),
-				Err:            err,
-			}
-		}
-
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			slog.Warn("fetch_current_user failed", "attempt", attempt, "status", resp.StatusCode)
-			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
-				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-				continue
-			}
-			return nil, &RequestResponseError{
-				Operation:       "fetch_current_user",
+				Operation:       operation,
 				Method:          req.Method,
-				URL:             url,
+				URL:             finalURL,
 				RequestHeaders:  flattenHeaders(req.Header),
+				RequestBody:     string(requestBody),
 				ResponseStatus:  resp.StatusCode,
 				ResponseHeaders: flattenHeaders(resp.Header),
-				ResponseBody:    string(body),
-				Err:             fmt.Errorf("fetch_current_user failed: status %d", resp.StatusCode),
+				ResponseBody:    string(responseBody),
+				Err:             fmt.Errorf("unexpected content type %q", resp.Header.Get("Content-Type")),
 			}
 		}
 
-		data, err := parseCurrentUserResponse(body)
-		if err == nil && data != nil {
-			return data, nil
-		}
-		slog.Warn("fetch_current_user could not parse response", "attempt", attempt, "error", err)
-		if attempt < maxRetries {
-			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-			continue
-		}
-		return nil, &RequestResponseError{
-			Operation:       "fetch_current_user_parse",
-			Method:          req.Method,
-			URL:             url,
-			RequestHeaders:  flattenHeaders(req.Header),
-			ResponseStatus:  resp.StatusCode,
-			ResponseHeaders: flattenHeaders(resp.Header),
-			ResponseBody:    string(body),
-			Err:             err,
-		}
+		return responseBody, nil
 	}
 
-	return nil, fmt.Errorf("fetch_current_user failed after %d attempts", maxRetries)
+	return nil, fmt.Errorf("%s failed after %d attempts", operation, attempts)
 }
 
-// parseCurrentUserResponse unwraps the {"data": {...}} envelope. Kept pure so
-// the response contract is unit-testable without a live session.
-func parseCurrentUserResponse(body []byte) (map[string]any, error) {
+func decodeDataObject(body []byte, operation string) (map[string]any, error) {
 	var envelope struct {
-		Data  map[string]any `json:"data"`
-		Error any            `json:"error"`
+		Data json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return nil, fmt.Errorf("current_user response is not json: %w", err)
+		return nil, fmt.Errorf("%s: decode response: %w", operation, err)
 	}
-	if envelope.Error != nil {
-		return nil, fmt.Errorf("current_user returned error: %v", envelope.Error)
+	if len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+		return nil, fmt.Errorf("%s: response missing data object", operation)
 	}
-	if len(envelope.Data) == 0 {
-		return nil, fmt.Errorf("current_user response had no data")
+
+	var data map[string]any
+	if err := json.Unmarshal(envelope.Data, &data); err != nil {
+		return nil, fmt.Errorf("%s: decode data object: %w", operation, err)
 	}
-	return envelope.Data, nil
+	if len(data) == 0 {
+		return nil, fmt.Errorf("%s: response data is empty or not an object", operation)
+	}
+	return data, nil
 }
 
-// FetchActivityData fetches user data including email and privacy toggles.
-//
-// Order: the private REST endpoint first, then the legacy server-action paths
-// (/activity, then /workspaces/default/observability) as fallbacks. The legacy
-// paths are retained because they cost nothing when the primary succeeds and
-// they are the only recourse if OpenRouter reverts the migration.
+// FetchActivityData fetches account identity and privacy toggles from the
+// current-user JSON endpoint. It does not depend on Next.js bundle internals.
 func FetchActivityData(auth *Auth) (map[string]any, error) {
-	if data, restErr := fetchCurrentUser(auth); restErr == nil && data != nil {
-		return data, nil
-	} else if restErr != nil {
-		slog.Warn("current_user endpoint failed, trying legacy server-action paths", "error", restErr)
-	}
-
-	data, err := fetchUserDataFromEndpoint(auth, "/activity", activityRouterState, "fetch_activity_data")
-	if err == nil && data != nil {
-		return data, nil
-	}
-
-	slog.Warn("activity endpoint failed, trying observability fallback", "error", err)
-	fallbackData, fallbackErr := fetchUserDataFromEndpoint(auth, observabilityPagePath, observabilityRouterState, "fetch_observability_data")
-	if fallbackErr == nil && fallbackData != nil {
-		slog.Info("observability fallback succeeded")
-		return fallbackData, nil
-	}
-
-	// Return the original activity error since that's the primary endpoint
+	body, err := doFrontendJSON(
+		auth,
+		"fetch_activity_data",
+		http.MethodGet,
+		currentUserAPIPath,
+		privacySettingsPagePath,
+		nil,
+	)
 	if err != nil {
 		return nil, err
 	}
-	return nil, fallbackErr
+	return decodeDataObject(body, "fetch_activity_data")
 }
 
-// FetchWorkspaceData fetches workspace settings from the SSR page response.
-// Workspace-level toggles like is_data_discount_logging_enabled are only available
-// in the workspace data, not in the getCurrentUserSA response.
+// FetchWorkspaceData fetches the station account's default workspace settings.
 func FetchWorkspaceData(auth *Auth) (map[string]any, error) {
-	cookies := auth.GetCookies()
-	pagePath := "/workspaces/default/settings"
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, _ := http.NewRequest("GET", config.BaseURL+pagePath, nil)
-		// Request RSC stream format instead of HTML to get parseable JSON
-		req.Header.Set("RSC", "1")
-		req.Header.Set("Next-Url", pagePath)
-		for _, c := range cookies {
-			req.AddCookie(c)
-		}
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			slog.Warn("fetch_workspace_data error", "attempt", attempt, "error", err)
-			if attempt < maxRetries {
-				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-				continue
-			}
-			return nil, &RequestResponseError{
-				Operation:      "fetch_workspace_data",
-				Method:         req.Method,
-				URL:            req.URL.String(),
-				RequestHeaders: flattenHeaders(req.Header),
-				Err:            err,
-			}
-		}
-
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			slog.Warn("fetch_workspace_data failed", "attempt", attempt, "status", resp.StatusCode)
-			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
-				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-				continue
-			}
-			return nil, &RequestResponseError{
-				Operation:       "fetch_workspace_data",
-				Method:          req.Method,
-				URL:             req.URL.String(),
-				RequestHeaders:  flattenHeaders(req.Header),
-				ResponseStatus:  resp.StatusCode,
-				ResponseHeaders: flattenHeaders(resp.Header),
-				ResponseBody:    string(body),
-				Err:             fmt.Errorf("fetch_workspace_data failed: status %d", resp.StatusCode),
-			}
-		}
-
-		// Parse response - look for workspace data containing slug field.
-		// The response can be RSC stream (line-based) or HTML with embedded data.
-		bodyStr := string(body)
-
-		// Try RSC stream format: lines like 1:{"__kind":"OK","data":{...}}
-		for _, line := range strings.Split(bodyStr, "\n") {
-			if !strings.Contains(line, `"__kind":"OK"`) {
-				continue
-			}
-			idx := strings.Index(line, "{")
-			if idx < 0 {
-				continue
-			}
-			var obj map[string]any
-			if err := json.Unmarshal([]byte(line[idx:]), &obj); err != nil {
-				continue
-			}
-			if obj["__kind"] != "OK" {
-				continue
-			}
-			data, ok := obj["data"].(map[string]any)
-			if !ok {
-				continue
-			}
-			if _, hasSlug := data["slug"]; hasSlug {
-				return data, nil
-			}
-		}
-
-		// Try HTML format: workspace data embedded in script tags as escaped JSON
-		// Pattern: "slug":"default" with is_data_discount_logging_enabled nearby
-		wsRe := regexp.MustCompile(`\{[^{}]*"slug"\s*:\s*"default"[^}]*"is_data_discount_logging_enabled"\s*:\s*(true|false)[^}]*\}`)
-		if m := wsRe.FindString(bodyStr); m != "" {
-			// Unescape if needed
-			unescaped := strings.ReplaceAll(m, `\"`, `"`)
-			var data map[string]any
-			if err := json.Unmarshal([]byte(unescaped), &data); err == nil {
-				if _, hasSlug := data["slug"]; hasSlug {
-					return data, nil
-				}
-			}
-		}
-
-		// Try broader search: find any JSON object with slug and the toggle
-		// The RSC stream may have the data split across push() calls in HTML
-		slugIdx := strings.Index(bodyStr, `"slug":"default"`)
-		if slugIdx < 0 {
-			slugIdx = strings.Index(bodyStr, `\"slug\":\"default\"`)
-		}
-		if slugIdx >= 0 {
-			// Search backward for opening brace, forward for the toggle
-			searchStart := max(0, slugIdx-500)
-			searchEnd := min(len(bodyStr), slugIdx+2000)
-			window := bodyStr[searchStart:searchEnd]
-
-			// Look for the toggle value in this window
-			toggleRe := regexp.MustCompile(`"is_data_discount_logging_enabled"\s*:\s*(true|false)`)
-			escapedToggleRe := regexp.MustCompile(`\\"is_data_discount_logging_enabled\\":\s*(true|false)`)
-			if tm := toggleRe.FindStringSubmatch(window); len(tm) > 1 {
-				slog.Info("found workspace toggle in page data", "is_data_discount_logging_enabled", tm[1])
-				return map[string]any{
-					"slug":                              "default",
-					"is_data_discount_logging_enabled":  tm[1] == "true",
-				}, nil
-			}
-			if tm := escapedToggleRe.FindStringSubmatch(window); len(tm) > 1 {
-				slog.Info("found workspace toggle in escaped page data", "is_data_discount_logging_enabled", tm[1])
-				return map[string]any{
-					"slug":                              "default",
-					"is_data_discount_logging_enabled":  tm[1] == "true",
-				}, nil
-			}
-		}
-
-		slog.Warn("fetch_workspace_data could not parse response", "attempt", attempt)
-		if attempt < maxRetries {
-			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-			continue
-		}
-		return nil, &RequestResponseError{
-			Operation:       "fetch_workspace_data_parse",
-			Method:          req.Method,
-			URL:             req.URL.String(),
-			RequestHeaders:  flattenHeaders(req.Header),
-			ResponseStatus:  resp.StatusCode,
-			ResponseHeaders: flattenHeaders(resp.Header),
-			ResponseBody:    string(body),
-			Err:             fmt.Errorf("fetch_workspace_data parse failed"),
-		}
+	query := url.Values{"scope": []string{"member"}}
+	body, err := doFrontendJSON(
+		auth,
+		"fetch_workspace_data",
+		http.MethodGet,
+		userWorkspacesAPIPath+"?"+query.Encode(),
+		workspaceSettingsPagePath,
+		nil,
+	)
+	if err != nil {
+		return nil, err
 	}
 
-	return nil, fmt.Errorf("fetch_workspace_data failed after %d attempts", maxRetries)
-}
-
-// FetchProvisioningKeys fetches all provisioning keys.
-//
-// Prefers the private REST API, which paginates and so returns the full set.
-// The legacy path below scrapes the settings page and only ever saw the first
-// page of keys, which silently under-reports on accounts with many keys.
-func FetchProvisioningKeys(auth *Auth) ([]map[string]string, error) {
-	if keys, err := fetchProvisioningKeysREST(auth); err == nil {
-		return keys, nil
-	} else {
-		slog.Warn("list provisioning keys via REST failed, trying legacy page scrape", "error", err)
-	}
-
-	cookies := auth.GetCookies()
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, _ := http.NewRequest("GET", config.BaseURL+managementKeysPagePath, nil)
-		for _, c := range cookies {
-			req.AddCookie(c)
-		}
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			slog.Warn("fetch_provisioning_keys error", "attempt", attempt, "path", managementKeysPagePath, "error", err)
-			if attempt < maxRetries {
-				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-				continue
-			}
-			return nil, &RequestResponseError{
-				Operation:      "fetch_provisioning_keys",
-				Method:         req.Method,
-				URL:            req.URL.String(),
-				RequestHeaders: flattenHeaders(req.Header),
-				Err:            err,
-			}
-		}
-
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			slog.Warn("fetch_provisioning_keys failed", "attempt", attempt, "path", managementKeysPagePath, "status", resp.StatusCode)
-			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
-				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-				continue
-			}
-			return nil, &RequestResponseError{
-				Operation:       "fetch_provisioning_keys",
-				Method:          req.Method,
-				URL:             req.URL.String(),
-				RequestHeaders:  flattenHeaders(req.Header),
-				ResponseStatus:  resp.StatusCode,
-				ResponseHeaders: flattenHeaders(resp.Header),
-				ResponseBody:    string(body),
-				Err:             fmt.Errorf("fetch_provisioning_keys failed: status %d", resp.StatusCode),
-			}
-		}
-
-		return parseProvisioningKeysResponse(string(body)), nil
-	}
-
-	return nil, fmt.Errorf("fetch_provisioning_keys failed after %d attempts", maxRetries)
-}
-
-func parseProvisioningKeysResponse(body string) []map[string]string {
-	candidates := parseProvisioningKeyCandidates(body, escapedObjectRe, escapedHashRe, escapedNameRe, escapedProvRe)
-
-	normalized := strings.ReplaceAll(body, `\"`, `"`)
-	candidates = append(candidates, parseProvisioningKeyCandidates(normalized, plainObjectRe, plainHashRe, plainNameRe, plainProvRe)...)
-
-	keys := make([]map[string]string, 0, len(candidates))
-	seen := make(map[string]struct{})
-	for _, key := range candidates {
-		hash := key["hash"]
-		if hash == "" {
-			continue
-		}
-		if _, exists := seen[hash]; exists {
-			continue
-		}
-		seen[hash] = struct{}{}
-		keys = append(keys, key)
-	}
-
-	return keys
-}
-
-func parseProvisioningKeyCandidates(body string, objectRe, hashRe, nameRe, provisioningRe *regexp.Regexp) []map[string]string {
-	objects := objectRe.FindAllString(body, -1)
-	keys := make([]map[string]string, 0, len(objects))
-
-	for _, obj := range objects {
-		hashMatch := hashRe.FindStringSubmatch(obj)
-		if len(hashMatch) < 2 || hashMatch[1] == "" {
-			continue
-		}
-
-		nameMatch := nameRe.FindStringSubmatch(obj)
-		if len(nameMatch) < 2 || nameMatch[1] == "" {
-			continue
-		}
-
-		provisioningMatch := provisioningRe.FindStringSubmatch(obj)
-		if len(provisioningMatch) >= 2 && provisioningMatch[1] != "true" {
-			continue
-		}
-
-		keys = append(keys, map[string]string{
-			"name": nameMatch[1],
-			"hash": hashMatch[1],
-		})
-	}
-
-	return keys
-}
-
-// DeleteProvisioningKey deletes a provisioning key by hash.
-//
-// Prefers the private REST API; the server-action path below is retained as a
-// fallback in case OpenRouter reverts the 2026-08 migration.
-func DeleteProvisioningKey(auth *Auth, keyHash string) error {
-	if err := deleteProvisioningKeyREST(auth, keyHash); err == nil {
-		return nil
-	} else {
-		slog.Warn("delete provisioning key via REST failed, trying legacy server action", "error", err)
-	}
-
-	actionHash := auth.GetActionHash("provisioning_keys_delete")
-	if actionHash == "" {
-		return fmt.Errorf("could not get delete action hash")
-	}
-
-	cookies := auth.GetCookies()
-	payload := fmt.Sprintf(`[%q,{"deleted":true},{"isProvisioningKey":true}]`, keyHash)
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, _ := http.NewRequest("POST", config.BaseURL+managementKeysPagePath, strings.NewReader(payload))
-		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
-		req.Header.Set("Accept", "text/x-component")
-		req.Header.Set("Accept-Encoding", "identity")
-		req.Header.Set("Next-Action", actionHash)
-		req.Header.Set("Next-Router-State-Tree", managementKeysRouterState)
-		req.Header.Set("Origin", config.BaseURL)
-		req.Header.Set("Referer", config.BaseURL+managementKeysPagePath)
-
-		for _, c := range cookies {
-			req.AddCookie(c)
-		}
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			slog.Warn("delete_provisioning_key error", "attempt", attempt, "error", err)
-			if attempt < maxRetries {
-				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-				continue
-			}
-			return &RequestResponseError{
-				Operation:      "delete_provisioning_key",
-				Method:         req.Method,
-				URL:            req.URL.String(),
-				RequestHeaders: flattenHeaders(req.Header),
-				RequestBody:    payload,
-				Err:            err,
-			}
-		}
-
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			slog.Warn("delete_provisioning_key failed", "attempt", attempt, "status", resp.StatusCode)
-			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
-				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-				continue
-			}
-			return &RequestResponseError{
-				Operation:       "delete_provisioning_key",
-				Method:          req.Method,
-				URL:             req.URL.String(),
-				RequestHeaders:  flattenHeaders(req.Header),
-				RequestBody:     payload,
-				ResponseStatus:  resp.StatusCode,
-				ResponseHeaders: flattenHeaders(resp.Header),
-				ResponseBody:    string(body),
-				Err:             fmt.Errorf("delete_provisioning_key failed: status %d", resp.StatusCode),
-			}
-		}
-
-		if strings.Contains(string(body), `"deleted":true`) || strings.Contains(string(body), `"__kind":"OK"`) {
-			slog.Info("deleted provisioning key", "hash", keyHash[:min(16, len(keyHash))])
-			return nil
-		}
-
-		slog.Warn("delete_provisioning_key unexpected response", "attempt", attempt)
-		if attempt < maxRetries {
-			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-			continue
-		}
-		return &RequestResponseError{
-			Operation:       "delete_provisioning_key_parse",
-			Method:          req.Method,
-			URL:             req.URL.String(),
-			RequestHeaders:  flattenHeaders(req.Header),
-			RequestBody:     payload,
-			ResponseStatus:  resp.StatusCode,
-			ResponseHeaders: flattenHeaders(resp.Header),
-			ResponseBody:    string(body),
-			Err:             fmt.Errorf("delete_provisioning_key unexpected response"),
-		}
-	}
-
-	return fmt.Errorf("delete_provisioning_key failed after %d attempts", maxRetries)
-}
-
-// Private frontend REST endpoints for management (provisioning) keys. These
-// replace the createManagementKeySA / updateManagementKeySA server actions
-// OpenRouter removed in 2026-08.
-const (
-	managementKeysListPath = "/api/frontend/v1/private/management-keys"
-	workspaceAPIKeysPath   = "/api/frontend/v1/private/workspace-api-keys"
-
-	// maxManagementKeyPages bounds pagination so a bad total_count can't spin
-	// forever. At 20 keys/page this covers 4000 keys.
-	maxManagementKeyPages = 200
-)
-
-// doJSONRequest performs an authenticated JSON request against the private
-// frontend API with the shared retry policy, returning the raw body.
-func doJSONRequest(auth *Auth, method, path, reqBody, operation string) ([]byte, error) {
-	cookies := auth.GetCookies()
-	url := config.BaseURL + path
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		var bodyReader io.Reader
-		if reqBody != "" {
-			bodyReader = strings.NewReader(reqBody)
-		}
-		req, _ := http.NewRequest(method, url, bodyReader)
-		req.Header.Set("Accept", "application/json")
-		if reqBody != "" {
-			req.Header.Set("Content-Type", "application/json")
-		}
-		req.Header.Set("Origin", config.BaseURL)
-		req.Header.Set("Referer", config.BaseURL+managementKeysPagePath)
-		for _, c := range cookies {
-			req.AddCookie(c)
-		}
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			slog.Warn(operation+" error", "attempt", attempt, "error", err)
-			if attempt < maxRetries {
-				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-				continue
-			}
-			return nil, &RequestResponseError{
-				Operation:      operation,
-				Method:         method,
-				URL:            url,
-				RequestHeaders: flattenHeaders(req.Header),
-				RequestBody:    reqBody,
-				Err:            err,
-			}
-		}
-
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			slog.Warn(operation+" failed", "attempt", attempt, "status", resp.StatusCode)
-			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
-				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-				continue
-			}
-			return nil, &RequestResponseError{
-				Operation:       operation,
-				Method:          method,
-				URL:             url,
-				RequestHeaders:  flattenHeaders(req.Header),
-				RequestBody:     reqBody,
-				ResponseStatus:  resp.StatusCode,
-				ResponseHeaders: flattenHeaders(resp.Header),
-				ResponseBody:    string(body),
-				Err:             fmt.Errorf("%s failed: status %d", operation, resp.StatusCode),
-			}
-		}
-
-		return body, nil
-	}
-
-	return nil, fmt.Errorf("%s failed after %d attempts", operation, maxRetries)
-}
-
-// parseManagementKeysPage extracts one page of management keys. Exposed as a
-// pure function so the response contract is testable without a live session.
-func parseManagementKeysPage(body []byte) (keys []map[string]string, totalCount int, err error) {
 	var envelope struct {
-		Data struct {
-			Keys []struct {
-				Hash string `json:"hash"`
-				Name string `json:"name"`
-			} `json:"keys"`
-			TotalCount int `json:"total_count"`
-		} `json:"data"`
-		Error any `json:"error"`
+		Data               []map[string]any `json:"data"`
+		ActiveWorkspaceID  string           `json:"active_workspace_id"`
+		DefaultWorkspaceID string           `json:"default_workspace_id"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return nil, 0, fmt.Errorf("management_keys response is not json: %w", err)
+		return nil, fmt.Errorf("fetch_workspace_data: decode response: %w", err)
 	}
-	if envelope.Error != nil {
-		return nil, 0, fmt.Errorf("management_keys returned error: %v", envelope.Error)
+	if envelope.DefaultWorkspaceID == "" {
+		return nil, fmt.Errorf("fetch_workspace_data: response missing default_workspace_id")
 	}
-	for _, k := range envelope.Data.Keys {
-		if k.Hash == "" {
-			continue
+
+	for _, workspace := range envelope.Data {
+		if id, _ := workspace["id"].(string); id == envelope.DefaultWorkspaceID {
+			return workspace, nil
 		}
-		keys = append(keys, map[string]string{"hash": k.Hash, "name": k.Name})
 	}
-	return keys, envelope.Data.TotalCount, nil
+
+	return nil, fmt.Errorf(
+		"fetch_workspace_data: default workspace %q absent from %d memberships",
+		envelope.DefaultWorkspaceID,
+		len(envelope.Data),
+	)
 }
 
-// fetchProvisioningKeysREST lists every management key, following pagination.
-//
-// Paging matters for correctness, not just completeness: CleanupProvisioningKeys
-// deletes keys whose name matches a station label, so a partial listing would
-// silently leave that station's keys alive on the operator's account.
-func fetchProvisioningKeysREST(auth *Auth) ([]map[string]string, error) {
-	var all []map[string]string
+type managementKeyMetadata struct {
+	Hash    string `json:"hash"`
+	Name    string `json:"name"`
+	Deleted bool   `json:"deleted"`
+}
+
+func parseManagementKeysPage(body []byte) ([]managementKeyMetadata, int, error) {
+	var envelope struct {
+		Data *struct {
+			Keys       *[]managementKeyMetadata `json:"keys"`
+			TotalCount *int                     `json:"total_count"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, 0, fmt.Errorf("fetch_provisioning_keys: decode response: %w", err)
+	}
+	if envelope.Data == nil || envelope.Data.Keys == nil || envelope.Data.TotalCount == nil {
+		return nil, 0, fmt.Errorf("fetch_provisioning_keys: response missing data.keys or data.total_count")
+	}
+	if *envelope.Data.TotalCount < 0 {
+		return nil, 0, fmt.Errorf("fetch_provisioning_keys: response has negative data.total_count")
+	}
+	return *envelope.Data.Keys, *envelope.Data.TotalCount, nil
+}
+
+// FetchProvisioningKeys fetches every account management/provisioning key.
+// OpenRouter paginates this endpoint, so cleanup must follow all pages or it can
+// silently leave an older same-label verifier key behind.
+func FetchProvisioningKeys(auth *Auth) ([]map[string]string, error) {
+	keys := make([]map[string]string, 0)
 	seen := make(map[string]struct{})
 
 	for page := 1; page <= maxManagementKeyPages; page++ {
-		body, err := doJSONRequest(auth, "GET",
-			fmt.Sprintf("%s?page=%d", managementKeysListPath, page), "",
-			"fetch_provisioning_keys_rest")
+		query := url.Values{"page": []string{strconv.Itoa(page)}}
+		body, err := doFrontendJSON(
+			auth,
+			"fetch_provisioning_keys",
+			http.MethodGet,
+			managementKeysAPIPath+"?"+query.Encode(),
+			managementKeysPagePath,
+			nil,
+		)
 		if err != nil {
 			return nil, err
 		}
 
-		keys, totalCount, err := parseManagementKeysPage(body)
+		pageKeys, totalCount, err := parseManagementKeysPage(body)
 		if err != nil {
 			return nil, err
 		}
-		if len(keys) == 0 {
-			break
+		if len(pageKeys) == 0 {
+			if len(seen) >= totalCount {
+				return keys, nil
+			}
+			return nil, fmt.Errorf(
+				"fetch_provisioning_keys: pagination ended after %d of %d keys",
+				len(seen),
+				totalCount,
+			)
 		}
-		for _, k := range keys {
-			if _, dup := seen[k["hash"]]; dup {
+
+		added := 0
+		for _, key := range pageKeys {
+			if key.Hash == "" {
 				continue
 			}
-			seen[k["hash"]] = struct{}{}
-			all = append(all, k)
+			if _, exists := seen[key.Hash]; exists {
+				continue
+			}
+			seen[key.Hash] = struct{}{}
+			added++
+			if key.Deleted || key.Name == "" {
+				continue
+			}
+			keys = append(keys, map[string]string{
+				"name": key.Name,
+				"hash": key.Hash,
+			})
 		}
-		if totalCount > 0 && len(all) >= totalCount {
-			break
+		if len(seen) >= totalCount {
+			return keys, nil
+		}
+		if added == 0 {
+			return nil, fmt.Errorf(
+				"fetch_provisioning_keys: page %d made no progress after %d of %d keys",
+				page,
+				len(seen),
+				totalCount,
+			)
 		}
 	}
 
-	return all, nil
+	return nil, fmt.Errorf("fetch_provisioning_keys: exceeded %d pages", maxManagementKeyPages)
 }
 
-// createProvisioningKeyREST creates a management key and returns its secret.
-func createProvisioningKeyREST(auth *Auth, label string) (string, error) {
-	reqBody, err := json.Marshal(map[string]string{"name": label})
-	if err != nil {
-		return "", err
+var managementKeyHashRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// DeleteProvisioningKey deletes a management/provisioning key by hash.
+func DeleteProvisioningKey(auth *Auth, keyHash string) error {
+	if !managementKeyHashRe.MatchString(keyHash) {
+		return fmt.Errorf("delete_provisioning_key: invalid key hash")
 	}
 
-	body, err := doJSONRequest(auth, "POST", workspaceAPIKeysPath+"/management",
-		string(reqBody), "create_provisioning_key_rest")
-	if err != nil {
-		return "", err
+	payload := map[string]any{
+		"payload": map[string]bool{"deleted": true},
+		"opts":    map[string]bool{"is_provisioning_key": true},
 	}
-
-	var envelope struct {
-		Data struct {
-			Key string `json:"key"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		return "", fmt.Errorf("create_provisioning_key response is not json: %w", err)
-	}
-	if !strings.HasPrefix(envelope.Data.Key, "sk-or-") {
-		return "", fmt.Errorf("create_provisioning_key response had no sk-or- key")
-	}
-
-	slog.Info("created provisioning key", "key", envelope.Data.Key[:20])
-	return envelope.Data.Key, nil
-}
-
-// deleteProvisioningKeyREST soft-deletes a management key.
-//
-// The opts flag is required and must be snake_case: the endpoint answers 403
-// for opts:{} or opts:{"isProvisioningKey":true}, and only accepts
-// {"is_provisioning_key":true} for a management key.
-func deleteProvisioningKeyREST(auth *Auth, keyHash string) error {
-	reqBody := `{"payload":{"deleted":true},"opts":{"is_provisioning_key":true}}`
-
-	body, err := doJSONRequest(auth, "PATCH",
-		workspaceAPIKeysPath+"/"+url.PathEscape(keyHash), reqBody,
-		"delete_provisioning_key_rest")
+	body, err := doFrontendJSON(
+		auth,
+		"delete_provisioning_key",
+		http.MethodPatch,
+		workspaceAPIKeysAPIPath+"/"+url.PathEscape(keyHash),
+		managementKeysPagePath,
+		payload,
+	)
 	if err != nil {
 		return err
 	}
 
 	var envelope struct {
-		Data struct {
-			Deleted bool `json:"deleted"`
+		Data *struct {
+			Deleted *bool `json:"deleted"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return fmt.Errorf("delete_provisioning_key response is not json: %w", err)
+		return fmt.Errorf("delete_provisioning_key: decode response: %w", err)
 	}
-	if !envelope.Data.Deleted {
-		return fmt.Errorf("delete_provisioning_key did not report deleted")
+	if envelope.Data == nil || envelope.Data.Deleted == nil || !*envelope.Data.Deleted {
+		return fmt.Errorf("delete_provisioning_key: response did not confirm deletion")
 	}
+	slog.Info("deleted provisioning key")
 	return nil
 }
 
@@ -1008,115 +581,73 @@ func CleanupProvisioningKeys(auth *Auth, label string) (int, error) {
 	return deleted, nil
 }
 
-// CreateProvisioningKey creates a new provisioning key and returns it.
-//
-// Prefers the private REST API; the server-action path below is retained as a
-// fallback in case OpenRouter reverts the 2026-08 migration.
+// CreateProvisioningKey creates a new management/provisioning key and returns
+// its plaintext value. OpenRouter only returns the plaintext once.
 func CreateProvisioningKey(auth *Auth, label string) (string, error) {
-	if key, err := createProvisioningKeyREST(auth, label); err == nil {
-		return key, nil
-	} else {
-		slog.Warn("create provisioning key via REST failed, trying legacy server action", "error", err)
+	if strings.TrimSpace(label) == "" {
+		return "", fmt.Errorf("create_provisioning_key: label is required")
 	}
 
-	actionHash := auth.GetActionHash("provisioning_keys_create")
-	if actionHash == "" {
-		return "", fmt.Errorf("could not get create action hash, available: %v", auth.GetAllActionHashes())
+	body, err := doFrontendJSON(
+		auth,
+		"create_provisioning_key",
+		http.MethodPost,
+		workspaceAPIKeysAPIPath+"/management",
+		managementKeysPagePath,
+		map[string]string{"name": label},
+	)
+	if err != nil {
+		var requestErr *RequestResponseError
+		if errors.As(err, &requestErr) &&
+			requestErr.ResponseStatus >= http.StatusBadRequest &&
+			requestErr.ResponseStatus < http.StatusInternalServerError {
+			return "", err
+		}
+		return "", reconcileAmbiguousCreate(auth, label, err)
 	}
 
-	cookies := auth.GetCookies()
-	payload := fmt.Sprintf(`[{"name":%q}]`, label)
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		req, _ := http.NewRequest("POST", config.BaseURL+managementKeysPagePath, strings.NewReader(payload))
-		req.Header.Set("Content-Type", "text/plain;charset=UTF-8")
-		req.Header.Set("Accept", "text/x-component")
-		req.Header.Set("Accept-Encoding", "identity")
-		req.Header.Set("Next-Action", actionHash)
-		req.Header.Set("Next-Router-State-Tree", managementKeysRouterState)
-		req.Header.Set("Origin", config.BaseURL)
-		req.Header.Set("Referer", config.BaseURL+managementKeysPagePath)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-
-		for _, c := range cookies {
-			req.AddCookie(c)
-		}
-
-		resp, err := httpClient.Do(req)
-		if err != nil {
-			slog.Warn("create_provisioning_key error", "attempt", attempt, "error", err)
-			if attempt < maxRetries {
-				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-				continue
-			}
-			return "", &RequestResponseError{
-				Operation:      "create_provisioning_key",
-				Method:         req.Method,
-				URL:            req.URL.String(),
-				RequestHeaders: flattenHeaders(req.Header),
-				RequestBody:    payload,
-				Err:            err,
-			}
-		}
-
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			slog.Warn("create_provisioning_key failed", "attempt", attempt, "status", resp.StatusCode)
-			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
-				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-				continue
-			}
-			return "", &RequestResponseError{
-				Operation:       "create_provisioning_key",
-				Method:          req.Method,
-				URL:             req.URL.String(),
-				RequestHeaders:  flattenHeaders(req.Header),
-				RequestBody:     payload,
-				ResponseStatus:  resp.StatusCode,
-				ResponseHeaders: flattenHeaders(resp.Header),
-				ResponseBody:    string(body),
-				Err:             fmt.Errorf("create_provisioning_key failed: status %d", resp.StatusCode),
-			}
-		}
-
-		for _, line := range strings.Split(string(body), "\n") {
-			idx := strings.Index(line, "{")
-			if idx >= 0 {
-				var obj map[string]any
-				if err := json.Unmarshal([]byte(line[idx:]), &obj); err == nil {
-					if obj["__kind"] == "OK" {
-						if data, ok := obj["data"].(map[string]any); ok {
-							if key, ok := data["key"].(string); ok && strings.HasPrefix(key, "sk-or-") {
-								slog.Info("created provisioning key", "key", key[:20])
-								return key, nil
-							}
-						}
-					}
-				}
-			}
-		}
-
-		slog.Warn("create_provisioning_key could not parse key from response", "attempt", attempt)
-		if attempt < maxRetries {
-			_ = netretry.Sleep(context.Background(), attempt, retryCfg)
-			continue
-		}
-		return "", &RequestResponseError{
-			Operation:       "create_provisioning_key_parse",
-			Method:          req.Method,
-			URL:             req.URL.String(),
-			RequestHeaders:  flattenHeaders(req.Header),
-			RequestBody:     payload,
-			ResponseStatus:  resp.StatusCode,
-			ResponseHeaders: flattenHeaders(resp.Header),
-			ResponseBody:    string(body),
-			Err:             fmt.Errorf("create_provisioning_key parse failed"),
-		}
+	var envelope struct {
+		Data *struct {
+			Key string `json:"key"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return "", reconcileAmbiguousCreate(
+			auth,
+			label,
+			fmt.Errorf("create_provisioning_key: decode response: %w", err),
+		)
+	}
+	if envelope.Data == nil || !strings.HasPrefix(envelope.Data.Key, "sk-or-") {
+		return "", reconcileAmbiguousCreate(
+			auth,
+			label,
+			fmt.Errorf("create_provisioning_key: response missing a valid key"),
+		)
 	}
 
-	return "", fmt.Errorf("create_provisioning_key failed after %d attempts", maxRetries)
+	return envelope.Data.Key, nil
+}
+
+// reconcileAmbiguousCreate removes a same-label key that may have been created
+// when OpenRouter accepted the POST but the response was lost or malformed.
+func reconcileAmbiguousCreate(auth *Auth, label string, createErr error) error {
+	deleted, cleanupErr := CleanupProvisioningKeys(auth, label)
+	if cleanupErr != nil {
+		return fmt.Errorf(
+			"create_provisioning_key was ambiguous and orphan cleanup failed: %v: %w",
+			cleanupErr,
+			createErr,
+		)
+	}
+	if deleted > 0 {
+		return fmt.Errorf(
+			"create_provisioning_key response was ambiguous; cleaned up %d possible orphan(s): %w",
+			deleted,
+			createErr,
+		)
+	}
+	return createErr
 }
 
 // OwnershipCheckResult describes the ownership check outcome.

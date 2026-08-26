@@ -192,6 +192,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	data, err := openrouter.FetchActivityData(auth)
 	if err != nil || data == nil {
 		errDetail := "empty_activity_payload"
+		statusCode, clientMessage := classifyOpenRouterReadFailure(err)
 		if err != nil {
 			errDetail = err.Error()
 		}
@@ -206,7 +207,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 			event:                   "register_activity_fetch_failed",
 			publicKey:               req.PublicKey,
 			reason:                  "failed_to_fetch_activity",
-			statusCode:              http.StatusUnauthorized,
+			statusCode:              statusCode,
 			errorDetail:             errDetail,
 			operation:               "activity_fetch",
 			consecutiveFailureCount: count,
@@ -215,7 +216,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		slog.Warn("registration rejected: failed to fetch activity data",
 			"pk", req.PublicKey[:16],
 			"display_name", req.DisplayName)
-		writeError(w, http.StatusUnauthorized, "Failed to verify cookie")
+		writeError(w, statusCode, clientMessage)
 		return
 	}
 	s.clearOpFailure(registerIdentity, "activity_fetch")
@@ -309,9 +310,26 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// Fetch workspace data for workspace-level toggles
 	wsData, wsErr := openrouter.FetchWorkspaceData(auth)
 	if wsErr != nil {
-		slog.Warn("registration: workspace data fetch failed, checking with user data only",
+		statusCode, clientMessage := classifyOpenRouterReadFailure(wsErr)
+		count := s.incOpFailure(registerIdentity, "workspace_fetch")
+		s.notifyOrgEvent(orgEvent{
+			event:                   "register_workspace_fetch_failed",
+			stationID:               stationID,
+			publicKey:               req.PublicKey,
+			email:                   email,
+			reason:                  "failed_to_fetch_workspace",
+			statusCode:              statusCode,
+			errorDetail:             wsErr.Error(),
+			operation:               "workspace_fetch",
+			consecutiveFailureCount: count,
+			details:                 openrouterErrorDetails(wsErr),
+		})
+		slog.Warn("registration rejected: workspace data fetch failed",
 			"email", email, "error", wsErr)
+		writeError(w, statusCode, clientMessage)
+		return
 	}
+	s.clearOpFailure(registerIdentity, "workspace_fetch")
 
 	// Verify privacy toggles immediately (merged user + workspace data)
 	toggleResult, toggleDetails := challenge.CheckPrivacyToggles(mergeToggleData(data, wsData))
@@ -435,8 +453,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		provisioningKey = key
 		slog.Info("created provisioning key",
 			"station_id", stationID,
-			"label", label,
-			"key_prefix", provisioningKey[:min(20, len(provisioningKey))])
+			"label", label)
 	} else {
 		slog.Info("using existing provisioning key", "station_id", stationID)
 	}

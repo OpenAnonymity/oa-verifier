@@ -166,6 +166,7 @@ func (s *Server) challengeOneStation(_ context.Context, pk string, station model
 				unregisterOperation = "activity_fetch"
 				transientEvent = "verification_activity_fetch_failed"
 				transientOperation = "activity_fetch"
+				transientStatusCode, _ = classifyOpenRouterReadFailure(err)
 				if err != nil {
 					unregisterDetail = err.Error()
 					transientDetails = openrouterErrorDetails(err)
@@ -176,33 +177,43 @@ func (s *Server) challengeOneStation(_ context.Context, pk string, station model
 				// are only available from the workspace settings endpoint.
 				wsData, wsErr := openrouter.FetchWorkspaceData(auth)
 				if wsErr != nil {
-					slog.Warn("workspace data fetch failed, checking with user data only", "station_id", stationID, "error", wsErr)
-				}
-				mergedData := mergeToggleData(activityData, wsData)
+					reason = "workspace_fetch_failed"
+					transientFailure = true
+					unregisterReason = "workspace_fetch_failed"
+					unregisterDetail = wsErr.Error()
+					unregisterOperation = "workspace_fetch"
+					transientEvent = "verification_workspace_fetch_failed"
+					transientOperation = "workspace_fetch"
+					transientStatusCode, _ = classifyOpenRouterReadFailure(wsErr)
+					transientDetails = openrouterErrorDetails(wsErr)
+					slog.Warn("workspace data fetch failed", "station_id", stationID, "error", wsErr)
+				} else {
+					mergedData := mergeToggleData(activityData, wsData)
 
-				toggleResult, toggleDetails := challenge.CheckPrivacyToggles(mergedData)
-				switch toggleResult {
-				case challenge.ToggleOK:
-					passed = true
-				case challenge.ToggleInvalid:
-					reason = fmt.Sprintf("privacy_toggles_invalid:[%s]", strings.Join(toggleDetails, ","))
-					slog.Error("station failed privacy toggle check", "station_id", stationID, "toggles", toggleDetails)
-				case challenge.ToggleMissing:
-					reason = fmt.Sprintf("privacy_toggles_missing:[%s]", strings.Join(toggleDetails, ","))
-					transientFailure = true
-					unregisterReason = "privacy_toggles_missing"
-					unregisterDetail = strings.Join(toggleDetails, ",")
-					unregisterOperation = "privacy_toggle_check"
-					transientEvent = "verification_privacy_toggles_missing"
-					transientOperation = "privacy_toggle_check"
-				case challenge.ToggleUnparseable:
-					reason = fmt.Sprintf("privacy_toggles_unparseable:[%s]", strings.Join(toggleDetails, ","))
-					transientFailure = true
-					unregisterReason = "privacy_toggles_unparseable"
-					unregisterDetail = strings.Join(toggleDetails, ",")
-					unregisterOperation = "privacy_toggle_check"
-					transientEvent = "verification_privacy_toggles_unparseable"
-					transientOperation = "privacy_toggle_check"
+					toggleResult, toggleDetails := challenge.CheckPrivacyToggles(mergedData)
+					switch toggleResult {
+					case challenge.ToggleOK:
+						passed = true
+					case challenge.ToggleInvalid:
+						reason = fmt.Sprintf("privacy_toggles_invalid:[%s]", strings.Join(toggleDetails, ","))
+						slog.Error("station failed privacy toggle check", "station_id", stationID, "toggles", toggleDetails)
+					case challenge.ToggleMissing:
+						reason = fmt.Sprintf("privacy_toggles_missing:[%s]", strings.Join(toggleDetails, ","))
+						transientFailure = true
+						unregisterReason = "privacy_toggles_missing"
+						unregisterDetail = strings.Join(toggleDetails, ",")
+						unregisterOperation = "privacy_toggle_check"
+						transientEvent = "verification_privacy_toggles_missing"
+						transientOperation = "privacy_toggle_check"
+					case challenge.ToggleUnparseable:
+						reason = fmt.Sprintf("privacy_toggles_unparseable:[%s]", strings.Join(toggleDetails, ","))
+						transientFailure = true
+						unregisterReason = "privacy_toggles_unparseable"
+						unregisterDetail = strings.Join(toggleDetails, ",")
+						unregisterOperation = "privacy_toggle_check"
+						transientEvent = "verification_privacy_toggles_unparseable"
+						transientOperation = "privacy_toggle_check"
+					}
 				}
 			}
 		}

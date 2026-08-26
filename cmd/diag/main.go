@@ -1,7 +1,8 @@
-// Diagnostic tool: test privacy toggle verification with raw cookies.
+// Diagnostic tool: test privacy toggle verification with an OpenRouter session.
 //
 // Usage:
-//   OR_COOKIES='<raw Cookie header>' go run cmd/diag/main.go
+//
+//	OR_COOKIES='<raw Cookie header>' go run ./cmd/diag
 //
 // The cookie header can be copied from browser DevTools Network tab.
 package main
@@ -22,8 +23,8 @@ func main() {
 	jsonCreds := os.Getenv("OR_CREDS")
 	if rawCookies == "" && jsonCreds == "" {
 		fmt.Println("Usage:")
-		fmt.Println("  OR_COOKIES='<raw Cookie header>' go run cmd/diag/main.go")
-		fmt.Println("  OR_CREDS='{\"client_token\":\"...\",\"session_id\":\"...\",\"client_uat\":\"...\"}' go run cmd/diag/main.go")
+		fmt.Println("  OR_COOKIES='<raw Cookie header>' go run ./cmd/diag")
+		fmt.Println("  OR_CREDS='{\"client_token\":\"...\",\"session_id\":\"...\",\"client_uat\":\"...\",\"org_id\":\"...\"}' go run ./cmd/diag")
 		os.Exit(1)
 	}
 
@@ -37,20 +38,18 @@ func main() {
 			ClientToken string `json:"client_token"`
 			ClientUAT   string `json:"client_uat"`
 			SessionID   string `json:"session_id"`
+			OrgID       string `json:"org_id"`
 		}
 		if e := json.Unmarshal([]byte(jsonCreds), &creds); e != nil {
 			fmt.Printf("Failed to parse OR_CREDS JSON: %v\n", e)
 			os.Exit(1)
 		}
-		fmt.Printf("Session ID: %s\n", creds.SessionID)
-		fmt.Printf("Client token: %s...\n", creds.ClientToken[:min(30, len(creds.ClientToken))])
-
 		// Build structured cookie data for NewAuthFromCookieData
 		cookieData := map[string]any{
 			"cookies": []any{
 				map[string]any{"name": "__client", "value": creds.ClientToken, "domain": "clerk.openrouter.ai"},
 				map[string]any{"name": "__client_uat", "value": creds.ClientUAT, "domain": "openrouter.ai"},
-				map[string]any{"name": "clerk_active_context", "value": creds.SessionID + ":", "domain": "openrouter.ai"},
+				map[string]any{"name": "clerk_active_context", "value": creds.SessionID + ":" + creds.OrgID, "domain": "openrouter.ai"},
 			},
 		}
 		auth, err = openrouter.NewAuthFromCookieData(cookieData)
@@ -67,7 +66,6 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("Authentication successful!")
-	fmt.Printf("Action hashes: %v\n", auth.GetAllActionHashes())
 
 	fmt.Println("\n=== Step 2: Fetch Activity Data ===")
 	data, err := openrouter.FetchActivityData(auth)
@@ -87,16 +85,13 @@ func main() {
 	}
 
 	fmt.Println("Activity data fetched successfully!")
-	pretty, _ := json.MarshalIndent(data, "", "  ")
-	fmt.Printf("\nUser data:\n%s\n", string(pretty))
 
 	fmt.Println("\n=== Step 2b: Fetch Workspace Data ===")
 	wsData, wsErr := openrouter.FetchWorkspaceData(auth)
 	if wsErr != nil {
 		fmt.Printf("Workspace data fetch failed: %v\n", wsErr)
 	} else if wsData != nil {
-		wsPretty, _ := json.MarshalIndent(wsData, "", "  ")
-		fmt.Printf("Workspace data:\n%s\n", string(wsPretty))
+		fmt.Println("Workspace data fetched successfully!")
 	}
 
 	// Merge user + workspace data for toggle checking
@@ -140,10 +135,6 @@ func main() {
 		}
 		fmt.Printf("  %-40s %s\n", name, status)
 	}
-
-	// List all boolean-like fields in merged response
-	fmt.Println("\nAll boolean fields (merged):")
-	listBoolFields(merged, "")
 }
 
 func findToggleValue(data map[string]any, name string) (bool, bool) {
@@ -182,25 +173,4 @@ func searchMap(data map[string]any, target, prefix string) (bool, bool) {
 		}
 	}
 	return false, false
-}
-
-func listBoolFields(data map[string]any, prefix string) {
-	for k, v := range data {
-		path := k
-		if prefix != "" {
-			path = prefix + "." + k
-		}
-		switch t := v.(type) {
-		case bool:
-			fmt.Printf("  %s = %v\n", path, t)
-		case map[string]any:
-			listBoolFields(t, path)
-		case []any:
-			for i, item := range t {
-				if m, ok := item.(map[string]any); ok {
-					listBoolFields(m, fmt.Sprintf("%s[%d]", path, i))
-				}
-			}
-		}
-	}
 }
