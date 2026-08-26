@@ -68,6 +68,10 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
+      - name: Run Go tests
+        if: steps.should-build.outputs.build == 'true'
+        run: nix develop --command go test ./...
+
       - name: Build container with Nix (reproducible)
         if: steps.should-build.outputs.build == 'true'
         id: build

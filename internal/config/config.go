@@ -75,10 +75,11 @@ const (
 //     improvement in exchange for a 1% usage discount. Must be false so
 //     user data is not used for training or product enhancement. This
 //     replaced the former enable_logging field. Note: this is a workspace-
-//     level setting fetched from workspace data, not from getCurrentUserSA.
+//     level setting fetched from the default workspace response, not the
+//     current-user response.
 //     Ref: https://openrouter.ai/docs/guides/privacy/data-collection
 
-// UserRequiredToggles are checked against getCurrentUserSA response.
+// UserRequiredToggles are checked against the authenticated current-user API.
 //
 // Removed 2026-04-27: `always_enforce_allowed` (model-allowlist enforcement).
 // OpenRouter retired the field — confirmed zero references in the public

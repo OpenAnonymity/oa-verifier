@@ -1,6 +1,10 @@
 package server
 
-import "github.com/openanonymity/oa-verifier/internal/openrouter"
+import (
+	"net/http"
+
+	"github.com/openanonymity/oa-verifier/internal/openrouter"
+)
 
 func openrouterErrorDetails(err error) map[string]any {
 	ctx := openrouter.ErrorContext(err)
@@ -8,6 +12,13 @@ func openrouterErrorDetails(err error) map[string]any {
 		return nil
 	}
 	return ctx
+}
+
+func classifyOpenRouterReadFailure(err error) (int, string) {
+	if openrouter.IsSessionAuthError(err) {
+		return http.StatusUnauthorized, "Failed to verify cookie"
+	}
+	return http.StatusBadGateway, "Unable to fetch OpenRouter verification data"
 }
 
 func openrouterOwnershipDetails(result openrouter.OwnershipCheckResult) map[string]any {
