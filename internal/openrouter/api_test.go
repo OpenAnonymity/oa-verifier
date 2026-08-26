@@ -78,3 +78,73 @@ func TestParseCurrentUserResponse_Rejects(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Management-key REST contract
+//
+// Regression guard for the 2026-08-25 migration: createManagementKeySA /
+// updateManagementKeySA were removed. Shapes below are real responses from
+// /api/frontend/v1/private/management-keys, with hashes redacted.
+// ---------------------------------------------------------------------------
+
+func TestParseManagementKeysPage_OK(t *testing.T) {
+	body := `{"data":{"keys":[
+	  {"hash":"aaa","name":"key-watchdog-v2-station-x","label":"sk-or-v1-2f1...628","expires_at":null,"disabled":false},
+	  {"hash":"bbb","name":"other","label":"sk-or-v1-a9a...e37","expires_at":null,"disabled":false}
+	],"total_count":164}}`
+
+	keys, total, err := parseManagementKeysPage([]byte(body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if total != 164 {
+		t.Errorf("total_count = %d, want 164", total)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("got %d keys, want 2", len(keys))
+	}
+	// CleanupProvisioningKeys matches on "name" and deletes by "hash"; both must
+	// survive the parse or cleanup silently no-ops.
+	if keys[0]["hash"] != "aaa" || keys[0]["name"] != "key-watchdog-v2-station-x" {
+		t.Errorf("first key = %v", keys[0])
+	}
+}
+
+func TestParseManagementKeysPage_SkipsHashlessEntries(t *testing.T) {
+	// A key with no hash cannot be deleted, so it must not enter the list and
+	// give cleanup a target it will fail on.
+	body := `{"data":{"keys":[{"hash":"","name":"broken"},{"hash":"ccc","name":"ok"}],"total_count":2}}`
+	keys, _, err := parseManagementKeysPage([]byte(body))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(keys) != 1 || keys[0]["hash"] != "ccc" {
+		t.Errorf("got %v, want only the hashed entry", keys)
+	}
+}
+
+func TestParseManagementKeysPage_Rejects(t *testing.T) {
+	cases := []struct{ name, body string }{
+		{"error envelope", `{"error":{"message":"Forbidden","code":403}}`},
+		{"html", `<!DOCTYPE html><html></html>`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := parseManagementKeysPage([]byte(tc.body)); err == nil {
+				t.Errorf("expected error for %s", tc.name)
+			}
+		})
+	}
+}
+
+func TestParseManagementKeysPage_EmptyPageTerminatesPaging(t *testing.T) {
+	// fetchProvisioningKeysREST stops on an empty page; that must parse cleanly
+	// rather than erroring, or pagination would abort mid-listing.
+	keys, total, err := parseManagementKeysPage([]byte(`{"data":{"keys":[],"total_count":40}}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(keys) != 0 || total != 40 {
+		t.Errorf("keys=%v total=%d", keys, total)
+	}
+}

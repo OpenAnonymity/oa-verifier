@@ -519,7 +519,17 @@ func FetchWorkspaceData(auth *Auth) (map[string]any, error) {
 }
 
 // FetchProvisioningKeys fetches all provisioning keys.
+//
+// Prefers the private REST API, which paginates and so returns the full set.
+// The legacy path below scrapes the settings page and only ever saw the first
+// page of keys, which silently under-reports on accounts with many keys.
 func FetchProvisioningKeys(auth *Auth) ([]map[string]string, error) {
+	if keys, err := fetchProvisioningKeysREST(auth); err == nil {
+		return keys, nil
+	} else {
+		slog.Warn("list provisioning keys via REST failed, trying legacy page scrape", "error", err)
+	}
+
 	cookies := auth.GetCookies()
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
@@ -624,7 +634,16 @@ func parseProvisioningKeyCandidates(body string, objectRe, hashRe, nameRe, provi
 }
 
 // DeleteProvisioningKey deletes a provisioning key by hash.
+//
+// Prefers the private REST API; the server-action path below is retained as a
+// fallback in case OpenRouter reverts the 2026-08 migration.
 func DeleteProvisioningKey(auth *Auth, keyHash string) error {
+	if err := deleteProvisioningKeyREST(auth, keyHash); err == nil {
+		return nil
+	} else {
+		slog.Warn("delete provisioning key via REST failed, trying legacy server action", "error", err)
+	}
+
 	actionHash := auth.GetActionHash("provisioning_keys_delete")
 	if actionHash == "" {
 		return fmt.Errorf("could not get delete action hash")
@@ -712,6 +731,210 @@ func DeleteProvisioningKey(auth *Auth, keyHash string) error {
 	return fmt.Errorf("delete_provisioning_key failed after %d attempts", maxRetries)
 }
 
+// Private frontend REST endpoints for management (provisioning) keys. These
+// replace the createManagementKeySA / updateManagementKeySA server actions
+// OpenRouter removed in 2026-08.
+const (
+	managementKeysListPath = "/api/frontend/v1/private/management-keys"
+	workspaceAPIKeysPath   = "/api/frontend/v1/private/workspace-api-keys"
+
+	// maxManagementKeyPages bounds pagination so a bad total_count can't spin
+	// forever. At 20 keys/page this covers 4000 keys.
+	maxManagementKeyPages = 200
+)
+
+// doJSONRequest performs an authenticated JSON request against the private
+// frontend API with the shared retry policy, returning the raw body.
+func doJSONRequest(auth *Auth, method, path, reqBody, operation string) ([]byte, error) {
+	cookies := auth.GetCookies()
+	url := config.BaseURL + path
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		var bodyReader io.Reader
+		if reqBody != "" {
+			bodyReader = strings.NewReader(reqBody)
+		}
+		req, _ := http.NewRequest(method, url, bodyReader)
+		req.Header.Set("Accept", "application/json")
+		if reqBody != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req.Header.Set("Origin", config.BaseURL)
+		req.Header.Set("Referer", config.BaseURL+managementKeysPagePath)
+		for _, c := range cookies {
+			req.AddCookie(c)
+		}
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			slog.Warn(operation+" error", "attempt", attempt, "error", err)
+			if attempt < maxRetries {
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
+			}
+			return nil, &RequestResponseError{
+				Operation:      operation,
+				Method:         method,
+				URL:            url,
+				RequestHeaders: flattenHeaders(req.Header),
+				RequestBody:    reqBody,
+				Err:            err,
+			}
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			slog.Warn(operation+" failed", "attempt", attempt, "status", resp.StatusCode)
+			if netretry.ShouldRetry(resp.StatusCode, nil) && attempt < maxRetries {
+				_ = netretry.Sleep(context.Background(), attempt, retryCfg)
+				continue
+			}
+			return nil, &RequestResponseError{
+				Operation:       operation,
+				Method:          method,
+				URL:             url,
+				RequestHeaders:  flattenHeaders(req.Header),
+				RequestBody:     reqBody,
+				ResponseStatus:  resp.StatusCode,
+				ResponseHeaders: flattenHeaders(resp.Header),
+				ResponseBody:    string(body),
+				Err:             fmt.Errorf("%s failed: status %d", operation, resp.StatusCode),
+			}
+		}
+
+		return body, nil
+	}
+
+	return nil, fmt.Errorf("%s failed after %d attempts", operation, maxRetries)
+}
+
+// parseManagementKeysPage extracts one page of management keys. Exposed as a
+// pure function so the response contract is testable without a live session.
+func parseManagementKeysPage(body []byte) (keys []map[string]string, totalCount int, err error) {
+	var envelope struct {
+		Data struct {
+			Keys []struct {
+				Hash string `json:"hash"`
+				Name string `json:"name"`
+			} `json:"keys"`
+			TotalCount int `json:"total_count"`
+		} `json:"data"`
+		Error any `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, 0, fmt.Errorf("management_keys response is not json: %w", err)
+	}
+	if envelope.Error != nil {
+		return nil, 0, fmt.Errorf("management_keys returned error: %v", envelope.Error)
+	}
+	for _, k := range envelope.Data.Keys {
+		if k.Hash == "" {
+			continue
+		}
+		keys = append(keys, map[string]string{"hash": k.Hash, "name": k.Name})
+	}
+	return keys, envelope.Data.TotalCount, nil
+}
+
+// fetchProvisioningKeysREST lists every management key, following pagination.
+//
+// Paging matters for correctness, not just completeness: CleanupProvisioningKeys
+// deletes keys whose name matches a station label, so a partial listing would
+// silently leave that station's keys alive on the operator's account.
+func fetchProvisioningKeysREST(auth *Auth) ([]map[string]string, error) {
+	var all []map[string]string
+	seen := make(map[string]struct{})
+
+	for page := 1; page <= maxManagementKeyPages; page++ {
+		body, err := doJSONRequest(auth, "GET",
+			fmt.Sprintf("%s?page=%d", managementKeysListPath, page), "",
+			"fetch_provisioning_keys_rest")
+		if err != nil {
+			return nil, err
+		}
+
+		keys, totalCount, err := parseManagementKeysPage(body)
+		if err != nil {
+			return nil, err
+		}
+		if len(keys) == 0 {
+			break
+		}
+		for _, k := range keys {
+			if _, dup := seen[k["hash"]]; dup {
+				continue
+			}
+			seen[k["hash"]] = struct{}{}
+			all = append(all, k)
+		}
+		if totalCount > 0 && len(all) >= totalCount {
+			break
+		}
+	}
+
+	return all, nil
+}
+
+// createProvisioningKeyREST creates a management key and returns its secret.
+func createProvisioningKeyREST(auth *Auth, label string) (string, error) {
+	reqBody, err := json.Marshal(map[string]string{"name": label})
+	if err != nil {
+		return "", err
+	}
+
+	body, err := doJSONRequest(auth, "POST", workspaceAPIKeysPath+"/management",
+		string(reqBody), "create_provisioning_key_rest")
+	if err != nil {
+		return "", err
+	}
+
+	var envelope struct {
+		Data struct {
+			Key string `json:"key"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return "", fmt.Errorf("create_provisioning_key response is not json: %w", err)
+	}
+	if !strings.HasPrefix(envelope.Data.Key, "sk-or-") {
+		return "", fmt.Errorf("create_provisioning_key response had no sk-or- key")
+	}
+
+	slog.Info("created provisioning key", "key", envelope.Data.Key[:20])
+	return envelope.Data.Key, nil
+}
+
+// deleteProvisioningKeyREST soft-deletes a management key.
+//
+// The opts flag is required and must be snake_case: the endpoint answers 403
+// for opts:{} or opts:{"isProvisioningKey":true}, and only accepts
+// {"is_provisioning_key":true} for a management key.
+func deleteProvisioningKeyREST(auth *Auth, keyHash string) error {
+	reqBody := `{"payload":{"deleted":true},"opts":{"is_provisioning_key":true}}`
+
+	body, err := doJSONRequest(auth, "PATCH",
+		workspaceAPIKeysPath+"/"+url.PathEscape(keyHash), reqBody,
+		"delete_provisioning_key_rest")
+	if err != nil {
+		return err
+	}
+
+	var envelope struct {
+		Data struct {
+			Deleted bool `json:"deleted"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return fmt.Errorf("delete_provisioning_key response is not json: %w", err)
+	}
+	if !envelope.Data.Deleted {
+		return fmt.Errorf("delete_provisioning_key did not report deleted")
+	}
+	return nil
+}
+
 // CleanupOperationError identifies the failing operation in provisioning-key cleanup.
 type CleanupOperationError struct {
 	Operation string
@@ -786,7 +1009,16 @@ func CleanupProvisioningKeys(auth *Auth, label string) (int, error) {
 }
 
 // CreateProvisioningKey creates a new provisioning key and returns it.
+//
+// Prefers the private REST API; the server-action path below is retained as a
+// fallback in case OpenRouter reverts the 2026-08 migration.
 func CreateProvisioningKey(auth *Auth, label string) (string, error) {
+	if key, err := createProvisioningKeyREST(auth, label); err == nil {
+		return key, nil
+	} else {
+		slog.Warn("create provisioning key via REST failed, trying legacy server action", "error", err)
+	}
+
 	actionHash := auth.GetActionHash("provisioning_keys_create")
 	if actionHash == "" {
 		return "", fmt.Errorf("could not get create action hash, available: %v", auth.GetAllActionHashes())
