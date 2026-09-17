@@ -40,7 +40,7 @@ if isinstance(runtime.get('client-payload'), dict): runtime = runtime['client-pa
 if runtime.get('nonce') != nonce: raise RuntimeError('Attestation freshness nonce mismatch')
 if claims.get('x-ms-sevsnpvm-is-debuggable') is not False:
     raise RuntimeError('Confidential VM debug-disabled claim missing or false')
-if claims.get('x-ms-attestation-type') != 'sevsnpvm' or claims.get('x-ms-compliance-status') != 'azure-compliant-cvm':
+if claims.get('x-ms-attestation-type') != 'sevsnpvm' or claims.get('x-ms-compliance-status') != 'azure-compliant-uvm':
     raise RuntimeError('Expected Azure compliant confidential VM attestation')
 policy_hash = hashlib.sha256(base64.b64decode(attestation['policy']['base64'])).hexdigest()
 if policy_hash != record['policy_sha256'] or claims.get('x-ms-sevsnpvm-hostdata') != policy_hash:
