@@ -1,6 +1,12 @@
 name: Deploy isolated production verifier
 on:
   workflow_dispatch:
+    inputs:
+      operation:
+        type: choice
+        options: [diagnostics, deploy]
+        default: diagnostics
+        required: true
 permissions:
   contents: read
   packages: write
@@ -19,7 +25,7 @@ env:
   IMAGE_NAME: oa-verifier-production-20260917
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/codex/oa-verifier-production-20260917'
+    if: github.ref == 'refs/heads/codex/oa-verifier-production-20260917' && inputs.operation == 'deploy'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     environment: oa-production-20260917
@@ -118,3 +124,26 @@ jobs:
       - name: Remove private deployment inputs
         if: always()
         run: python3 automation/deploy/production/isolated.py cleanup
+  diagnostics:
+    if: github.ref == 'refs/heads/codex/oa-verifier-production-20260917' && inputs.operation == 'diagnostics'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: oa-production-20260917
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Read only isolated-container diagnostic categories
+        env:
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          PRODUCTION_REGISTRY_SECRET: ${{ secrets.PRODUCTION_REGISTRY_SECRET }}
+          CF_DNS_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        run: python3 deploy/production/diagnostics.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: isolated-verifier-diagnostics-${{ github.run_id }}
+          path: diagnostic-summary.json
+          retention-days: 7
