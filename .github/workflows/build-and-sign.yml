@@ -259,8 +259,14 @@ jobs:
           
           # Create deployment template - credentials depend on registry
           if [ "$USE_GHCR" = "true" ]; then
-            # GHCR - use GitHub token (or no creds for public)
-            CREDS_JSON='[{"server": "${{ env.GHCR_REGISTRY }}", "username": "${{ github.actor }}", "password": "${{ secrets.GITHUB_TOKEN }}"}]'
+            # GHCR - the image is public, so pull anonymously. Do NOT store
+            # GITHUB_TOKEN here: it is job-scoped and is revoked as soon as this
+            # workflow finishes, but ACI keeps it as the group's permanent pull
+            # credential. Whenever the platform later repairs/re-creates the group
+            # it re-pulls the image with that dead token, the pull never succeeds,
+            # both containers sit in "Waiting" and the group fails with
+            # DeploymentTimeout after 30 minutes (outages of 2026-09-25/27/28).
+            CREDS_JSON='[]'
           else
             # ACR - use ACR credentials
             CREDS_JSON='[{"server": "${{ env.ACR_REGISTRY }}", "username": "${{ secrets.ACR_USERNAME }}", "password": "${{ secrets.ACR_PASSWORD }}"}]'
