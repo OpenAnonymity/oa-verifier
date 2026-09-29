@@ -48,6 +48,11 @@ type Store interface {
    is never replaced by a self-signed one.** Self-signed remains only for the
    case where there is nothing valid at all, exactly as before.
 
+`store.Load` errors other than "not found" (for example the SKR sidecar still
+attesting when the verifier starts) are retried per `acme.LoadRetryPolicy`
+(default 6 attempts, 10 s apart, context-aware) before falling through to
+issuance, so a slow sidecar does not re-issue a certificate on every restart.
+
 The renewal loop (`acme.StartRenewalLoop`) creates its ACME client lazily from
 the bundle's account key, saves the renewed bundle to the store and swaps the
 live certificate under the existing mutex.

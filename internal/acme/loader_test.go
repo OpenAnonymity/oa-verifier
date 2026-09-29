@@ -63,15 +63,24 @@ type memStore struct {
 	mu      sync.Mutex
 	bundle  *certstore.Bundle
 	loadErr error
-	saveErr error
-	saves   int
+	// loadErrTimes > 0 makes loadErr transient: only the first loadErrTimes
+	// Load calls fail. Zero means every Load fails.
+	loadErrTimes int
+	saveErr      error
+	saves        int
+	loads        int
 }
 
 func (m *memStore) Load(context.Context) (*certstore.Bundle, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.loads++
 	if m.loadErr != nil {
-		return nil, m.loadErr
+		if m.loadErrTimes > 0 && m.loads > m.loadErrTimes {
+			// transient: succeed after loadErrTimes failures
+		} else {
+			return nil, m.loadErr
+		}
 	}
 	if m.bundle == nil {
 		return nil, certstore.ErrNotFound
@@ -242,6 +251,9 @@ func TestLoadOrObtain_CAMismatchDoesNotReuseAccount(t *testing.T) {
 
 func TestLoadOrObtain_StoreErrorsAreNonFatal(t *testing.T) {
 	fresh := makeBundle(t, testDomain, testNow.Add(90*24*time.Hour), lego.LEDirectoryProduction)
+	saved := LoadRetryPolicy
+	LoadRetryPolicy.Delay = 0
+	t.Cleanup(func() { LoadRetryPolicy = saved })
 
 	// Load error (e.g. key release failed) -> obtain without account reuse.
 	store := &memStore{loadErr: errors.New("skr: HTTP 403")}
@@ -357,5 +369,46 @@ func TestRetryObtain(t *testing.T) {
 	_, err = retryObtain(ctx, slow, func() (bundleObtainer, error) { return nil, errors.New("register failed") })
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+func TestLoadOrObtain_TransientLoadErrorIsRetried(t *testing.T) {
+	saved := LoadRetryPolicy
+	LoadRetryPolicy = struct {
+		Attempts int
+		Delay    time.Duration
+	}{Attempts: 4, Delay: 0}
+	t.Cleanup(func() { LoadRetryPolicy = saved })
+
+	// The SKR sidecar is not up for the first two calls, then the persisted
+	// bundle loads: no issuance must happen.
+	valid := makeBundle(t, testDomain, testNow.Add(60*24*time.Hour), lego.LEDirectoryProduction)
+	store := &memStore{bundle: valid, loadErr: errors.New("dial tcp 127.0.0.1:8080: connection refused"), loadErrTimes: 2}
+	ob := &fakeObtainer{err: errors.New("must not be called")}
+	got, src, err := LoadOrObtain(context.Background(), prodCfg(), store, ob.fn, fixedNow)
+	if err != nil || src != SourcePersisted || got != valid {
+		t.Fatalf("src=%q err=%v", src, err)
+	}
+	if store.loads != 3 || ob.calls != 0 {
+		t.Fatalf("loads=%d obtains=%d, want 3 and 0", store.loads, ob.calls)
+	}
+
+	// Exhausting the attempts falls through to issuance (old behaviour).
+	store = &memStore{bundle: valid, loadErr: errors.New("connection refused")}
+	fresh := makeBundle(t, testDomain, testNow.Add(90*24*time.Hour), lego.LEDirectoryProduction)
+	ob = &fakeObtainer{result: fresh}
+	_, src, err = LoadOrObtain(context.Background(), prodCfg(), store, ob.fn, fixedNow)
+	if err != nil || src != SourceObtained || store.loads != 4 || ob.calls != 1 {
+		t.Fatalf("src=%q err=%v loads=%d obtains=%d", src, err, store.loads, ob.calls)
+	}
+
+	// A cancelled context aborts the retry loop instead of issuing.
+	LoadRetryPolicy.Delay = time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	store = &memStore{bundle: valid, loadErr: errors.New("connection refused")}
+	ob = &fakeObtainer{result: fresh}
+	if _, _, err := LoadOrObtain(ctx, prodCfg(), store, ob.fn, fixedNow); !errors.Is(err, context.Canceled) || ob.calls != 0 {
+		t.Fatalf("err=%v obtains=%d, want context.Canceled and 0", err, ob.calls)
 	}
 }

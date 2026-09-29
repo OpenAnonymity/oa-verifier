@@ -77,7 +77,10 @@ func LoadOrObtain(ctx context.Context, cfg *Config, store certstore.Store, obtai
 	}
 	caDir := cfg.CADirURL()
 
-	stored, err := store.Load(ctx)
+	stored, err := loadWithRetry(ctx, cfg.Domain, store)
+	if ctx.Err() != nil {
+		return nil, "", ctx.Err()
+	}
 	switch {
 	case err == nil:
 		if cerr := CheckBundle(stored, cfg.Domain, caDir, now(), RenewBefore); cerr == nil {
@@ -127,6 +130,39 @@ func LoadOrObtain(ctx context.Context, cfg *Config, store certstore.Store, obtai
 		}
 	}
 	return nil, "", oerr
+}
+
+// LoadRetryPolicy bounds the retries LoadOrObtain makes when store.Load fails
+// with something other than certstore.ErrNotFound. In Confidential ACI the
+// verifier and the SKR sidecar start together and the sidecar needs a few
+// seconds to attest, so the first key release at start-up can be refused;
+// giving up immediately would re-issue a certificate on every restart, which
+// is exactly the rate-limit failure persistence exists to prevent.
+var LoadRetryPolicy = struct {
+	Attempts int
+	Delay    time.Duration
+}{Attempts: 6, Delay: 10 * time.Second}
+
+// loadWithRetry calls store.Load, retrying transient errors per
+// LoadRetryPolicy. ErrNotFound and context cancellation return immediately.
+func loadWithRetry(ctx context.Context, domain string, store certstore.Store) (*certstore.Bundle, error) {
+	attempts := LoadRetryPolicy.Attempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	var err error
+	for attempt := 1; ; attempt++ {
+		var b *certstore.Bundle
+		b, err = store.Load(ctx)
+		if err == nil || errors.Is(err, certstore.ErrNotFound) || attempt >= attempts {
+			return b, err
+		}
+		slog.Warn("loading persisted TLS certificate failed, retrying",
+			"domain", domain, "attempt", attempt, "max_attempts", attempts, "error", err)
+		if werr := sleepCtx(ctx, LoadRetryPolicy.Delay); werr != nil {
+			return nil, werr
+		}
+	}
 }
 
 // RetryPolicy controls NewRetryingObtainer.
