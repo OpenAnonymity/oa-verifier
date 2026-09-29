@@ -110,8 +110,11 @@ Proof: "This exact code is running in an isolated enclave"
 
 ## Development
 
-Toolchain: Go 1.24 or newer (`go.mod` declares `go 1.22.0` as the minimum
-language version; the Nix build and CI use Go 1.24 from nixpkgs `nixos-25.05`).
+Toolchain: `go.mod` declares Go 1.22.0 as the minimum language version.
+This rollout retains the existing nixos-24.05 lock and toolchain. The Go 1.24
+upgrade is deferred to a separate change with a generated, committed lock
+and a verified container build; this does not resolve the older toolchain's
+support status.
 
 ```bash
 # Build server
@@ -129,17 +132,17 @@ go vet ./... && go test -race ./...
 
 ### Reproducible Build (Nix)
 
-`flake.nix` pins nixpkgs `nixos-25.05` and builds with `buildGo124Module`;
-`flake.lock` pins the exact nixpkgs revision. After changing the nixpkgs
-input, run `nix flake update nixpkgs` and commit `flake.lock`, or the build
-floats to the branch tip and stops being reproducible.
+`flake.nix` and `flake.lock` agree on nixpkgs `nixos-24.05`; the lock pins
+its exact revision. CI uses `--no-update-lock-file` for both development
+shells and builds so an inconsistent lock fails instead of silently floating.
+Change the input and regenerate/commit the lock together when upgrading.
 `vendorHash` covers the vendored module tree (derived from `go.mod`/`go.sum`),
 not the toolchain, so it only changes when dependencies change; on a mismatch
 the build fails and prints the expected hash.
 
 ```bash
 # Build container with deterministic hash
-nix build .#container
+nix build --no-update-lock-file .#container
 
 # Load and inspect
 docker load < result

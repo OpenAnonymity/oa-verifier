@@ -1,7 +1,8 @@
 name: Self-Heal Container Group
 
 # Watches the production container group and re-runs the deploy workflow when the
-# group is gone, has failed, or has a container that is not Running.
+# group is gone or has explicitly failed. Repairing/Creating/Waiting are observed
+# without redeploying: a platform repair must be allowed to finish.
 #
 # Why this exists: in September 2026 the platform repaired (moved) the group ~24h
 # after every deploy, and each repair left the group in DeploymentTimeout with no IP
@@ -29,11 +30,6 @@ env:
   RESOURCE_GROUP: oa-verifier
   CONTAINER_NAME: oa-verifier-2
   DEPLOY_WORKFLOW: build-and-sign.yml
-  # Number of samples and the spacing between them. A container must be
-  # non-Running in EVERY sample before we call it unhealthy, so a normal restart or
-  # a deploy that is still settling does not trigger a redeploy.
-  SAMPLES: '3'
-  SAMPLE_INTERVAL_SECONDS: '30'
   # Do not redispatch the deploy while its most recent run failed less than this long ago.
   FAILED_DEPLOY_BACKOFF_SECONDS: '10800'
 
@@ -43,14 +39,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Skip if a deploy is already queued or running
         id: inflight
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          IN_PROGRESS=$(gh run list --workflow "$DEPLOY_WORKFLOW" --status in_progress --json databaseId --jq 'length')
-          QUEUED=$(gh run list --workflow "$DEPLOY_WORKFLOW" --status queued --json databaseId --jq 'length')
+          IN_PROGRESS=$(gh run list --workflow "$DEPLOY_WORKFLOW" --branch main --status in_progress --json databaseId --jq 'length')
+          QUEUED=$(gh run list --workflow "$DEPLOY_WORKFLOW" --branch main --status queued --json databaseId --jq 'length')
           echo "in_progress=$IN_PROGRESS queued=$QUEUED"
           if [ "${IN_PROGRESS:-0}" -gt 0 ] || [ "${QUEUED:-0}" -gt 0 ]; then
             echo "inflight=true" >> "$GITHUB_OUTPUT"
@@ -65,15 +65,14 @@ jobs:
           # Backoff: if the most recent deploy run (any trigger) failed less than
           # FAILED_DEPLOY_BACKOFF_SECONDS ago, do not dispatch another one. A deploy that
           # fails outright leaves the group missing, and re-running it every 15 minutes
-          # would loop on the same error while burning one Let's Encrypt issuance (plus one
-          # for the recovery test) per attempt against the 5-per-week duplicate limit.
-          LAST=$(gh run list --workflow "$DEPLOY_WORKFLOW" --limit 1 --json conclusion,createdAt,url --jq '.[0] // empty')
+          # would loop on the same error while burning one Let's Encrypt issuance per attempt against the 5-per-week duplicate limit.
+          LAST=$(gh run list --workflow "$DEPLOY_WORKFLOW" --branch main --limit 50 --json conclusion,updatedAt,url,event --jq '[.[] | select(.event == "push" or .event == "workflow_dispatch")][0] // empty')
           if [ -n "$LAST" ]; then
             LAST_CONCLUSION=$(echo "$LAST" | jq -r '.conclusion // ""')
-            LAST_CREATED=$(echo "$LAST" | jq -r '.createdAt // ""')
+            LAST_COMPLETED=$(echo "$LAST" | jq -r '.updatedAt // ""')
             LAST_URL=$(echo "$LAST" | jq -r '.url // ""')
-            if [ "$LAST_CONCLUSION" = "failure" ] && [ -n "$LAST_CREATED" ]; then
-              AGE=$(( $(date -u +%s) - $(date -u -d "$LAST_CREATED" +%s) ))
+            if [[ "$LAST_CONCLUSION" =~ ^(failure|timed_out|cancelled)$ ]] && [ -n "$LAST_COMPLETED" ]; then
+              AGE=$(( $(date -u +%s) - $(date -u -d "$LAST_COMPLETED" +%s) ))
               if [ "$AGE" -lt "$FAILED_DEPLOY_BACKOFF_SECONDS" ]; then
                 echo "::warning title=Self-heal backoff::The last deploy failed ${AGE}s ago ($LAST_URL); not redeploying until it is ${FAILED_DEPLOY_BACKOFF_SECONDS}s old. Fix the deploy or run it manually."
                 echo "inflight=true" >> "$GITHUB_OUTPUT"
@@ -97,85 +96,7 @@ jobs:
       - name: Inspect container group
         if: steps.inflight.outputs.inflight != 'true'
         id: inspect
-        run: |
-          # Each sample: does the group exist, what is provisioningState, and which
-          # containers are not Running. A container counts as unhealthy only if it is
-          # non-Running in all samples; missing group or provisioningState=Failed
-          # trigger immediately (those do not recover on their own).
-          NEEDS_HEAL=false
-          REASON=""
-          declare -A NOT_RUNNING_COUNT
-          declare -A LAST_STATE
-          LAST_PROV=""
-          SAMPLE_LOG=""
-
-          for i in $(seq 1 "$SAMPLES"); do
-            if ! GROUP=$(az container show --name "$CONTAINER_NAME" --resource-group "$RESOURCE_GROUP" -o json 2>/tmp/az-err.txt); then
-              if grep -qi "ResourceNotFound\|could not be found\|NotFound" /tmp/az-err.txt; then
-                NEEDS_HEAL=true
-                REASON="container group $CONTAINER_NAME does not exist in resource group $RESOURCE_GROUP"
-                SAMPLE_LOG="${SAMPLE_LOG}- sample $i: group missing\n"
-                break
-              fi
-              echo "az container show failed (not a NotFound):"
-              cat /tmp/az-err.txt
-              exit 1
-            fi
-
-            LAST_PROV=$(echo "$GROUP" | jq -r '.provisioningState // "unknown"')
-            IP=$(echo "$GROUP" | jq -r '.ipAddress.ip // "none"')
-            SAMPLE_LOG="${SAMPLE_LOG}- sample $i: provisioningState=$LAST_PROV ip=$IP"
-
-            if [ "$LAST_PROV" = "Failed" ]; then
-              NEEDS_HEAL=true
-              REASON="provisioningState is Failed"
-              SAMPLE_LOG="${SAMPLE_LOG}\n"
-              break
-            fi
-
-            while IFS=$'\t' read -r NAME STATE DETAIL; do
-              [ -z "$NAME" ] && continue
-              LAST_STATE["$NAME"]="$STATE ($DETAIL)"
-              SAMPLE_LOG="${SAMPLE_LOG} $NAME=$STATE"
-              if [ "$STATE" != "Running" ]; then
-                NOT_RUNNING_COUNT["$NAME"]=$(( ${NOT_RUNNING_COUNT["$NAME"]:-0} + 1 ))
-              fi
-            done < <(echo "$GROUP" | jq -r '.containers[] | [.name, (.instanceView.currentState.state // "unknown"), (.instanceView.currentState.detailStatus // "")] | @tsv')
-            SAMPLE_LOG="${SAMPLE_LOG}\n"
-
-            CONTAINER_COUNT=$(echo "$GROUP" | jq -r '.containers | length')
-            if [ "$CONTAINER_COUNT" -lt 2 ]; then
-              NEEDS_HEAL=true
-              REASON="group has $CONTAINER_COUNT container(s), expected 2"
-              break
-            fi
-
-            if [ "$i" -lt "$SAMPLES" ]; then
-              sleep "$SAMPLE_INTERVAL_SECONDS"
-            fi
-          done
-
-          if [ "$NEEDS_HEAL" != "true" ]; then
-            for NAME in "${!NOT_RUNNING_COUNT[@]}"; do
-              if [ "${NOT_RUNNING_COUNT[$NAME]}" -ge "$SAMPLES" ]; then
-                NEEDS_HEAL=true
-                REASON="container $NAME was not Running in all $SAMPLES samples (last: ${LAST_STATE[$NAME]})"
-                break
-              fi
-            done
-          fi
-
-          printf 'Samples:\n%b' "$SAMPLE_LOG"
-          echo "needs_heal=$NEEDS_HEAL"
-          echo "reason=$REASON"
-          echo "needs_heal=$NEEDS_HEAL" >> "$GITHUB_OUTPUT"
-          echo "reason=$REASON" >> "$GITHUB_OUTPUT"
-          echo "provisioning_state=$LAST_PROV" >> "$GITHUB_OUTPUT"
-          {
-            echo "sample_log<<SAMPLES_EOF"
-            printf '%b' "$SAMPLE_LOG"
-            echo "SAMPLES_EOF"
-          } >> "$GITHUB_OUTPUT"
+        run: python3 scripts/self_heal.py
 
       - name: Trigger redeploy
         if: steps.inflight.outputs.inflight != 'true' && steps.inspect.outputs.needs_heal == 'true'
@@ -187,8 +108,8 @@ jobs:
         run: |
           # Re-check right before dispatching: another self-heal run or a push may have
           # started a deploy while we were sampling.
-          IN_PROGRESS=$(gh run list --workflow "$DEPLOY_WORKFLOW" --status in_progress --json databaseId --jq 'length')
-          QUEUED=$(gh run list --workflow "$DEPLOY_WORKFLOW" --status queued --json databaseId --jq 'length')
+          IN_PROGRESS=$(gh run list --workflow "$DEPLOY_WORKFLOW" --branch main --status in_progress --json databaseId --jq 'length')
+          QUEUED=$(gh run list --workflow "$DEPLOY_WORKFLOW" --branch main --status queued --json databaseId --jq 'length')
           if [ "${IN_PROGRESS:-0}" -gt 0 ] || [ "${QUEUED:-0}" -gt 0 ]; then
             echo "A deploy started while sampling; not dispatching another."
             echo "dispatched=false" >> "$GITHUB_OUTPUT"
@@ -206,19 +127,19 @@ jobs:
           REASON: ${{ steps.inspect.outputs.reason }}
           PROV: ${{ steps.inspect.outputs.provisioning_state }}
           SAMPLE_LOG: ${{ steps.inspect.outputs.sample_log }}
-          TRIGGER_OUTCOME: ${{ steps.trigger.outcome }}
+          DISPATCHED: ${{ steps.trigger.outputs.dispatched }}
         run: |
           {
-            if [ "$NEEDS_HEAL" = "true" ]; then
+            if [ "$DISPATCHED" = "true" ]; then
               echo "## Self-heal: redeploy triggered"
               echo ""
               echo "**Reason:** $REASON"
               echo ""
-              echo "Dispatched \`$DEPLOY_WORKFLOW\` on \`main\` (outcome: ${TRIGGER_OUTCOME:-n/a}). It rebuilds, regenerates the CCE policy, re-creates the group with durable pull credentials and runs the restart recovery test."
+              echo "Dispatched \`$DEPLOY_WORKFLOW\` on \`main\`. It rebuilds, regenerates the CCE policy and re-creates the group with durable pull credentials. The optional restart test is not requested."
             elif [ -n "$NEEDS_HEAL" ]; then
-              echo "## Self-heal: healthy"
+              echo "## Self-heal: no redeploy dispatched"
               echo ""
-              echo "provisioningState=\`$PROV\`, both containers Running in every sample. Nothing to do."
+              echo "provisioningState=\`$PROV\`. Only an explicitly Failed or missing group is eligible. See the inspection result; no claim of endpoint health is made."
             else
               echo "## Self-heal: check did not complete"
               echo ""

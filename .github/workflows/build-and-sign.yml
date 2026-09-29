@@ -7,6 +7,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      run_recovery_test:
+        description: 'Restart after this deployment to validate recovery (extra certificate issuance and station reauthentication may be required)'
+        type: boolean
+        required: false
+        default: false
 
 env:
   GHCR_REGISTRY: ghcr.io
@@ -32,6 +38,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Test deployment safeguards
+        run: python3 -m unittest discover -s tests/deployment -p 'test_*.py'
 
       - name: Check for code changes
         id: changes
@@ -74,14 +83,14 @@ jobs:
 
       - name: Run Go tests
         if: steps.should-build.outputs.build == 'true'
-        run: nix develop --command go test ./...
+        run: nix develop --no-update-lock-file --command go test ./...
 
       - name: Build container with Nix (reproducible)
         if: steps.should-build.outputs.build == 'true'
         id: build
         run: |
           echo "Building container with Nix..."
-          nix build .#container --print-build-logs
+          nix build --no-update-lock-file .#container --print-build-logs
           
           # Load the image into Docker
           docker load < result
@@ -680,23 +689,22 @@ jobs:
           echo "Waiting for container to start..."
           sleep 90
 
-      # Post-deploy recovery test. `az container restart` stops and re-creates every
-      # container in the group; on the Confidential SKU that means a fresh UVM and a fresh
-      # pull of BOTH images using only what is stored on the group (imageRegistryCredentials
-      # / identity) -- the same path a platform-initiated repair takes, and the path that
-      # failed for 30 minutes and then gave up on 2026-09-25/27/28. If the group cannot
-      # survive a restart now, it will not survive the next repair either, so fail the
-      # deploy here instead of discovering it at 03:00.
+      # Optional post-deploy recovery test. Restart once during a chosen validation
+      # deployment. Running containers prove process recovery; Azure Pulling/Pulled
+      # events are needed separately to prove image downloads. Also observe a repair
+      # after the workflow job ends to rule out dependence on its temporary token.
       #
       # Trade-off: the app re-issues its Let's Encrypt certificate on every start (no
       # persistent volume), so this restart costs one extra issuance per deploy against
       # the 5-per-week duplicate-certificate limit. Set repository variable
-      # ACI_SKIP_RECOVERY_TEST=true to skip it temporarily.
-      - name: Recovery test (restart re-pulls both images)
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main') && vars.ACI_SKIP_RECOVERY_TEST != 'true'
+      # ACI_SKIP_RECOVERY_TEST=true to prohibit it. Ordinary pushes and self-heal
+      # never request this test. A manual dispatch must explicitly opt in for that
+      # one run; the input defaults back to false on the next dispatch.
+      - name: Recovery test (explicit restart)
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.run_recovery_test == true && vars.ACI_SKIP_RECOVERY_TEST != 'true'
         id: recovery
         run: |
-          echo "Restarting ${{ env.CONTAINER_NAME }} to force a fresh image pull with the stored credentials..."
+          echo "Restarting ${{ env.CONTAINER_NAME }} for this explicitly requested recovery test..."
           az container restart --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }}
 
           DEADLINE=$((SECONDS + 300))
@@ -737,7 +745,7 @@ jobs:
             echo "will not recover from the next repair either."
             exit 1
           fi
-          echo "✅ Recovery test passed: both containers re-pulled and are Running after restart."
+          echo "✅ Recovery test passed: both containers are Running after restart. Check Azure pull events separately."
           # The app re-runs its ACME issuance after the restart before it opens :443; give it
           # the same head start the initial "Wait for container" step gives (the TLS check
           # below also retries 8 x 15s on its own).
@@ -951,7 +959,7 @@ jobs:
         id: build
         run: |
           echo "Rebuilding container from source..."
-          nix build .#container --print-build-logs
+          nix build --no-update-lock-file .#container --print-build-logs
           docker load < result
           
           IMAGE_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}')

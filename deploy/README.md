@@ -22,7 +22,7 @@ The build-and-sign workflow handles everything automatically:
 4. **Policy**: CCE policy generated with secret protection (regex patterns)
 5. **Guardrail**: the job refuses to deploy if the group would store an ephemeral pull credential
 6. **Deploy**: Container deployed to Azure Confidential Containers
-7. **Recovery test**: `az container restart` forces both images to be re-pulled with only what is stored on the group; the job fails if the group is not back to `Succeeded` with both containers `Running` within 5 minutes
+7. **Optional recovery test**: an explicitly selected manual run restarts the group and checks that both containers return to `Running`. Pushes and automatic self-heal skip this extra restart. Inspect Azure pull events separately to establish whether images were actually re-pulled.
 8. **Verify**: Attestation verified against build
 
 ### Trigger Deployment
@@ -59,8 +59,9 @@ Rules the workflow now enforces:
 - The guardrail step fails the job if any credential equals the job's `GITHUB_TOKEN`, if a
   password is stored for ghcr.io, or if an identity entry also carries a password. It runs
   **before** the old group is deleted, so a refusal never causes an outage.
-- The recovery test exercises the same re-pull path a platform repair uses, right after the
-  deploy, so a credential that cannot survive is caught in CI instead of at 03:00.
+- A successful restart shows container recovery, not proof of fresh image downloads.
+  Inspect Azure events for both image pulls, and verify repair recovery after the
+  deployment job has ended so its temporary token is no longer valid.
 
 ### Setting up identity-based pull (recommended)
 
@@ -123,9 +124,12 @@ az monitor log-analytics workspace get-shared-keys -g oa-verifier -n oa-verifier
   Azure FQDN), opens/updates a single issue titled "Verifier endpoint down" on failure and
   closes it on the next success; warns when the origin certificate is not Let's Encrypt.
 - `.github/workflows/self-heal.yml` (every 15 min): reads the group's `provisioningState`
-  and container states; if the group is missing, `Failed`, or a container is not `Running`
-  across the whole check, it dispatches `build-and-sign.yml` on `main` -- unless a deploy is
-  already queued or running.
+  only. It dispatches `build-and-sign.yml` on `main` for an explicitly missing or
+  `Failed` group, unless a deploy is queued/running or a failed, cancelled or timed-out
+  deploy completed within the past three hours. `Repairing`, `Creating`, `Waiting`,
+  partial container lists and unknown states never trigger deletion. Azure access
+  errors fail the check rather than being treated as a missing group. A present
+  group is not necessarily serving requests; the uptime workflow checks that separately.
 
 ## GitHub Secrets Required
 
@@ -147,7 +151,7 @@ az monitor log-analytics workspace get-shared-keys -g oa-verifier -n oa-verifier
 | `ACI_PULL_IDENTITY_ID` (variable or secret) | Resource id of the user-assigned managed identity for ACR pull. When set, ACR + identity is used instead of anonymous GHCR. |
 | `LOG_ANALYTICS_WORKSPACE_ID` (secret) | Log Analytics workspace (customer) id for container group diagnostics |
 | `LOG_ANALYTICS_WORKSPACE_KEY` (secret) | Log Analytics workspace shared key |
-| `ACI_SKIP_RECOVERY_TEST` (variable) | Set to `true` to skip the post-deploy restart test (each restart costs one Let's Encrypt issuance) |
+| `ACI_SKIP_RECOVERY_TEST` (variable) | Set to `true` to prohibit even an explicitly requested recovery restart. Normal deploys already skip it. |
 
 ### Optional (for custom TLS domain)
 
@@ -215,3 +219,27 @@ This ensures:
 ## Verification
 
 See [../docs/ATTESTATION.md](../docs/ATTESTATION.md) for zero-trust verification instructions.
+
+### One controlled restart test
+
+For the designated validation deployment, manually dispatch on `main` with
+`run_recovery_test=true` (and `ACI_SKIP_RECOVERY_TEST` unset or false):
+
+```bash
+gh workflow run build-and-sign.yml --ref main -f run_recovery_test=true
+```
+
+The checkbox defaults to false for every new dispatch, so the opt-in does not
+persist. Pushes and self-heal never request it. Existing
+`ACI_SKIP_RECOVERY_TEST=true` remains an override; it can stay true after validation.
+A re-run of a manually opted-in run retains its inputs and can restart again:
+create a fresh dispatch with the default input instead when no repeat is intended.
+Certificate persistence remains disabled by default, and a restart may issue a
+new certificate and require station/OpenRouter reauthentication.
+
+### Toolchain upgrade deferred
+
+This change retains the existing nixos-24.05 lock and Go toolchain to keep the
+outage fix reproducible. Upgrade the toolchain separately with a generated lock,
+verified vendor hash and container/attestation checks. All CI `nix build` and
+`nix develop` invocations reject lock updates. No lock hash has been hand-edited.
