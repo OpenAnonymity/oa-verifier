@@ -110,9 +110,15 @@ Proof: "This exact code is running in an isolated enclave"
 
 ## Development
 
+Toolchain: Go 1.24 or newer (`go.mod` declares `go 1.22.0` as the minimum
+language version; the Nix build and CI use Go 1.24 from nixpkgs `nixos-25.05`).
+
 ```bash
 # Build server
 go build -o oa-verifier ./cmd/verifier
+
+# Test (the race detector covers the failure tracker and rate limiters)
+go vet ./... && go test -race ./...
 
 # Run locally (without attestation)
 ./oa-verifier -local
@@ -122,6 +128,14 @@ go build -o oa-verifier ./cmd/verifier
 ```
 
 ### Reproducible Build (Nix)
+
+`flake.nix` pins nixpkgs `nixos-25.05` and builds with `buildGo124Module`;
+`flake.lock` pins the exact nixpkgs revision. After changing the nixpkgs
+input, run `nix flake update nixpkgs` and commit `flake.lock`, or the build
+floats to the branch tip and stops being reproducible.
+`vendorHash` covers the vendored module tree (derived from `go.mod`/`go.sum`),
+not the toolchain, so it only changes when dependencies change; on a mismatch
+the build fails and prints the expected hash.
 
 ```bash
 # Build container with deterministic hash
@@ -148,6 +162,17 @@ See [deploy/README.md](deploy/README.md) for details.
 | `CHALLENGE_MAX_INTERVAL` | Max seconds between privacy checks |
 | `SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS` | Grace window for ownership checks |
 | `STATION_FAILURE_GRACE_SECONDS` | Grace window before unregistering on transient failures |
+| `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` | General per-IP rate limit, all routes (default 10 rps, burst 20) |
+| `MAX_CONCURRENT_REQUESTS` | Concurrent `/register` + `/submit_key` handlers (default 20) |
+| `ATTEST_RATE_LIMIT_RPS` / `ATTEST_RATE_LIMIT_BURST` | Per-IP limit for `/attestation*` (default 1 rps, burst 3); each request costs a sidecar attestation |
+| `ATTEST_GLOBAL_RPS` | Global limit for `/attestation*` across all clients (default 5 rps) |
+| `FAILURE_TRACK_MAX` | Max tracked `<identity>\|<operation>` consecutive-failure counters (default 10000, LRU eviction) |
+| `FAILURE_TRACK_TTL` | Idle expiry of those counters, Go duration or seconds (default `24h`) |
+
+Every variable the container reads must also appear in `required_env_vars` or
+`optional_env_vars` of the "Generate CCE policy" step in
+`.github/workflows/build-and-sign.yml`; the confidential-computing policy rejects
+any other environment variable and the container will not start.
 
 ## Documentation
 
