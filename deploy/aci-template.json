@@ -2,7 +2,7 @@
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
   "contentVersion": "1.0.0.0",
   "metadata": {
-    "_comment": "Reference template - CCE policy is generated dynamically by CI/CD workflow"
+    "_comment": "Reference template - CCE policy is generated dynamically by CI/CD workflow (.github/workflows/build-and-sign.yml). Mirrors what the workflow deploys: no password credentials for the public image, optional identity-based ACR pull, HTTPS liveness probe, optional Log Analytics diagnostics."
   },
   "parameters": {
     "imageDigest": {
@@ -15,7 +15,58 @@
       "type": "string",
       "defaultValue": "ghcr.io/openanonymity",
       "metadata": {
-        "description": "Container registry server (ghcr.io/OWNER or ACR)"
+        "description": "Registry path the image is pulled from: ghcr.io/OWNER (public, pulled anonymously) or the ACR login server (oaverifieracr.azurecr.io, pulled with the managed identity)."
+      }
+    },
+    "pullIdentityId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Resource id of a user-assigned managed identity with AcrPull on the ACR. When set, the group gets this identity and pulls from ACR with it (no username/password stored). Leave empty for anonymous GHCR pull. NEVER put a GitHub Actions GITHUB_TOKEN in imageRegistryCredentials: it is revoked when the job ends and the group re-uses it on every platform repair."
+      }
+    },
+    "acrServer": {
+      "type": "string",
+      "defaultValue": "oaverifieracr.azurecr.io",
+      "metadata": {
+        "description": "ACR login server the identity credential applies to (only used when pullIdentityId is set)."
+      }
+    },
+    "logAnalyticsWorkspaceId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional Log Analytics workspace id (customer id). When set with logAnalyticsWorkspaceKey, ACI ships ContainerEvent/ContainerInstanceLog records there."
+      }
+    },
+    "logAnalyticsWorkspaceKey": {
+      "type": "securestring",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Optional Log Analytics workspace shared key."
+      }
+    }
+  },
+  "variables": {
+    "useIdentity": "[not(empty(parameters('pullIdentityId')))]",
+    "useDiagnostics": "[and(not(empty(parameters('logAnalyticsWorkspaceId'))), not(empty(parameters('logAnalyticsWorkspaceKey'))))]",
+    "identity": {
+      "type": "UserAssigned",
+      "userAssignedIdentities": {
+        "[parameters('pullIdentityId')]": {}
+      }
+    },
+    "identityCredentials": [
+      {
+        "server": "[parameters('acrServer')]",
+        "identity": "[parameters('pullIdentityId')]"
+      }
+    ],
+    "diagnostics": {
+      "logAnalytics": {
+        "workspaceId": "[parameters('logAnalyticsWorkspaceId')]",
+        "workspaceKey": "[parameters('logAnalyticsWorkspaceKey')]",
+        "logType": "ContainerInstanceLogs"
       }
     }
   },
@@ -23,8 +74,9 @@
     {
       "type": "Microsoft.ContainerInstance/containerGroups",
       "apiVersion": "2023-05-01",
-      "name": "oa-verifier",
+      "name": "oa-verifier-2",
       "location": "eastus",
+      "identity": "[if(variables('useIdentity'), variables('identity'), json('null'))]",
       "properties": {
         "sku": "Confidential",
         "containers": [
@@ -38,6 +90,17 @@
                   "protocol": "TCP"
                 }
               ],
+              "livenessProbe": {
+                "httpGet": {
+                  "path": "/health",
+                  "port": 443,
+                  "scheme": "https"
+                },
+                "initialDelaySeconds": 300,
+                "periodSeconds": 30,
+                "failureThreshold": 3,
+                "timeoutSeconds": 10
+              },
               "environmentVariables": [
                 {
                   "name": "MAA_ENDPOINT",
@@ -78,6 +141,7 @@
             }
           }
         ],
+        "imageRegistryCredentials": "[if(variables('useIdentity'), variables('identityCredentials'), createArray())]",
         "ipAddress": {
           "type": "Public",
           "ports": [
@@ -86,10 +150,11 @@
               "protocol": "TCP"
             }
           ],
-          "dnsNameLabel": "oa-verifier"
+          "dnsNameLabel": "oa-verifier-2"
         },
         "osType": "Linux",
         "restartPolicy": "Always",
+        "diagnostics": "[if(variables('useDiagnostics'), variables('diagnostics'), json('null'))]",
         "confidentialComputeProperties": {
           "ccePolicy": ""
         }

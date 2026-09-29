@@ -1,0 +1,213 @@
+name: Uptime Check
+
+# Probes the public /health endpoint every 5 minutes. On failure the job fails and a
+# single GitHub issue titled "Verifier endpoint down" is opened (or updated when it is
+# already open); the next successful check closes it. Also inspects the ORIGIN TLS
+# certificate (bypassing any CDN edge) and warns when it is not Let's Encrypt, which
+# means the container fell back to its self-signed certificate after ACME failed.
+#
+# Hostname: TLS_DOMAIN when the secret is set (the same convention as
+# build-and-sign.yml and verify-attestation.yml); otherwise the Azure FQDN of the
+# group, which serves a self-signed certificate, so verification is skipped (-k).
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: uptime-check
+  cancel-in-progress: false
+
+env:
+  # dnsNameLabel "oa-verifier-2" in eastus (fixed in build-and-sign.yml).
+  ORIGIN_FQDN: oa-verifier-2.eastus.azurecontainer.io
+  ISSUE_TITLE: Verifier endpoint down
+
+jobs:
+  check:
+    name: Health and origin certificate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Determine service URL
+        id: url
+        env:
+          TLS_DOMAIN: ${{ secrets.TLS_DOMAIN }}
+        run: |
+          if [ -n "$TLS_DOMAIN" ]; then
+            echo "host=$TLS_DOMAIN" >> "$GITHUB_OUTPUT"
+            echo "url=https://$TLS_DOMAIN/health" >> "$GITHUB_OUTPUT"
+            echo "curl_flags=" >> "$GITHUB_OUTPUT"
+            echo "Using TLS_DOMAIN"
+          else
+            echo "host=$ORIGIN_FQDN" >> "$GITHUB_OUTPUT"
+            echo "url=https://$ORIGIN_FQDN/health" >> "$GITHUB_OUTPUT"
+            echo "curl_flags=-k" >> "$GITHUB_OUTPUT"
+            echo "TLS_DOMAIN not set; using Azure FQDN $ORIGIN_FQDN (self-signed, -k)"
+          fi
+
+      - name: Probe /health (15s timeout, 3 retries)
+        id: health
+        continue-on-error: true
+        env:
+          URL: ${{ steps.url.outputs.url }}
+          CURL_FLAGS: ${{ steps.url.outputs.curl_flags }}
+        run: |
+          echo "GET $URL"
+          BODY_FILE=/tmp/health-body.txt
+          set +e
+          # --retry-all-errors: retry on connection failures AND any HTTP error, not
+          # just the transient 4xx/5xx set curl retries by default.
+          HTTP_CODE=$(curl -sS $CURL_FLAGS \
+            --max-time 15 --connect-timeout 10 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            -o "$BODY_FILE" -w '%{http_code}' "$URL")
+          CURL_RC=$?
+          set -e
+          echo "curl exit=$CURL_RC http_code=${HTTP_CODE:-none}"
+          echo "http_code=${HTTP_CODE:-none}" >> "$GITHUB_OUTPUT"
+          echo "curl_rc=$CURL_RC" >> "$GITHUB_OUTPUT"
+          if [ "$CURL_RC" -ne 0 ] || [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Health check failed (curl exit $CURL_RC, HTTP ${HTTP_CODE:-none})"
+            head -c 500 "$BODY_FILE" 2>/dev/null || true
+            exit 1
+          fi
+          if ! jq -e '.status == "healthy"' "$BODY_FILE" >/dev/null 2>&1; then
+            echo "❌ HTTP 200 but body is not the expected health JSON:"
+            head -c 500 "$BODY_FILE"
+            exit 1
+          fi
+          echo "✅ Healthy: $(cat "$BODY_FILE")"
+
+      - name: Inspect origin TLS certificate
+        id: origin_cert
+        if: always()
+        continue-on-error: true
+        env:
+          SNI: ${{ steps.url.outputs.host }}
+        run: |
+          # Connect to the Azure origin directly (not through a CDN edge) and present
+          # the public hostname as SNI, exactly like the deploy workflow's check.
+          CERT_FILE=/tmp/origin-cert.pem
+          echo | timeout 20 openssl s_client -connect "${ORIGIN_FQDN}:443" -servername "$SNI" -showcerts 2>/dev/null \
+            | awk '/-----BEGIN CERTIFICATE-----/{flag=1} flag{print} /-----END CERTIFICATE-----/{exit}' > "$CERT_FILE" || true
+          if [ ! -s "$CERT_FILE" ]; then
+            echo "cert_status=unreachable" >> "$GITHUB_OUTPUT"
+            echo "issuer=" >> "$GITHUB_OUTPUT"
+            echo "not_after=" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Could not retrieve origin certificate from $ORIGIN_FQDN"
+            exit 0
+          fi
+          ISSUER=$(openssl x509 -in "$CERT_FILE" -noout -issuer | sed 's/^issuer=//')
+          SUBJECT=$(openssl x509 -in "$CERT_FILE" -noout -subject | sed 's/^subject=//')
+          NOT_AFTER=$(openssl x509 -in "$CERT_FILE" -noout -enddate | cut -d= -f2-)
+          CERT_STATUS="non-letsencrypt"
+          if echo "$ISSUER" | grep -qi "let's encrypt"; then
+            CERT_STATUS="letsencrypt"
+          elif [ "$ISSUER" = "$SUBJECT" ]; then
+            CERT_STATUS="self-signed"
+          fi
+          echo "Issuer:    $ISSUER"
+          echo "Subject:   $SUBJECT"
+          echo "Not After: $NOT_AFTER"
+          echo "Status:    $CERT_STATUS"
+          echo "cert_status=$CERT_STATUS" >> "$GITHUB_OUTPUT"
+          echo "issuer=$ISSUER" >> "$GITHUB_OUTPUT"
+          echo "not_after=$NOT_AFTER" >> "$GITHUB_OUTPUT"
+          if [ "$CERT_STATUS" != "letsencrypt" ]; then
+            echo "::warning title=Origin certificate is not Let's Encrypt::Origin $ORIGIN_FQDN presents a $CERT_STATUS certificate (issuer: $ISSUER). ACME issuance probably failed on the last start; check the container logs."
+          fi
+
+      - name: Open, update or close the outage issue
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEALTH_OUTCOME: ${{ steps.health.outcome }}
+          HTTP_CODE: ${{ steps.health.outputs.http_code }}
+          CURL_RC: ${{ steps.health.outputs.curl_rc }}
+          URL: ${{ steps.url.outputs.url }}
+          CERT_STATUS: ${{ steps.origin_cert.outputs.cert_status }}
+          CERT_ISSUER: ${{ steps.origin_cert.outputs.issuer }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Dedupe strictly by exact title. Plain listing (not --search) so a lagging
+          # search index cannot make us open a duplicate; oldest match wins.
+          EXISTING=$(gh issue list --state open --limit 200 --json number,title \
+            | jq -r --arg t "$ISSUE_TITLE" '[.[] | select(.title == $t)] | sort_by(.number) | .[0].number // empty')
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          if [ "$HEALTH_OUTCOME" = "success" ]; then
+            if [ -n "$EXISTING" ]; then
+              echo "Endpoint healthy again; closing issue #$EXISTING"
+              gh issue comment "$EXISTING" --body "$(printf 'Recovered at %s: \`%s\` returned HTTP 200 ([run](%s)). Closing automatically.' "$NOW" "$URL" "$RUN_URL")"
+              gh issue close "$EXISTING" --reason completed
+            else
+              echo "Healthy; no open outage issue."
+            fi
+            exit 0
+          fi
+
+          BODY=$(cat <<BODY_EOF
+          The uptime check could not get a healthy response from \`$URL\`.
+
+          - Time: $NOW
+          - curl exit code: ${CURL_RC:-n/a}
+          - HTTP status: ${HTTP_CODE:-none}
+          - Origin certificate: ${CERT_STATUS:-unknown} (${CERT_ISSUER:-issuer unknown})
+          - Run: $RUN_URL
+
+          The self-heal workflow redeploys the group automatically when Azure reports it as failed or missing; if this issue stays open for more than ~30 minutes, check the latest "Build, Sign, and Deploy" and "Self-Heal Container Group" runs. Background: deploy/README.md, "Why the pull credential matters".
+
+          This issue is managed by \`.github/workflows/uptime-check.yml\`; it will be closed automatically on the next successful check.
+          BODY_EOF
+          )
+
+          if [ -n "$EXISTING" ]; then
+            echo "Still down; updating issue #$EXISTING"
+            gh issue comment "$EXISTING" --body "$(printf 'Still failing at %s: curl exit %s, HTTP %s, origin cert %s ([run](%s)).' "$NOW" "${CURL_RC:-n/a}" "${HTTP_CODE:-none}" "${CERT_STATUS:-unknown}" "$RUN_URL")"
+          else
+            echo "Opening outage issue"
+            gh issue create --title "$ISSUE_TITLE" --body "$BODY"
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          HEALTH_OUTCOME: ${{ steps.health.outcome }}
+          HTTP_CODE: ${{ steps.health.outputs.http_code }}
+          URL: ${{ steps.url.outputs.url }}
+          CERT_STATUS: ${{ steps.origin_cert.outputs.cert_status }}
+          CERT_ISSUER: ${{ steps.origin_cert.outputs.issuer }}
+          CERT_NOT_AFTER: ${{ steps.origin_cert.outputs.not_after }}
+        run: |
+          {
+            if [ "$HEALTH_OUTCOME" = "success" ]; then
+              echo "## ✅ Uptime: healthy"
+            else
+              echo "## ❌ Uptime: DOWN"
+            fi
+            echo ""
+            echo "| Check | Result |"
+            echo "|-------|--------|"
+            echo "| URL | $URL |"
+            echo "| HTTP status | ${HTTP_CODE:-none} |"
+            echo "| Origin cert | ${CERT_STATUS:-unknown} |"
+            echo "| Origin cert issuer | ${CERT_ISSUER:-n/a} |"
+            echo "| Origin cert expires | ${CERT_NOT_AFTER:-n/a} |"
+            if [ -n "$CERT_STATUS" ] && [ "$CERT_STATUS" != "letsencrypt" ]; then
+              echo ""
+              echo "> ⚠️ The origin certificate is **$CERT_STATUS**, not Let's Encrypt. The container most likely fell back to a self-signed certificate after ACME failed on its last start."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail the job when the endpoint is down
+        if: steps.health.outcome != 'success'
+        run: |
+          echo "❌ ${{ steps.url.outputs.url }} is not healthy (see the issue '$ISSUE_TITLE')."
+          exit 1
