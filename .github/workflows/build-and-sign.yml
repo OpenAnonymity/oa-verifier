@@ -24,6 +24,11 @@ permissions:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    outputs:
+      deploy_registry: ${{ steps.registry.outputs.registry }}
+      deploy_digest: ${{ steps.registry.outputs.digest }}
+      deploy_use_identity: ${{ steps.registry.outputs.use_identity }}
+      deploy_pull_identity_id: ${{ steps.registry.outputs.pull_identity_id }}
 
     steps:
       - name: Checkout repository
@@ -197,35 +202,97 @@ jobs:
           echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
           echo "Reusing existing image: $IMAGE_ID (digest: $DIGEST)"
 
-      # --- Determine which registry to use for deployment ---
+      # --- Determine which registry and which pull authentication to deploy with ---
+      #
+      # Preference order (see deploy/README.md, "Why the pull credential matters"):
+      #   1. ACR + user-assigned managed identity   when ACI_PULL_IDENTITY_ID is set
+      #   2. GHCR, anonymous                        public image, nothing stored on the group
+      #   3. ACR + admin credentials                private-repo fallback
+      #
+      # The image is pushed to ACR on every build and its manifest digest is the same as
+      # the GHCR one (same local image, same manifest), so deploying from ACR does not
+      # change what is measured -- only the registry host in the policy "id" differs.
+      #
+      # NEVER a job-scoped GITHUB_TOKEN: ACI stores the pull credential on the group and
+      # re-uses it on every platform repair, long after the token has been revoked. That is
+      # what took the service down on 2026-09-25, 09-27 and 09-28.
       - name: Select registry for deployment
         if: github.event_name != 'pull_request'
         id: registry
+        env:
+          ACI_PULL_IDENTITY_ID: ${{ vars.ACI_PULL_IDENTITY_ID || secrets.ACI_PULL_IDENTITY_ID }}
+          BUILD: ${{ steps.should-build.outputs.build }}
+          GHCR_PUSH_OUTCOME: ${{ steps.push-ghcr.outcome }}
+          GHCR_DIGEST: ${{ steps.push-ghcr.outputs.digest }}
+          ACR_DIGEST: ${{ steps.push-acr.outputs.digest }}
+          EXISTING_DIGEST: ${{ steps.pull-existing.outputs.digest }}
+          GHCR_REKOR_LOG_INDEX: ${{ steps.sign-ghcr.outputs.rekor_log_index }}
+          GHCR_SIGNING_PAYLOAD_HASH: ${{ steps.sign-ghcr.outputs.signing_payload_hash }}
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
 
-          if [ "${{ steps.should-build.outputs.build }}" != "true" ]; then
-            echo "Reusing existing ACR image (no code changes)"
-            echo "registry=${{ env.ACR_REGISTRY }}" >> $GITHUB_OUTPUT
-            echo "digest=${{ steps.pull-existing.outputs.digest }}" >> $GITHUB_OUTPUT
-            echo "use_ghcr=false" >> $GITHUB_OUTPUT
-            echo "rekor_log_index=" >> $GITHUB_OUTPUT
-            echo "signing_payload_hash=" >> $GITHUB_OUTPUT
-          elif [ "${{ steps.push-ghcr.outcome }}" = "success" ]; then
-            echo "Using GHCR for deployment (public repo)"
-            echo "registry=${{ env.GHCR_REGISTRY }}/${OWNER}" >> $GITHUB_OUTPUT
-            echo "digest=${{ steps.push-ghcr.outputs.digest }}" >> $GITHUB_OUTPUT
-            echo "use_ghcr=true" >> $GITHUB_OUTPUT
-            echo "rekor_log_index=${{ steps.sign-ghcr.outputs.rekor_log_index }}" >> $GITHUB_OUTPUT
-            echo "signing_payload_hash=${{ steps.sign-ghcr.outputs.signing_payload_hash }}" >> $GITHUB_OUTPUT
+          REGISTRY=""
+          DIGEST=""
+          USE_GHCR=false
+          USE_IDENTITY=false
+          REKOR_LOG_INDEX=""
+          SIGNING_PAYLOAD_HASH=""
+
+          if [ -n "$ACI_PULL_IDENTITY_ID" ]; then
+            echo "ACI_PULL_IDENTITY_ID is set -- deploying from ACR with managed-identity pull (no stored secret)"
+            REGISTRY="${{ env.ACR_REGISTRY }}"
+            USE_IDENTITY=true
+            if [ "$BUILD" != "true" ]; then
+              echo "Reusing existing ACR image (no code changes)"
+              DIGEST="$EXISTING_DIGEST"
+            else
+              DIGEST="$ACR_DIGEST"
+              # Keep the GHCR Sigstore/Rekor record for the attestation response, but only
+              # when it provably describes the very digest ACI will pull.
+              if [ "$GHCR_PUSH_OUTCOME" = "success" ] && [ -n "$GHCR_DIGEST" ] && [ "$GHCR_DIGEST" = "$ACR_DIGEST" ]; then
+                REKOR_LOG_INDEX="$GHCR_REKOR_LOG_INDEX"
+                SIGNING_PAYLOAD_HASH="$GHCR_SIGNING_PAYLOAD_HASH"
+              elif [ "$GHCR_PUSH_OUTCOME" = "success" ]; then
+                echo "::warning::GHCR digest ($GHCR_DIGEST) differs from ACR digest ($ACR_DIGEST); not attaching the GHCR Rekor record to this deployment"
+              fi
+            fi
+          elif [ "$BUILD" != "true" ]; then
+            echo "Reusing existing ACR image (no code changes); ACR admin credentials"
+            REGISTRY="${{ env.ACR_REGISTRY }}"
+            DIGEST="$EXISTING_DIGEST"
+          elif [ "$GHCR_PUSH_OUTCOME" = "success" ]; then
+            echo "Using GHCR for deployment (public image, anonymous pull)"
+            REGISTRY="${{ env.GHCR_REGISTRY }}/${OWNER}"
+            DIGEST="$GHCR_DIGEST"
+            USE_GHCR=true
+            REKOR_LOG_INDEX="$GHCR_REKOR_LOG_INDEX"
+            SIGNING_PAYLOAD_HASH="$GHCR_SIGNING_PAYLOAD_HASH"
           else
-            echo "Using ACR for deployment (private repo fallback)"
-            echo "registry=${{ env.ACR_REGISTRY }}" >> $GITHUB_OUTPUT
-            echo "digest=${{ steps.push-acr.outputs.digest }}" >> $GITHUB_OUTPUT
-            echo "use_ghcr=false" >> $GITHUB_OUTPUT
-            echo "rekor_log_index=${{ steps.sign-ghcr.outputs.rekor_log_index }}" >> $GITHUB_OUTPUT
-            echo "signing_payload_hash=${{ steps.sign-ghcr.outputs.signing_payload_hash }}" >> $GITHUB_OUTPUT
+            echo "Using ACR for deployment (private repo fallback, admin credentials)"
+            REGISTRY="${{ env.ACR_REGISTRY }}"
+            DIGEST="$ACR_DIGEST"
+            REKOR_LOG_INDEX="$GHCR_REKOR_LOG_INDEX"
+            SIGNING_PAYLOAD_HASH="$GHCR_SIGNING_PAYLOAD_HASH"
           fi
+
+          if [ -z "$DIGEST" ]; then
+            echo "❌ No image digest available for deployment (registry=$REGISTRY, build=$BUILD)"
+            exit 1
+          fi
+
+          echo "Deploy registry: $REGISTRY"
+          echo "Deploy digest:   $DIGEST"
+          echo "Pull auth:       $( [ "$USE_IDENTITY" = "true" ] && echo "managed identity" || ( [ "$USE_GHCR" = "true" ] && echo "anonymous" || echo "ACR admin credentials" ) )"
+
+          {
+            echo "registry=$REGISTRY"
+            echo "digest=$DIGEST"
+            echo "use_ghcr=$USE_GHCR"
+            echo "use_identity=$USE_IDENTITY"
+            echo "pull_identity_id=$ACI_PULL_IDENTITY_ID"
+            echo "rekor_log_index=$REKOR_LOG_INDEX"
+            echo "signing_payload_hash=$SIGNING_PAYLOAD_HASH"
+          } >> "$GITHUB_OUTPUT"
 
       # --- DEPLOY SECTION (same job, same runner, image already loaded) ---
       
@@ -246,32 +313,81 @@ jobs:
           DEPLOY_REGISTRY: ${{ steps.registry.outputs.registry }}
           DEPLOY_DIGEST: ${{ steps.registry.outputs.digest }}
           USE_GHCR: ${{ steps.registry.outputs.use_ghcr }}
+          USE_IDENTITY: ${{ steps.registry.outputs.use_identity }}
+          PULL_IDENTITY_ID: ${{ steps.registry.outputs.pull_identity_id }}
           REKOR_LOG_INDEX: ${{ steps.registry.outputs.rekor_log_index }}
           SIGSTORE_PAYLOAD_HASH: ${{ steps.registry.outputs.signing_payload_hash }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+          LOG_ANALYTICS_WORKSPACE_ID: ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+          LOG_ANALYTICS_WORKSPACE_KEY: ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}
         run: |
           echo "Generating CCE policy..."
           echo "Registry: $DEPLOY_REGISTRY"
           echo "Digest: $DEPLOY_DIGEST"
+          echo "Pull auth: identity=$USE_IDENTITY ghcr-anonymous=$USE_GHCR"
           
           # Build image reference
           IMAGE_REF="${DEPLOY_REGISTRY}/${{ env.IMAGE_NAME }}@${DEPLOY_DIGEST}"
           echo "Image: $IMAGE_REF"
           
-          # Create deployment template - credentials depend on registry
-          if [ "$USE_GHCR" = "true" ]; then
-            # GHCR - the image is public, so pull anonymously. Do NOT store
-            # GITHUB_TOKEN here: it is job-scoped and is revoked as soon as this
-            # workflow finishes, but ACI keeps it as the group's permanent pull
-            # credential. Whenever the platform later repairs/re-creates the group
-            # it re-pulls the image with that dead token, the pull never succeeds,
-            # both containers sit in "Waiting" and the group fails with
-            # DeploymentTimeout after 30 minutes (outages of 2026-09-25/27/28).
+          # Pull authentication stored on the container group. All JSON fragments are
+          # built with jq so quoting is always correct; nothing secret is echoed.
+          #
+          # The group keeps whatever is stored here for its whole life and re-uses it on
+          # every platform repair. It must therefore be something that is still valid
+          # months later: a managed identity, nothing at all (public image), or a
+          # long-lived ACR admin credential. NEVER GITHUB_TOKEN: it is job-scoped and is
+          # revoked as soon as this workflow finishes; the next repair then re-pulls with
+          # a dead token, both containers sit in "Waiting" and the group fails with
+          # DeploymentTimeout after 30 minutes (outages of 2026-09-25/27/28).
+          IDENTITY_JSON=""
+          if [ "$USE_IDENTITY" = "true" ]; then
+            if [ -z "$PULL_IDENTITY_ID" ]; then
+              echo "❌ use_identity=true but no identity resource id"
+              exit 1
+            fi
+            # Identity-based pull: the group gets the user-assigned identity and the
+            # registry credential references it. No username, no password.
+            CREDS_JSON=$(jq -cn --arg server "${{ env.ACR_REGISTRY }}" --arg id "$PULL_IDENTITY_ID" \
+              '[{server: $server, identity: $id}]')
+            IDENTITY_OBJ=$(jq -cn --arg id "$PULL_IDENTITY_ID" \
+              '{type: "UserAssigned", userAssignedIdentities: {($id): {}}}')
+            IDENTITY_JSON="\"identity\": ${IDENTITY_OBJ},"
+          elif [ "$USE_GHCR" = "true" ]; then
+            # GHCR - the image is public, pull anonymously.
             CREDS_JSON='[]'
           else
-            # ACR - use ACR credentials
-            CREDS_JSON='[{"server": "${{ env.ACR_REGISTRY }}", "username": "${{ secrets.ACR_USERNAME }}", "password": "${{ secrets.ACR_PASSWORD }}"}]'
+            # ACR admin credentials (long-lived) - fallback when no identity is configured.
+            CREDS_JSON=$(jq -cn --arg server "${{ env.ACR_REGISTRY }}" --arg u "$ACR_USERNAME" --arg p "$ACR_PASSWORD" \
+              '[{server: $server, username: $u, password: $p}]')
           fi
-          
+
+          # Optional Log Analytics diagnostics (deploy template only - never part of the
+          # measured policy). Confidential containers cannot write stdout/stderr, but the
+          # ContainerEvent table still records pulls, starts, repairs and their failures,
+          # which is exactly the evidence that was missing during the 2026-09 outages.
+          DIAG_JSON=""
+          if [ -n "$LOG_ANALYTICS_WORKSPACE_ID" ] && [ -n "$LOG_ANALYTICS_WORKSPACE_KEY" ]; then
+            DIAG_OBJ=$(jq -cn --arg id "$LOG_ANALYTICS_WORKSPACE_ID" --arg key "$LOG_ANALYTICS_WORKSPACE_KEY" \
+              '{logAnalytics: {workspaceId: $id, workspaceKey: $key, logType: "ContainerInstanceLogs"}}')
+            DIAG_JSON="\"diagnostics\": ${DIAG_OBJ},"
+            echo "Log Analytics diagnostics: enabled"
+          else
+            echo "Log Analytics diagnostics: not configured (LOG_ANALYTICS_WORKSPACE_ID/KEY unset)"
+          fi
+
+          # Liveness probe for the oa-verifier container (both templates, so the CCE
+          # policy is generated from the same container spec that is deployed).
+          # /health is unauthenticated, returns 200, and GetCertificate ignores SNI so the
+          # probe's SNI-less HTTPS handshake succeeds.
+          # initialDelaySeconds is generous on purpose: the server only opens :443 AFTER
+          # the ACME DNS-01 issuance has finished (or fallen back to self-signed), and a
+          # probe that kills the container mid-issuance would loop and burn the Let's
+          # Encrypt duplicate-certificate quota. Tighten only after the app serves a
+          # self-signed cert while ACME is pending.
+          PROBE_JSON='"livenessProbe": {"httpGet": {"path": "/health", "port": 443, "scheme": "https"}, "initialDelaySeconds": 300, "periodSeconds": 30, "failureThreshold": 3, "timeoutSeconds": 10},'
+
           # Step 1: Create MINIMAL ARM template for policy generation
           # IMPORTANT: Do NOT include secret env vars here - they would be captured in the policy!
           # Only include non-secret env vars that have fixed values.
@@ -284,6 +400,7 @@ jobs:
               "apiVersion": "2023-05-01",
               "name": "oa-verifier-2",
               "location": "eastus",
+              ${IDENTITY_JSON}
               "properties": {
                 "sku": "Confidential",
                 "containers": [{
@@ -291,6 +408,7 @@ jobs:
                   "properties": {
                     "image": "${IMAGE_REF}",
                     "ports": [{"port": 443, "protocol": "TCP"}],
+                    ${PROBE_JSON}
                     "environmentVariables": [
                       {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
                       {"name": "MAA_PROVIDER_URL", "value": "sharedeus.eus.attest.azure.net"}
@@ -319,7 +437,9 @@ jobs:
             }]
           }
           EOF
-          
+
+          jq empty /tmp/aci-policy-template.json || { echo "❌ policy template is not valid JSON"; exit 1; }
+
           # Step 2: Generate base CCE policy from minimal template (no secrets!)
           az confcom acipolicygen -a /tmp/aci-policy-template.json --approve-wildcards
           
@@ -403,6 +523,7 @@ jobs:
               "apiVersion": "2023-05-01",
               "name": "oa-verifier-2",
               "location": "eastus",
+              ${IDENTITY_JSON}
               "properties": {
                 "sku": "Confidential",
                 "containers": [{
@@ -410,6 +531,7 @@ jobs:
                   "properties": {
                     "image": "${IMAGE_REF}",
                     "ports": [{"port": 443, "protocol": "TCP"}],
+                    ${PROBE_JSON}
                     "environmentVariables": [
                       {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
                       {"name": "MAA_PROVIDER_URL", "value": "sharedeus.eus.attest.azure.net"},
@@ -448,16 +570,93 @@ jobs:
                 },
                 "osType": "Linux",
                 "restartPolicy": "Always",
+                ${DIAG_JSON}
                 "confidentialComputeProperties": {"ccePolicy": "${POLICY_B64}"}
               }
             }]
           }
           DEPLOY_EOF
-          
+
+          jq empty /tmp/aci-deploy.json || { echo "❌ deployment template is not valid JSON"; exit 1; }
+
           echo "policy_hash=$POLICY_HASH" >> $GITHUB_OUTPUT
           echo "policy_b64=$POLICY_B64" >> $GITHUB_OUTPUT
           echo "✅ Policy hash: $POLICY_HASH"
           echo "✅ CCE_POLICY_B64 env var added to deployment template"
+
+      # Guardrail: refuse to deploy a group whose stored pull credential will not survive
+      # this job. The container group keeps imageRegistryCredentials for its whole life
+      # and re-uses them on every platform-initiated repair (host maintenance, UVM move).
+      # A job-scoped GITHUB_TOKEN is revoked the moment this job ends, so the next repair
+      # re-pulls with a dead token: GHCR answers 403, ACI does not fall back to anonymous,
+      # both containers stay "Waiting" and the group dies with DeploymentTimeout after
+      # 30 minutes. That is exactly what happened on 2026-09-25, 09-27 and 09-28.
+      #
+      # Runs BEFORE the existing group is deleted: a refused deploy must leave the
+      # currently running group untouched instead of causing the outage it prevents.
+      - name: Guardrail -- no ephemeral pull credentials on the container group
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
+        env:
+          JOB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          USE_IDENTITY: ${{ steps.registry.outputs.use_identity }}
+          USE_GHCR: ${{ steps.registry.outputs.use_ghcr }}
+        run: |
+          TEMPLATE=/tmp/aci-deploy.json
+          CREDS=$(jq -c '.resources[0].properties.imageRegistryCredentials // []' "$TEMPLATE")
+          echo "imageRegistryCredentials (secrets redacted):"
+          echo "$CREDS" | jq -c 'map(if has("password") then .password = "<redacted>" else . end)'
+
+          FAIL=0
+
+          # 1. A public GHCR image must be pulled anonymously. Any password stored for
+          #    ghcr.io is either GITHUB_TOKEN (dies with the job) or a PAT (expires and
+          #    is tied to a person); both eventually leave the group unable to repair.
+          if echo "$CREDS" | jq -e 'any(.[]; ((.server // "") | ascii_downcase | startswith("ghcr.io")) and has("password"))' >/dev/null; then
+            echo "❌ A password is stored for ghcr.io. The image is public: pull it anonymously (imageRegistryCredentials: [])."
+            FAIL=1
+          fi
+
+          # 2. No credential may equal this job's GITHUB_TOKEN, for any registry. The
+          #    token is compared inside jq via --arg and is never printed.
+          if [ -n "$JOB_TOKEN" ] && echo "$CREDS" | jq -e --arg tok "$JOB_TOKEN" 'any(.[]; (.password // "") == $tok)' >/dev/null; then
+            echo "❌ A stored pull credential equals the job-scoped GITHUB_TOKEN. GitHub revokes it when this job ends; ACI would keep it forever and every future platform repair would fail to pull."
+            FAIL=1
+          fi
+          # ... and not anywhere else in the template either (env vars, identity, ...).
+          if [ -n "$JOB_TOKEN" ] && grep -qF -- "$JOB_TOKEN" "$TEMPLATE"; then
+            echo "❌ The job-scoped GITHUB_TOKEN appears somewhere in the deployment template."
+            FAIL=1
+          fi
+
+          # 3. Identity-based entries must not also carry a username/password, and an
+          #    identity deployment must actually declare the identity on the group.
+          if echo "$CREDS" | jq -e 'any(.[]; has("identity") and (has("password") or has("username")))' >/dev/null; then
+            echo "❌ A credential mixes identity and username/password."
+            FAIL=1
+          fi
+          if [ "$USE_IDENTITY" = "true" ]; then
+            if ! jq -e '.resources[0].identity.type == "UserAssigned" and ((.resources[0].identity.userAssignedIdentities | length) == 1)' "$TEMPLATE" >/dev/null; then
+              echo "❌ use_identity=true but the group has no UserAssigned identity block."
+              FAIL=1
+            fi
+            if ! echo "$CREDS" | jq -e 'length == 1 and all(.[]; has("identity") and (has("password") | not))' >/dev/null; then
+              echo "❌ use_identity=true but imageRegistryCredentials is not a single identity-only entry."
+              FAIL=1
+            fi
+          fi
+          if [ "$USE_GHCR" = "true" ] && [ "$CREDS" != "[]" ]; then
+            echo "❌ GHCR deployment must carry no imageRegistryCredentials at all."
+            FAIL=1
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo ""
+            echo "Refusing to deploy. Why this matters: the credential stored on the container group"
+            echo "outlives this job and is what the platform uses to re-pull both images whenever it"
+            echo "repairs or moves the group. Fix the credential selection instead of bypassing this step."
+            exit 1
+          fi
+          echo "✅ Pull credentials are durable (identity, anonymous, or long-lived ACR credential)."
 
       - name: Delete existing container group
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
@@ -480,6 +679,69 @@ jobs:
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
         run: |
           echo "Waiting for container to start..."
+          sleep 90
+
+      # Post-deploy recovery test. `az container restart` stops and re-creates every
+      # container in the group; on the Confidential SKU that means a fresh UVM and a fresh
+      # pull of BOTH images using only what is stored on the group (imageRegistryCredentials
+      # / identity) -- the same path a platform-initiated repair takes, and the path that
+      # failed for 30 minutes and then gave up on 2026-09-25/27/28. If the group cannot
+      # survive a restart now, it will not survive the next repair either, so fail the
+      # deploy here instead of discovering it at 03:00.
+      #
+      # Trade-off: the app re-issues its Let's Encrypt certificate on every start (no
+      # persistent volume), so this restart costs one extra issuance per deploy against
+      # the 5-per-week duplicate-certificate limit. Set repository variable
+      # ACI_SKIP_RECOVERY_TEST=true to skip it temporarily.
+      - name: Recovery test (restart re-pulls both images)
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main') && vars.ACI_SKIP_RECOVERY_TEST != 'true'
+        id: recovery
+        run: |
+          echo "Restarting ${{ env.CONTAINER_NAME }} to force a fresh image pull with the stored credentials..."
+          az container restart --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }}
+
+          DEADLINE=$((SECONDS + 300))
+          RESULT="timeout"
+          while :; do
+            STATE=$(az container show --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} \
+              --query "{provisioningState: provisioningState, containers: containers[].{name: name, state: instanceView.currentState.state, detail: instanceView.currentState.detailStatus, restarts: instanceView.restartCount}}" \
+              -o json 2>/dev/null || echo '{}')
+            PROV=$(echo "$STATE" | jq -r '.provisioningState // "unknown"')
+            TOTAL=$(echo "$STATE" | jq -r '.containers // [] | length')
+            NOT_RUNNING=$(echo "$STATE" | jq -r '[(.containers // [])[] | select(.state != "Running")] | length')
+            echo "$(date -u +%H:%M:%S) provisioningState=$PROV running=$((TOTAL - NOT_RUNNING))/$TOTAL"
+
+            if [ "$PROV" = "Succeeded" ] && [ "$TOTAL" -eq 2 ] && [ "$NOT_RUNNING" -eq 0 ]; then
+              RESULT="ok"
+              break
+            fi
+            if [ "$PROV" = "Failed" ]; then
+              RESULT="failed"
+              break
+            fi
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              break
+            fi
+            sleep 15
+          done
+
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+          if [ "$RESULT" != "ok" ]; then
+            echo "❌ Recovery test $RESULT: the group did not return to Succeeded with both containers Running within 5 minutes after a restart."
+            echo "Last observed state:"
+            echo "$STATE" | jq .
+            echo "Recent events:"
+            az container show --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} \
+              --query "containers[].{name: name, events: instanceView.events}" -o json 2>/dev/null || true
+            echo ""
+            echo "This is the path a platform repair takes; a group that cannot re-pull its images now"
+            echo "will not recover from the next repair either."
+            exit 1
+          fi
+          echo "✅ Recovery test passed: both containers re-pulled and are Running after restart."
+          # The app re-runs its ACME issuance after the restart before it opens :443; give it
+          # the same head start the initial "Wait for container" step gives (the TLS check
+          # below also retries 8 x 15s on its own).
           sleep 90
 
       - name: Check origin TLS certificate (ACME vs fallback)
@@ -655,6 +917,8 @@ jobs:
           echo "| GHCR Push | ${{ steps.push-ghcr.outcome == 'success' && '✅' || '⏭️ skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| ACR Push | ✅ ${{ steps.push-acr.outputs.digest }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Deploy Registry | ${{ steps.registry.outputs.registry }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pull Auth | ${{ steps.registry.outputs.use_identity == 'true' && 'managed identity' || (steps.registry.outputs.use_ghcr == 'true' && 'anonymous (public image)' || 'ACR admin credentials') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Recovery Test (restart) | ${{ steps.recovery.outputs.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Policy Hash | ${{ steps.policy.outputs.policy_hash }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Origin Cert Status | ${{ steps.origin_cert.outputs.cert_status }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Origin Cert Not Before | ${{ steps.origin_cert.outputs.not_before }} |" >> $GITHUB_STEP_SUMMARY
@@ -704,13 +968,40 @@ jobs:
 
       - name: Verify local build matches registry
         id: verify-registry
+        env:
+          DEPLOY_REGISTRY: ${{ needs.build-and-deploy.outputs.deploy_registry }}
+          DEPLOY_DIGEST: ${{ needs.build-and-deploy.outputs.deploy_digest }}
         run: |
           LOCAL_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}')
           echo "Local Nix build: $LOCAL_ID"
-          
+
           # Lowercase the owner (Docker registries require lowercase)
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          
+
+          # The CCE policy embeds the image reference including the registry host, so the
+          # policy hash only matches when we generate it for the registry the group was
+          # actually deployed from. Prefer that registry when the deploy job told us.
+          if [ -n "$DEPLOY_REGISTRY" ] && [ -n "$DEPLOY_DIGEST" ]; then
+            DEPLOYED_IMAGE="${DEPLOY_REGISTRY}/${{ env.IMAGE_NAME }}@${DEPLOY_DIGEST}"
+            echo "Deploy job reported: $DEPLOYED_IMAGE"
+            docker pull "$DEPLOYED_IMAGE"
+            REMOTE_ID=$(docker inspect "$DEPLOYED_IMAGE" --format='{{.Id}}')
+            echo "Deployed image: $REMOTE_ID"
+            if [ "$LOCAL_ID" != "$REMOTE_ID" ]; then
+              echo "❌ Image mismatch! The deployed image does not match the local source build."
+              exit 1
+            fi
+            echo "✅ Source build matches the deployed image!"
+            echo "registry=${DEPLOY_REGISTRY}" >> $GITHUB_OUTPUT
+            echo "digest=${DEPLOY_DIGEST}" >> $GITHUB_OUTPUT
+            if [ "${DEPLOY_REGISTRY#ghcr.io}" != "$DEPLOY_REGISTRY" ]; then
+              echo "use_ghcr=true" >> $GITHUB_OUTPUT
+            else
+              echo "use_ghcr=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+
           # Try GHCR first
           GHCR_IMAGE="${{ env.GHCR_REGISTRY }}/${OWNER}/${{ env.IMAGE_NAME }}:latest"
           if docker pull "$GHCR_IMAGE" 2>/dev/null; then
@@ -755,17 +1046,31 @@ jobs:
           REGISTRY: ${{ steps.verify-registry.outputs.registry }}
           DIGEST: ${{ steps.verify-registry.outputs.digest }}
           USE_GHCR: ${{ steps.verify-registry.outputs.use_ghcr }}
+          USE_IDENTITY: ${{ needs.build-and-deploy.outputs.deploy_use_identity }}
+          PULL_IDENTITY_ID: ${{ needs.build-and-deploy.outputs.deploy_pull_identity_id }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
         run: |
           IMAGE_REF="${REGISTRY}/${{ env.IMAGE_NAME }}@${DIGEST}"
           echo "Generating policy for: $IMAGE_REF"
-          
-          # Set credentials based on registry
-          if [ "$USE_GHCR" = "true" ]; then
-            CREDS_JSON='[{"server": "${{ env.GHCR_REGISTRY }}", "username": "${{ github.actor }}", "password": "${{ secrets.GITHUB_TOKEN }}"}]'
+
+          # This template is only fed to acipolicygen, never deployed, but keep it
+          # structurally identical to the deploy job's policy template (identity, probe,
+          # credentials shape) so the generated policy is the same. No GITHUB_TOKEN here
+          # either -- the GHCR image is public.
+          IDENTITY_JSON=""
+          if [ "$USE_IDENTITY" = "true" ] && [ -n "$PULL_IDENTITY_ID" ]; then
+            CREDS_JSON=$(jq -cn --arg server "${{ env.ACR_REGISTRY }}" --arg id "$PULL_IDENTITY_ID" '[{server: $server, identity: $id}]')
+            IDENTITY_OBJ=$(jq -cn --arg id "$PULL_IDENTITY_ID" '{type: "UserAssigned", userAssignedIdentities: {($id): {}}}')
+            IDENTITY_JSON="\"identity\": ${IDENTITY_OBJ},"
+          elif [ "$USE_GHCR" = "true" ]; then
+            CREDS_JSON='[]'
           else
-            CREDS_JSON='[{"server": "${{ env.ACR_REGISTRY }}", "username": "${{ secrets.ACR_USERNAME }}", "password": "${{ secrets.ACR_PASSWORD }}"}]'
+            CREDS_JSON=$(jq -cn --arg server "${{ env.ACR_REGISTRY }}" --arg u "$ACR_USERNAME" --arg p "$ACR_PASSWORD" '[{server: $server, username: $u, password: $p}]')
           fi
-          
+          # MUST match the deploy job's probe exactly.
+          PROBE_JSON='"livenessProbe": {"httpGet": {"path": "/health", "port": 443, "scheme": "https"}, "initialDelaySeconds": 300, "periodSeconds": 30, "failureThreshold": 3, "timeoutSeconds": 10},'
+
           cat > /tmp/verify-template.json << EOF
           {
             "\$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
@@ -775,6 +1080,7 @@ jobs:
               "apiVersion": "2023-05-01",
               "name": "verify",
               "location": "eastus",
+              ${IDENTITY_JSON}
               "properties": {
                 "sku": "Confidential",
                 "containers": [{
@@ -782,6 +1088,7 @@ jobs:
                   "properties": {
                     "image": "${IMAGE_REF}",
                     "ports": [{"port": 443, "protocol": "TCP"}],
+                    ${PROBE_JSON}
                     "environmentVariables": [
                       {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
                       {"name": "MAA_PROVIDER_URL", "value": "sharedeus.eus.attest.azure.net"}
@@ -804,7 +1111,9 @@ jobs:
             }]
           }
           EOF
-          
+
+          jq empty /tmp/verify-template.json || { echo "❌ verify template is not valid JSON"; exit 1; }
+
           # Generate base policy
           az confcom acipolicygen -a /tmp/verify-template.json --approve-wildcards
           
