@@ -34,8 +34,9 @@ type Server struct {
 	stations      map[string]*models.Station // pk -> Station
 	emailToPK     map[string]string          // email -> pk
 	stationIDToPK map[string]string          // station_id -> pk
-	opFailureMu   sync.Mutex
-	opFailure     map[string]int // "<identity>|<operation>" -> consecutive failures
+	// Consecutive per-"<identity>|<operation>" failure counts, bounded by
+	// FAILURE_TRACK_MAX entries and FAILURE_TRACK_TTL idle expiry (failure.go).
+	opFailures *opFailureTracker
 
 	banned *banned.Manager
 
@@ -60,7 +61,7 @@ func New(attestationEnabled bool) *Server {
 		stations:           make(map[string]*models.Station),
 		emailToPK:          make(map[string]string),
 		stationIDToPK:      make(map[string]string),
-		opFailure:          make(map[string]int),
+		opFailures:         newOpFailureTrackerFromEnv(),
 		banned:             banned.NewManager(),
 		attestationEnabled: attestationEnabled,
 	}
@@ -89,10 +90,14 @@ func (s *Server) Router() chi.Router {
 	r.Delete("/banned-stations", s.handleClearBanned)
 	r.Post("/reload-config", s.handleReloadConfig)
 
-	// Attestation endpoints - prove this runs in a Confidential VM
+	// Attestation endpoints - prove this runs in a Confidential VM.
+	// Every request here triggers an SKR sidecar attestation call, and the
+	// deployed sidecar leaks one /dev/sev-guest descriptor per call, so these
+	// routes get a dedicated, stricter per-IP + global limiter on top of the
+	// general one (see attestationRateLimitMiddleware in ratelimit.go).
 	if s.attestationEnabled {
-		r.Get("/attestation", s.handleAttestation)
-		r.Get("/attestation/raw", s.handleAttestationRaw)
+		r.With(attestationRateLimitMiddleware).Get("/attestation", s.handleAttestation)
+		r.With(attestationRateLimitMiddleware).Get("/attestation/raw", s.handleAttestationRaw)
 	}
 
 	return r
