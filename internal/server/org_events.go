@@ -137,19 +137,14 @@ func opFailureKey(identity, operation string) string {
 	return identity + "|" + operation
 }
 
+// incOpFailure records one more consecutive failure of operation for identity
+// and returns the new count. Backed by the bounded opFailureTracker (failure.go).
 func (s *Server) incOpFailure(identity, operation string) int {
-	key := opFailureKey(identity, operation)
-	s.opFailureMu.Lock()
-	defer s.opFailureMu.Unlock()
-	s.opFailure[key]++
-	return s.opFailure[key]
+	return s.opFailures.inc(opFailureKey(identity, operation))
 }
 
+// clearOpFailure forgets the consecutive failure count of operation for
+// identity and returns the previous count (0 if none was tracked).
 func (s *Server) clearOpFailure(identity, operation string) int {
-	key := opFailureKey(identity, operation)
-	s.opFailureMu.Lock()
-	defer s.opFailureMu.Unlock()
-	prev := s.opFailure[key]
-	delete(s.opFailure, key)
-	return prev
+	return s.opFailures.clear(opFailureKey(identity, operation))
 }
