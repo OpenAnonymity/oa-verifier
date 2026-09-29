@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,6 +20,8 @@ import (
 	"github.com/go-acme/lego/v4/lego"
 	"github.com/go-acme/lego/v4/providers/dns/cloudflare"
 	"github.com/go-acme/lego/v4/registration"
+
+	"github.com/openanonymity/oa-verifier/internal/certstore"
 )
 
 // Config holds ACME configuration from environment variables.
@@ -26,6 +29,7 @@ type Config struct {
 	Domain   string // TLS_DOMAIN
 	Email    string // ACME_EMAIL
 	Provider string // ACME_DNS_PROVIDER (cloudflare, etc.)
+	Staging  bool   // ACME_STAGING=true
 }
 
 // LoadConfig reads ACME configuration from environment.
@@ -34,12 +38,23 @@ func LoadConfig() *Config {
 		Domain:   os.Getenv("TLS_DOMAIN"),
 		Email:    os.Getenv("ACME_EMAIL"),
 		Provider: os.Getenv("ACME_DNS_PROVIDER"),
+		Staging:  os.Getenv("ACME_STAGING") == "true",
 	}
 }
 
 // IsEnabled returns true if ACME is properly configured.
 func (c *Config) IsEnabled() bool {
 	return c.Domain != "" && c.Email != "" && c.Provider != ""
+}
+
+// CADirURL returns the ACME directory this configuration talks to. Account
+// keys and certificates are only meaningful at the CA that issued them, so
+// the value is persisted alongside the bundle.
+func (c *Config) CADirURL() string {
+	if c.Staging {
+		return lego.LEDirectoryStaging
+	}
+	return lego.LEDirectoryProduction
 }
 
 // User implements acme.User for lego.
@@ -60,13 +75,35 @@ type Client struct {
 	cfg    *Config
 }
 
-// NewClient creates an ACME client, generates an account key, and registers
-// with the ACME server. The returned Client can be reused for multiple
-// ObtainCertificate calls without re-registering (avoiding rate limits).
+// NewClient creates an ACME client with a fresh account key and registers it.
+// Prefer NewClientWithAccount when a persisted account exists: re-registering
+// on every start is what exhausted the CA's rate limits.
 func NewClient(cfg *Config) (*Client, error) {
-	privateKey, err := certcrypto.GeneratePrivateKey(certcrypto.EC256)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate account key: %w", err)
+	return NewClientWithAccount(cfg, nil, "")
+}
+
+// NewClientWithAccount creates an ACME client. When accountKeyPEM is given the
+// key is reused and the existing account is resolved by key
+// (registration.ResolveAccountByKey) instead of creating a new one; if the CA
+// does not know the key, a registration is created for it. accountURI is
+// informational (the CA is authoritative) and logged.
+func NewClientWithAccount(cfg *Config, accountKeyPEM []byte, accountURI string) (*Client, error) {
+	var privateKey crypto.PrivateKey
+	var err error
+	reused := false
+	if len(accountKeyPEM) > 0 {
+		privateKey, err = certcrypto.ParsePEMPrivateKey(accountKeyPEM)
+		if err != nil {
+			slog.Warn("persisted ACME account key is unreadable, generating a new one", "error", err)
+		} else {
+			reused = true
+		}
+	}
+	if privateKey == nil {
+		privateKey, err = certcrypto.GeneratePrivateKey(certcrypto.EC256)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate account key: %w", err)
+		}
 	}
 
 	user := &User{
@@ -76,12 +113,9 @@ func NewClient(cfg *Config) (*Client, error) {
 
 	config := lego.NewConfig(user)
 	config.Certificate.KeyType = certcrypto.EC256
-
-	if os.Getenv("ACME_STAGING") == "true" {
-		config.CADirURL = lego.LEDirectoryStaging
+	config.CADirURL = cfg.CADirURL()
+	if cfg.Staging {
 		slog.Info("using Let's Encrypt staging environment")
-	} else {
-		config.CADirURL = lego.LEDirectoryProduction
 	}
 
 	client, err := lego.NewClient(config)
@@ -99,19 +133,44 @@ func NewClient(cfg *Config) (*Client, error) {
 		return nil, fmt.Errorf("failed to set DNS provider: %w", err)
 	}
 
+	if reused {
+		reg, rerr := client.Registration.ResolveAccountByKey()
+		if rerr == nil {
+			user.Registration = reg
+			if accountURI != "" && accountURI != reg.URI {
+				slog.Warn("ACME account URI changed", "persisted", accountURI, "resolved", reg.URI)
+			}
+			slog.Info("reusing persisted ACME account", "account", reg.URI)
+			return &Client{client: client, user: user, cfg: cfg}, nil
+		}
+		slog.Warn("persisted ACME account key not known to CA, registering it", "error", rerr, "persisted_uri", accountURI)
+	}
+
 	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
 	if err != nil {
 		return nil, fmt.Errorf("failed to register with ACME: %w", err)
 	}
 	user.Registration = reg
-	slog.Info("registered with ACME server")
+	slog.Info("registered with ACME server", "account", reg.URI)
 
 	return &Client{client: client, user: user, cfg: cfg}, nil
 }
 
-// ObtainCertificate obtains a certificate via DNS-01 challenge using
-// an already-registered ACME client. Does not re-register.
-func (ac *Client) ObtainCertificate(ctx context.Context) (tls.Certificate, string, error) {
+// AccountKeyPEM returns the PEM-encoded account private key.
+func (ac *Client) AccountKeyPEM() []byte { return certcrypto.PEMEncode(ac.user.key) }
+
+// AccountURI returns the account's registration URI, if registered.
+func (ac *Client) AccountURI() string {
+	if ac.user.Registration == nil {
+		return ""
+	}
+	return ac.user.Registration.URI
+}
+
+// ObtainBundle obtains a certificate via DNS-01 challenge using an
+// already-registered ACME client and returns it together with the account
+// material as a persistable bundle. Does not re-register.
+func (ac *Client) ObtainBundle(ctx context.Context) (*certstore.Bundle, error) {
 	slog.Info("requesting ACME certificate", "domain", ac.cfg.Domain)
 
 	request := certificate.ObtainRequest{
@@ -121,18 +180,39 @@ func (ac *Client) ObtainCertificate(ctx context.Context) (tls.Certificate, strin
 
 	certificates, err := ac.client.Certificate.Obtain(request)
 	if err != nil {
-		return tls.Certificate{}, "", fmt.Errorf("failed to obtain certificate: %w", err)
+		return nil, fmt.Errorf("failed to obtain certificate: %w", err)
 	}
 
-	slog.Info("certificate obtained successfully", "domain", ac.cfg.Domain)
-
-	cert, err := tls.X509KeyPair(certificates.Certificate, certificates.PrivateKey)
+	b := &certstore.Bundle{
+		Domain:         ac.cfg.Domain,
+		CertificatePEM: certificates.Certificate,
+		PrivateKeyPEM:  certificates.PrivateKey,
+		AccountKeyPEM:  ac.AccountKeyPEM(),
+		AccountURI:     ac.AccountURI(),
+		CADirURL:       ac.cfg.CADirURL(),
+		IssuedAt:       time.Now().UTC(),
+	}
+	leaf, err := b.Leaf()
 	if err != nil {
-		return tls.Certificate{}, "", fmt.Errorf("failed to parse certificate: %w", err)
+		return nil, fmt.Errorf("failed to parse obtained certificate: %w", err)
+	}
+	b.NotAfter = leaf.NotAfter
+	if _, _, err := b.TLSCertificate(); err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: %w", err)
 	}
 
-	pubKeyHash := computePubKeyHash(&cert)
-	return cert, pubKeyHash, nil
+	slog.Info("certificate obtained successfully", "domain", ac.cfg.Domain, "not_after", leaf.NotAfter.UTC().Format(time.RFC3339))
+	return b, nil
+}
+
+// ObtainCertificate obtains a certificate via DNS-01 challenge using
+// an already-registered ACME client. Does not re-register.
+func (ac *Client) ObtainCertificate(ctx context.Context) (tls.Certificate, string, error) {
+	b, err := ac.ObtainBundle(ctx)
+	if err != nil {
+		return tls.Certificate{}, "", err
+	}
+	return b.TLSCertificate()
 }
 
 // ObtainCertificate is a convenience wrapper that creates a new client,
@@ -179,24 +259,28 @@ func computePubKeyHash(cert *tls.Certificate) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// RenewBefore is how long before expiry a certificate is renewed, and the
+// minimum remaining validity a persisted certificate needs to be reused.
+const RenewBefore = 30 * 24 * time.Hour
+
 // StartRenewalLoop starts a background goroutine that renews the certificate
-// before expiry and calls updateCert with the new certificate and public key hash.
-// It uses the provided Client to avoid re-registering with the ACME server.
-func StartRenewalLoop(ctx context.Context, cfg *Config, acmeClient *Client, cert tls.Certificate, updateCert func(tls.Certificate, string)) {
-	// Parse leaf to get expiry time.
-	var notAfter time.Time
-	if len(cert.Certificate) > 0 {
-		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil {
-			notAfter = leaf.NotAfter
-		}
+// in bundle before expiry, persists the new bundle to store and calls
+// updateCert with the new certificate and public key hash. The ACME client is
+// created lazily at renewal time from the bundle's persisted account key, so
+// no new account is registered.
+func StartRenewalLoop(ctx context.Context, cfg *Config, store certstore.Store, bundle *certstore.Bundle, updateCert func(tls.Certificate, string)) {
+	if store == nil {
+		store = certstore.NoopStore{}
 	}
-	if notAfter.IsZero() {
-		slog.Warn("could not determine certificate expiry, renewal loop will not run")
+	leaf, err := bundle.Leaf()
+	if err != nil || leaf.NotAfter.IsZero() {
+		slog.Warn("could not determine certificate expiry, renewal loop will not run", "error", err)
 		return
 	}
+	notAfter := leaf.NotAfter
+	current := bundle
 
 	go func() {
-		const renewBefore = 30 * 24 * time.Hour // renew 30 days before expiry
 		ticker := time.NewTicker(12 * time.Hour)
 		defer ticker.Stop()
 
@@ -208,27 +292,40 @@ func StartRenewalLoop(ctx context.Context, cfg *Config, acmeClient *Client, cert
 				remaining := time.Until(notAfter)
 				slog.Info("certificate renewal check", "domain", cfg.Domain, "expires_in", remaining.Round(time.Hour))
 
-				if remaining > renewBefore {
+				if remaining > RenewBefore {
 					continue
 				}
 
 				slog.Info("certificate expiring soon, renewing", "domain", cfg.Domain, "expires_in", remaining.Round(time.Hour))
-				newCert, newHash, err := acmeClient.ObtainCertificate(ctx)
+				client, err := NewClientWithAccount(cfg, current.AccountKeyPEM, current.AccountURI)
+				if err != nil {
+					slog.Error("certificate renewal failed: ACME client", "domain", cfg.Domain, "error", err)
+					continue
+				}
+				newBundle, err := client.ObtainBundle(ctx)
 				if err != nil {
 					slog.Error("certificate renewal failed", "domain", cfg.Domain, "error", err)
 					continue
 				}
-
-				// Update expiry for next check.
-				if len(newCert.Certificate) > 0 {
-					if leaf, err := x509.ParseCertificate(newCert.Certificate[0]); err == nil {
-						notAfter = leaf.NotAfter
-					}
+				newCert, newHash, err := newBundle.TLSCertificate()
+				if err != nil {
+					slog.Error("certificate renewal produced an unusable bundle", "domain", cfg.Domain, "error", err)
+					continue
+				}
+				if err := store.Save(ctx, newBundle); err != nil {
+					slog.Error("failed to persist renewed certificate; it will be re-issued on next restart", "domain", cfg.Domain, "error", err)
+				} else {
+					slog.Info("renewed certificate persisted", "domain", cfg.Domain)
 				}
 
-				slog.Info("certificate renewed", "domain", cfg.Domain, "new_hash", newHash)
+				current = newBundle
+				notAfter = newBundle.NotAfter
+				slog.Info("certificate renewed", "domain", cfg.Domain, "new_hash", newHash, "not_after", notAfter.UTC().Format(time.RFC3339))
 				updateCert(newCert, newHash)
 			}
 		}
 	}()
 }
+
+// errNoBundle is used internally when nothing usable could be produced.
+var errNoBundle = errors.New("acme: no certificate available")

@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 
 	"github.com/openanonymity/oa-verifier/internal/acme"
 	"github.com/openanonymity/oa-verifier/internal/banned"
+	"github.com/openanonymity/oa-verifier/internal/certstore"
 	"github.com/openanonymity/oa-verifier/internal/challenge"
 	"github.com/openanonymity/oa-verifier/internal/models"
 )
@@ -34,8 +36,9 @@ type Server struct {
 	stations      map[string]*models.Station // pk -> Station
 	emailToPK     map[string]string          // email -> pk
 	stationIDToPK map[string]string          // station_id -> pk
-	opFailureMu   sync.Mutex
-	opFailure     map[string]int // "<identity>|<operation>" -> consecutive failures
+	// Consecutive per-"<identity>|<operation>" failure counts, bounded by
+	// FAILURE_TRACK_MAX entries and FAILURE_TRACK_TTL idle expiry (failure.go).
+	opFailures *opFailureTracker
 
 	banned *banned.Manager
 
@@ -60,7 +63,7 @@ func New(attestationEnabled bool) *Server {
 		stations:           make(map[string]*models.Station),
 		emailToPK:          make(map[string]string),
 		stationIDToPK:      make(map[string]string),
-		opFailure:          make(map[string]int),
+		opFailures:         newOpFailureTrackerFromEnv(),
 		banned:             banned.NewManager(),
 		attestationEnabled: attestationEnabled,
 	}
@@ -89,10 +92,14 @@ func (s *Server) Router() chi.Router {
 	r.Delete("/banned-stations", s.handleClearBanned)
 	r.Post("/reload-config", s.handleReloadConfig)
 
-	// Attestation endpoints - prove this runs in a Confidential VM
+	// Attestation endpoints - prove this runs in a Confidential VM.
+	// Every request here triggers an SKR sidecar attestation call, and the
+	// deployed sidecar leaks one /dev/sev-guest descriptor per call, so these
+	// routes get a dedicated, stricter per-IP + global limiter on top of the
+	// general one (see attestationRateLimitMiddleware in ratelimit.go).
 	if s.attestationEnabled {
-		r.Get("/attestation", s.handleAttestation)
-		r.Get("/attestation/raw", s.handleAttestationRaw)
+		r.With(attestationRateLimitMiddleware).Get("/attestation", s.handleAttestation)
+		r.With(attestationRateLimitMiddleware).Get("/attestation/raw", s.handleAttestationRaw)
 	}
 
 	return r
@@ -137,7 +144,9 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 }
 
 // RunTLS starts HTTPS.
-// If ACME is configured (TLS_DOMAIN, ACME_EMAIL, ACME_DNS_PROVIDER), obtains a Let's Encrypt certificate.
+// If ACME is configured (TLS_DOMAIN, ACME_EMAIL, ACME_DNS_PROVIDER), serves a Let's Encrypt
+// certificate: a persisted one when TLS_CERT_STORE holds a still-valid bundle for the
+// domain, otherwise a freshly obtained one (which is then persisted).
 // Otherwise, generates a self-signed certificate.
 // TLS terminates at this server (inside the enclave), not at Azure.
 func (s *Server) RunTLS(ctx context.Context, addr string) error {
@@ -149,68 +158,44 @@ func (s *Server) RunTLS(ctx context.Context, addr string) error {
 	// Try ACME first if configured
 	acmeCfg := acme.LoadConfig()
 	if acmeCfg.IsEnabled() {
-		slog.Info("ACME configured, obtaining Let's Encrypt certificate",
-			"domain", acmeCfg.Domain,
-			"provider", acmeCfg.Provider)
-
-		// Register once with ACME server (avoids rate limit on re-registration).
-		const maxRegRetries = 10
-		const regRetryDelay = 3 * time.Minute
-		var acmeClient *acme.Client
-		for attempt := 1; ; attempt++ {
-			acmeClient, err = acme.NewClient(acmeCfg)
-			if err == nil {
-				break
-			}
-			if attempt >= maxRegRetries {
-				slog.Error("ACME registration failed after all retries",
-					"attempts", maxRegRetries, "error", err)
-				break
-			}
-			slog.Warn("ACME registration failed, retrying",
-				"attempt", attempt, "max_retries", maxRegRetries, "error", err)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(regRetryDelay):
-			}
+		// Certificate persistence backend (TLS_CERT_STORE; default none = historical behaviour).
+		store, storeDesc, serr := certstore.FromEnv(os.Getenv)
+		if serr != nil {
+			slog.Error("invalid TLS certificate store configuration", "error", serr)
+			return fmt.Errorf("certificate store: %w", serr)
 		}
+		slog.Info("ACME configured", "domain", acmeCfg.Domain, "provider", acmeCfg.Provider,
+			"cert_store", storeDesc, "ca", acmeCfg.CADirURL())
 
-		if acmeClient != nil {
-			// Obtain certificate (retries don't re-register).
-			const maxCertRetries = 5
-			const certRetryDelay = 15 * time.Second
-			for attempt := 1; ; attempt++ {
-				cert, pubKeyHash, err = acmeClient.ObtainCertificate(ctx)
-				if err == nil {
-					break
-				}
-				if attempt >= maxCertRetries {
-					slog.Error("ACME certificate failed after all retries",
-						"attempts", maxCertRetries, "error", err)
-					break
-				}
-				slog.Warn("ACME certificate attempt failed, retrying",
-					"attempt", attempt, "max_retries", maxCertRetries, "error", err)
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(certRetryDelay):
-				}
-			}
+		// Load a persisted certificate or obtain one (registration and issuance
+		// retries live in the obtainer; the persisted ACME account is reused).
+		bundle, source, lerr := acme.LoadOrObtain(ctx, acmeCfg, store,
+			acme.NewRetryingObtainer(acmeCfg, acme.DefaultRetryPolicy), nil)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if lerr == nil {
+			cert, pubKeyHash, err = bundle.TLSCertificate()
+		} else {
+			err = lerr
 		}
 
 		if err != nil {
-			slog.Error("ACME certificate failed, falling back to self-signed", "error", err)
+			// No persisted certificate could be served either (LoadOrObtain would have
+			// returned it), so self-signed is the only remaining option.
+			slog.Error("ACME certificate failed and no persisted certificate is usable, falling back to self-signed", "error", err)
 			cert, pubKeyHash, err = generateSelfSignedCert()
 			if err != nil {
 				return err
 			}
 			certType = "self-signed (ACME fallback)"
 		} else {
-			certType = "Let's Encrypt"
-			// Start renewal loop — callback swaps the live cert under a mutex.
-			acme.StartRenewalLoop(ctx, acmeCfg, acmeClient, cert, func(newCert tls.Certificate, newHash string) {
+			certType = "Let's Encrypt (" + string(source) + ")"
+			slog.Info("TLS certificate source", "source", source,
+				"not_after", bundle.NotAfter.UTC().Format(time.RFC3339))
+			// Start renewal loop — renews from the persisted account, saves to the store,
+			// and swaps the live cert under a mutex.
+			acme.StartRenewalLoop(ctx, acmeCfg, store, bundle, func(newCert tls.Certificate, newHash string) {
 				s.tlsCertMu.Lock()
 				s.tlsCert = &newCert
 				s.tlsPubKeyHash = newHash

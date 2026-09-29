@@ -10,7 +10,7 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
-        
+
         # Fixed timestamp for reproducibility (2024-01-01T00:00:00Z)
         SOURCE_DATE_EPOCH = "1704067200";
 
@@ -19,14 +19,14 @@
           pname = "oa-verifier";
           version = "0.1.0";
           src = ./.;
-          
+
           subPackages = [ "cmd/verifier" ];
           vendorHash = "sha256-Gw49LP2f8VWvUqViQayxKH+fMuj4OCjCHIgFSBGPvuw=";
-          
+
           CGO_ENABLED = 0;
-          
+
           ldflags = [ "-s" "-w" "-buildid=" ];
-          
+
           preBuild = ''
             export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
           '';
@@ -34,7 +34,7 @@
           postInstall = ''
             mv $out/bin/verifier $out/bin/oa-verifier
           '';
-          
+
           meta = with pkgs.lib; {
             description = "OA-Verifier attestation service";
             license = licenses.agpl3Plus;
@@ -53,13 +53,13 @@
             name = "oa-verifier";
             tag = "latest";
             created = "2024-01-01T00:00:00Z";  # Fixed timestamp
-            
+
             copyToRoot = pkgs.buildEnv {
               name = "image-root";
               paths = [ pkgs.cacert pkgs.tzdata server ];
               pathsToLink = [ "/bin" "/etc" ];
             };
-            
+
             config = {
               Entrypoint = [ "/bin/oa-verifier" ];
               ExposedPorts."443/tcp" = {};
@@ -73,7 +73,7 @@
 
         devShells.default = pkgs.mkShell {
           buildInputs = [ pkgs.go_1_22 pkgs.gopls pkgs.docker pkgs.azure-cli pkgs.jq ];
-          
+
           shellHook = ''
             echo "OA-Verifier Dev Environment"
             echo "  nix build .#server    - Build Go binary"

@@ -45,7 +45,7 @@ jobs:
         id: build
         run: |
           echo "Building container from source with Nix..."
-          nix build .#container --print-build-logs
+          nix build --no-update-lock-file .#container --print-build-logs
           
           # Load into Docker
           docker load < result
