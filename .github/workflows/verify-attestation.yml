@@ -1,38 +1,81 @@
 name: Verify Attestation (Source → Deployed)
 
-# This workflow rebuilds from source and verifies the deployed container matches.
-# It pushes to a local registry to get the manifest digest, which should match
-# GHCR if Nix builds are reproducible.
-
+# Both post-deploy and manual checks use the same read-only verification path.
 on:
-  # Run after Build, Sign, and Deploy completes
-  workflow_run:
-    workflows: ["Build, Sign, and Deploy"]
-    types: [completed]
-    branches: [main]
-  
-  # Manual trigger
+  workflow_call:
+    inputs:
+      source_revision:
+        type: string
+        required: true
+    secrets:
+      AZURE_CREDENTIALS:
+        required: true
+      ACR_USERNAME:
+        required: true
+      ACR_PASSWORD:
+        required: true
+      ACI_PULL_IDENTITY_ID:
+        required: false
+      TLS_DOMAIN:
+        required: false
   workflow_dispatch:
     inputs:
-      service_url:
-        description: 'Service URL to verify (leave empty to use TLS_DOMAIN or default)'
-        required: false
-        default: ''
-  
-  # Daily verification
+      source_revision:
+        description: 'Exact source commit of the deployed shared verifier'
+        type: string
+        required: true
   schedule:
     - cron: '0 0 * * *'
 
+permissions:
+  contents: read
+  packages: read
+
+env:
+  GHCR_REGISTRY: ghcr.io
+  ACR_REGISTRY: oaverifieracr.azurecr.io
+  IMAGE_NAME: oa-verifier
+
 jobs:
   verify:
-    name: Verify Source Matches Deployment
+    name: Verify Attestation
     runs-on: ubuntu-latest
-    # Only run if triggered manually, scheduled, or if the build workflow succeeded
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
-    
+    permissions:
+      contents: read
+      packages: read
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Test verification and deployment safeguards
+        run: python3 -m unittest discover -s tests/deployment -p 'test_*.py'
+
+      - name: Checkout source revision to rebuild
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_revision || github.sha }}
+          path: source
+
+      - name: Install Azure CLI and confcom
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          az extension add --name confcom --yes
+
+      - name: Azure login for read-only deployment inspection
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Read exact deployed image (no latest-tag fallback)
+        id: deployed
+        env:
+          PULL_IDENTITY_ID: ${{ vars.ACI_PULL_IDENTITY_ID || secrets.ACI_PULL_IDENTITY_ID }}
+        run: |
+          az container show --resource-group oa-verifier --name oa-verifier-2 \
+            --query "{containers:containers[].{name:name,image:image},registries:imageRegistryCredentials[].{server:server,identity:identity}}" \
+            --output json > /tmp/deployed-image.json
+          python3 scripts/deployed_image.py /tmp/deployed-image.json >> "$GITHUB_OUTPUT"
 
       - name: Install Nix
         uses: cachix/install-nix-action@v27
@@ -43,184 +86,241 @@ jobs:
 
       - name: Build container from source (Nix)
         id: build
+        working-directory: source
         run: |
-          echo "Building container from source with Nix..."
+          echo "Rebuilding container from source..."
           nix build --no-update-lock-file .#container --print-build-logs
-          
-          # Load into Docker
           docker load < result
-          
-          # Get the image ID for reference
-          IMAGE_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}' | cut -d: -f2)
+
+          IMAGE_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}')
           echo "image_id=$IMAGE_ID" >> $GITHUB_OUTPUT
-          echo "Source build image ID: $IMAGE_ID"
+          echo "✅ Source build complete. Image ID: $IMAGE_ID"
 
-      - name: Get manifest digest via local registry
-        id: digest
+      - name: Log in to registries
         run: |
-          # Start a local registry
-          docker run -d -p 5000:5000 --name registry registry:2
-          sleep 3
-          
-          # Push to local registry to get manifest digest
-          docker tag oa-verifier:latest localhost:5000/oa-verifier:latest
-          docker push localhost:5000/oa-verifier:latest
-          
-          # Get the manifest digest (this is what CCE policy uses)
-          LOCAL_DIGEST=$(docker inspect localhost:5000/oa-verifier:latest --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
-          echo "digest=$LOCAL_DIGEST" >> $GITHUB_OUTPUT
-          echo "Local build manifest digest: $LOCAL_DIGEST"
-          
-          # Cleanup
-          docker stop registry && docker rm registry
+          # Log in to GHCR
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.GHCR_REGISTRY }} -u "${{ github.actor }}" --password-stdin || true
+          # Log in to ACR
+          echo "${{ secrets.ACR_PASSWORD }}" | docker login ${{ env.ACR_REGISTRY }} -u "${{ secrets.ACR_USERNAME }}" --password-stdin
 
-      - name: Determine service URL
-        id: url
-        run: |
-          # Priority: 1) Manual input, 2) TLS_DOMAIN secret, 3) Azure FQDN default
-          if [ -n "${{ github.event.inputs.service_url }}" ]; then
-            echo "url=${{ github.event.inputs.service_url }}" >> $GITHUB_OUTPUT
-            echo "curl_flags=-sfk" >> $GITHUB_OUTPUT
-            echo "Using manual input: ${{ github.event.inputs.service_url }}"
-          elif [ -n "${{ secrets.TLS_DOMAIN }}" ]; then
-            echo "url=https://${{ secrets.TLS_DOMAIN }}" >> $GITHUB_OUTPUT
-            echo "curl_flags=-sf" >> $GITHUB_OUTPUT
-            echo "Using TLS_DOMAIN: ${{ secrets.TLS_DOMAIN }}"
-          else
-            echo "url=https://oa-verifier-2.eastus.azurecontainer.io" >> $GITHUB_OUTPUT
-            echo "curl_flags=-sfk" >> $GITHUB_OUTPUT
-            echo "Using default Azure FQDN"
-          fi
-
-      - name: Fetch attestation from deployed service
-        id: attestation
+      - name: Verify local build matches deployed image
         env:
-          SERVICE_URL: ${{ steps.url.outputs.url }}
-          CURL_FLAGS: ${{ steps.url.outputs.curl_flags }}
+          REGISTRY: ${{ steps.deployed.outputs.registry }}
+          DIGEST: ${{ steps.deployed.outputs.digest }}
         run: |
-          echo "Fetching attestation from: $SERVICE_URL"
-          
-          ATTESTATION=$(curl $CURL_FLAGS "$SERVICE_URL/attestation?nonce=verify-$(date +%s)" 2>/dev/null)
-          
-          if [ -z "$ATTESTATION" ]; then
-            echo "❌ Could not fetch attestation from service"
+          LOCAL_ID=$(docker inspect oa-verifier:latest --format='{{.Id}}')
+          IMAGE_REF="${REGISTRY}/oa-verifier@${DIGEST}"
+          docker pull "$IMAGE_REF"
+          REMOTE_ID=$(docker inspect "$IMAGE_REF" --format='{{.Id}}')
+          if [ "$LOCAL_ID" != "$REMOTE_ID" ]; then
+            echo "Source build does not match the exact deployed image."
             exit 1
           fi
-          
-          # Extract the policy
-          POLICY=$(echo "$ATTESTATION" | jq -r '.policy.decoded')
-          
-          if [ -z "$POLICY" ] || [ "$POLICY" = "null" ]; then
-            echo "❌ Could not extract policy from attestation"
+          echo "Source build matches the exact deployed image."
+
+      - name: Generate CCE policy from source build
+        id: policy
+        env:
+          REGISTRY: ${{ steps.deployed.outputs.registry }}
+          DIGEST: ${{ steps.deployed.outputs.digest }}
+          USE_GHCR: ${{ steps.deployed.outputs.use_ghcr }}
+          USE_IDENTITY: ${{ steps.deployed.outputs.use_identity }}
+          # This must match the identity read from the live group.
+          PULL_IDENTITY_ID: ${{ vars.ACI_PULL_IDENTITY_ID || secrets.ACI_PULL_IDENTITY_ID }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          IMAGE_REF="${REGISTRY}/${{ env.IMAGE_NAME }}@${DIGEST}"
+          echo "Generating policy for: $IMAGE_REF"
+
+          # This template is only fed to acipolicygen, never deployed, but keep it
+          # structurally identical to the deploy job's policy template (identity, probe,
+          # credentials shape) so the generated policy is the same. No GITHUB_TOKEN here
+          # either -- the GHCR image is public.
+          IDENTITY_JSON=""
+          if [ "$USE_IDENTITY" = "true" ] && [ -z "$PULL_IDENTITY_ID" ]; then
+            echo "❌ Live group uses identity-based pull but ACI_PULL_IDENTITY_ID is unavailable"
             exit 1
           fi
-          
-          # Extract the image digest from the policy
-          # The policy contains: "id":"ghcr.io/xxx/oa-verifier@sha256:..."
-          REMOTE_DIGEST=$(echo "$POLICY" | python3 -c "
-          import sys, json, re
+          if [ "$USE_IDENTITY" = "true" ]; then
+            CREDS_JSON=$(jq -cn --arg server "${{ env.ACR_REGISTRY }}" --arg id "$PULL_IDENTITY_ID" '[{server: $server, identity: $id}]')
+            IDENTITY_OBJ=$(jq -cn --arg id "$PULL_IDENTITY_ID" '{type: "UserAssigned", userAssignedIdentities: {($id): {}}}')
+            IDENTITY_JSON="\"identity\": ${IDENTITY_OBJ},"
+          elif [ "$USE_GHCR" = "true" ]; then
+            CREDS_JSON='[]'
+          else
+            CREDS_JSON=$(jq -cn --arg server "${{ env.ACR_REGISTRY }}" --arg u "$ACR_USERNAME" --arg p "$ACR_PASSWORD" '[{server: $server, username: $u, password: $p}]')
+          fi
+          # MUST match the deploy job's probe exactly.
+          PROBE_JSON='"livenessProbe": {"httpGet": {"path": "/health", "port": 443, "scheme": "https"}, "initialDelaySeconds": 300, "periodSeconds": 30, "failureThreshold": 3, "timeoutSeconds": 10},'
+
+          cat > /tmp/verify-template.json << EOF
+          {
+            "\$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+            "contentVersion": "1.0.0.0",
+            "resources": [{
+              "type": "Microsoft.ContainerInstance/containerGroups",
+              "apiVersion": "2023-05-01",
+              "name": "verify",
+              "location": "eastus",
+              ${IDENTITY_JSON}
+              "properties": {
+                "sku": "Confidential",
+                "containers": [{
+                  "name": "oa-verifier",
+                  "properties": {
+                    "image": "${IMAGE_REF}",
+                    "ports": [{"port": 443, "protocol": "TCP"}],
+                    ${PROBE_JSON}
+                    "environmentVariables": [
+                      {"name": "MAA_ENDPOINT", "value": "http://localhost:8080/attest/maa"},
+                      {"name": "MAA_PROVIDER_URL", "value": "sharedeus.eus.attest.azure.net"}
+                    ],
+                    "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
+                  }
+                },{
+                  "name": "skr-sidecar",
+                  "properties": {
+                    "image": "mcr.microsoft.com/aci/skr@sha256:baa6acf093c011cb26799187b6a535e32bd8248f52dd2cd9c606732b8a23c112",
+                    "command": ["/skr.sh"],
+                    "ports": [{"port": 8080, "protocol": "TCP"}],
+                    "resources": {"requests": {"cpu": 0.5, "memoryInGB": 1.0}}
+                  }
+                }],
+                "imageRegistryCredentials": ${CREDS_JSON},
+                "osType": "Linux",
+                "confidentialComputeProperties": {"ccePolicy": ""}
+              }
+            }]
+          }
+          EOF
+
+          jq empty /tmp/verify-template.json || { echo "❌ verify template is not valid JSON"; exit 1; }
+
+          # Generate base policy
+          az confcom acipolicygen -a /tmp/verify-template.json --approve-wildcards
+
+          # Modify policy to allow CCE_POLICY_B64 env var (same as deploy)
+          BASE_POLICY_B64=$(jq -r '.resources[0].properties.confidentialComputeProperties.ccePolicy' /tmp/verify-template.json)
+          BASE_POLICY=$(echo "$BASE_POLICY_B64" | base64 -d)
+
+          # Add regex rules for ALL dynamic env vars (must match deploy job!)
+          MODIFIED_POLICY=$(echo "$BASE_POLICY" | python3 -c '
+          import sys
+          import json
+          import re
+
           policy = sys.stdin.read()
-          match = re.search(r'containers\s*:=\s*(\[.*?\])\s*\n', policy, re.DOTALL)
+          match = re.search(r"containers := (\[.*?\])\s*\n\nallow_properties", policy, re.DOTALL)
+          if not match:
+              match = re.search(r"containers := (\[.*?\])(?=\s*\n\n|\s*$)", policy, re.DOTALL)
+
           if match:
-              containers = json.loads(match.group(1))
-              for c in containers:
-                  if c.get('name') == 'oa-verifier':
-                      image_id = c.get('id', '')
-                      # Extract digest from image ID
-                      if '@sha256:' in image_id:
-                          print('sha256:' + image_id.split('@sha256:')[1])
-                      break
-          ")
-          
-          if [ -z "$REMOTE_DIGEST" ]; then
-            echo "❌ Could not extract digest from policy"
-            exit 1
-          fi
-          
-          echo "remote_digest=$REMOTE_DIGEST" >> $GITHUB_OUTPUT
-          echo "Deployed image digest: $REMOTE_DIGEST"
-          
-          # Also get policy hash for reference
-          POLICY_HASH=$(echo "$ATTESTATION" | jq -r '.summary.cce_policy_hash // .summary.host_data')
-          echo "policy_hash=$POLICY_HASH" >> $GITHUB_OUTPUT
-          
-          echo ""
-          echo "Attestation details:"
-          echo "$ATTESTATION" | jq '{
-            issuer: .summary.issuer,
-            type: .summary.attestation_type,
-            compliance: .summary.compliance_status,
-            debug_disabled: .summary.debug_disabled,
-            policy_hash: .summary.cce_policy_hash
-          }'
+              containers_json = match.group(1)
+              containers = json.loads(containers_json)
+              if containers and "env_rules" in containers[0]:
+                  # MUST match the same env vars as deploy job!
+                  # Required vars use .+ (must have value), optional use .* (can be empty)
+                  required_env_vars = [
+                      "CCE_POLICY_B64",
+                      "STATION_REGISTRY_URL",
+                      "STATION_REGISTRY_SECRET",
+                      "CHALLENGE_MIN_INTERVAL",
+                      "CHALLENGE_MAX_INTERVAL"
+                  ]
+                  optional_env_vars = [
+                      "MAX_CONCURRENT_REQUESTS",
+                      "RATE_LIMIT_RPS",
+                      "RATE_LIMIT_BURST",
+                      "SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS",
+                      "TLS_DOMAIN",
+                      "ACME_EMAIL",
+                      "ACME_DNS_PROVIDER",
+                      "CF_DNS_API_TOKEN",
+                      "CF_ZONE_API_TOKEN",
+                      "REKOR_LOG_INDEX",
+                      "SIGSTORE_PAYLOAD_HASH"
+                  ]
+                  for env_var in required_env_vars:
+                      containers[0]["env_rules"].append({
+                          "pattern": f"{env_var}=.+",
+                          "required": False,
+                          "strategy": "re2"
+                      })
+                  for env_var in optional_env_vars:
+                      containers[0]["env_rules"].append({
+                          "pattern": f"{env_var}=.*",
+                          "required": False,
+                          "strategy": "re2"
+                      })
+              new_containers_json = json.dumps(containers, separators=(",", ":"))
+              policy = policy[:match.start(1)] + new_containers_json + policy[match.end(1):]
+          print(policy)
+          ')
 
-      - name: Compare digests (Source vs Deployed)
+          SOURCE_HASH=$(echo "$MODIFIED_POLICY" | sha256sum | cut -d' ' -f1)
+          echo "source_hash=$SOURCE_HASH" >> $GITHUB_OUTPUT
+          echo "Source policy hash: $SOURCE_HASH"
+
+      - name: Fetch and verify attestation
         env:
-          SOURCE_DIGEST: ${{ steps.digest.outputs.digest }}
-          REMOTE_DIGEST: ${{ steps.attestation.outputs.remote_digest }}
-          SOURCE_IMAGE_ID: ${{ steps.build.outputs.image_id }}
-          REMOTE_POLICY_HASH: ${{ steps.attestation.outputs.policy_hash }}
+          SOURCE_HASH: ${{ steps.policy.outputs.source_hash }}
         run: |
-          echo "=============================================="
-          echo "  ZERO-TRUST VERIFICATION RESULT"
-          echo "=============================================="
-          echo ""
-          echo "Source build digest:  $SOURCE_DIGEST"
-          echo "Deployed digest:      $REMOTE_DIGEST"
-          echo ""
-          echo "Additional info:"
-          echo "  Source image ID:    $SOURCE_IMAGE_ID"
-          echo "  Deployed policy:    $REMOTE_POLICY_HASH"
-          echo ""
-          
-          if [ "$SOURCE_DIGEST" = "$REMOTE_DIGEST" ]; then
-            echo "✅ VERIFICATION PASSED"
-            echo ""
-            echo "The deployed container's manifest digest EXACTLY matches"
-            echo "what was built from this repository's source code."
-            echo ""
-            echo "This proves:"
-            echo "  - Nix builds are reproducible"
-            echo "  - The same source produces the same container"
-            echo "  - No tampering occurred between build and deployment"
+          # Use custom domain if configured, otherwise Azure FQDN
+          if [ -n "${{ secrets.TLS_DOMAIN }}" ]; then
+            SERVICE_URL="https://${{ secrets.TLS_DOMAIN }}"
+            CURL_FLAGS="-sf"
           else
-            echo "❌ VERIFICATION FAILED"
-            echo ""
-            echo "The deployed container does NOT match this source code!"
-            echo ""
-            echo "Possible reasons:"
-            echo "  - Source code has changed since deployment"
-            echo "  - Different Nix version or configuration"
-            echo "  - The service was deployed from different code"
+            SERVICE_URL="https://oa-verifier-2.eastus.azurecontainer.io"
+            CURL_FLAGS="-sfk"
+          fi
+          echo "Fetching attestation from: $SERVICE_URL"
+          NONCE="verify-$(openssl rand -hex 16)"
+          ATTESTATION=$(curl $CURL_FLAGS --max-time 90 "$SERVICE_URL/attestation?nonce=$NONCE" 2>/dev/null || echo "{}")
+
+          if [ -z "$ATTESTATION" ] || [ "$ATTESTATION" = "{}" ]; then
+            echo "⚠️ Could not fetch attestation"
             exit 1
           fi
 
-      - name: Generate verification summary
+          TOKEN=$(echo "$ATTESTATION" | jq -r '.token // empty')
+          VERIFY_AT=$(echo "$ATTESTATION" | jq -r '.verify_at // empty')
+          if [ -z "$TOKEN" ] || [ -z "$VERIFY_AT" ]; then
+            echo "❌ Missing token or verify_at in attestation payload"
+            exit 1
+          fi
+          if [ "$VERIFY_AT" != "https://sharedeus.eus.attest.azure.net/certs" ]; then
+            echo "Unexpected Azure Attestation signing-key endpoint"
+            exit 1
+          fi
+
+          bash scripts/verify-jwt.sh "$TOKEN" "$VERIFY_AT" "$NONCE"
+
+          # Compare the signed JWT claim, not the unsigned response summary.
+          REMOTE_HASH=$(printf '%s' "$TOKEN" | python3 scripts/attestation_claim.py)
+
+          echo "=============================================="
+          echo "  ZERO-TRUST VERIFICATION"
+          echo "=============================================="
+          echo "Source build hash:  $SOURCE_HASH"
+          echo "Attestation hash:   $REMOTE_HASH"
+          echo ""
+
+          if [ "$SOURCE_HASH" = "$REMOTE_HASH" ]; then
+            echo "✅ VERIFICATION PASSED!"
+            echo "Deployed code matches source code."
+            echo "JWT signature and nonce were verified against Azure Attestation keys."
+          else
+            echo "❌ VERIFICATION FAILED!"
+            exit 1
+          fi
+
+      - name: Verification Summary
         if: always()
         env:
-          SERVICE_URL: ${{ steps.url.outputs.url }}
-          SOURCE_DIGEST: ${{ steps.digest.outputs.digest }}
-          REMOTE_DIGEST: ${{ steps.attestation.outputs.remote_digest }}
-          SOURCE_IMAGE_ID: ${{ steps.build.outputs.image_id }}
-          REMOTE_POLICY_HASH: ${{ steps.attestation.outputs.policy_hash }}
+          RESULT: ${{ job.status }}
+          SOURCE_REVISION: ${{ inputs.source_revision || github.sha }}
         run: |
-          echo "## Zero-Trust Verification Report" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Service URL:** $SERVICE_URL" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Source Build (from this repository)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Manifest Digest:** \`$SOURCE_DIGEST\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image ID:** \`$SOURCE_IMAGE_ID\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Deployed Service" >> $GITHUB_STEP_SUMMARY
-          echo "- **Manifest Digest:** \`$REMOTE_DIGEST\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Policy Hash:** \`$REMOTE_POLICY_HASH\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          if [ "$SOURCE_DIGEST" = "$REMOTE_DIGEST" ]; then
-            echo "### ✅ Result: VERIFIED" >> $GITHUB_STEP_SUMMARY
-            echo "The deployed code matches the source code in this repository." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "### ❌ Result: MISMATCH" >> $GITHUB_STEP_SUMMARY
-            echo "The deployed code does NOT match the source code!" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "## Independent attestation verification: $RESULT" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source revision: $SOURCE_REVISION" >> "$GITHUB_STEP_SUMMARY"
+          echo "Target: oa-verifier-2; no service changes or restarts were requested." >> "$GITHUB_STEP_SUMMARY"

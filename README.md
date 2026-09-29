@@ -57,6 +57,30 @@ cd oa-verifier
 This rebuilds the container locally with Nix and compares the policy hash against what Azure hardware attests.
 For strict zero-trust conclusions, also verify the JWT signature using the `verify_at` key endpoint returned by `/attestation`.
 
+### Recheck the shared deployment without restarting it
+
+Run **Verify Attestation (Source → Deployed)** (`verify-attestation.yml`) manually
+with `source_revision` set to the full commit SHA used by the deployment. Select
+the branch containing the verification workflow you want to run; the source is
+checked out separately at the supplied revision. Do not rerun **Build, Sign, and
+Deploy** merely to repeat verification: that workflow can replace the live group.
+
+The verification workflow targets the shared `oa-verifier-2` group only. It uses
+the existing Azure and registry credentials to read the deployed immutable image
+reference and pull identity, rebuild the specified source, compare Docker image
+IDs, regenerate the deployment policy, and compare its hash to the signed Azure
+attestation claim after checking the signature, nonce, issuer, and validity time.
+It never creates, deletes, or restarts Azure resources. This does not test
+OpenRouter login or station registration.
+
+Post-deployment verification calls this same workflow. It no longer passes image
+references through cross-job outputs, which GitHub can suppress when values
+match a secret. Missing or unexpected deployment metadata fails verification;
+there is no fallback to a registry's `latest` tag. The daily check uses the
+current main commit, so a deployment that lags main can report a mismatch.
+The previous arbitrary `service_url` input is removed because other deployments
+can have different policies and need their own verification configuration.
+
 ## Trust Chain
 
 ```
