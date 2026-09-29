@@ -28,7 +28,6 @@ jobs:
       deploy_registry: ${{ steps.registry.outputs.registry }}
       deploy_digest: ${{ steps.registry.outputs.digest }}
       deploy_use_identity: ${{ steps.registry.outputs.use_identity }}
-      deploy_pull_identity_id: ${{ steps.registry.outputs.pull_identity_id }}
 
     steps:
       - name: Checkout repository
@@ -1047,7 +1046,10 @@ jobs:
           DIGEST: ${{ steps.verify-registry.outputs.digest }}
           USE_GHCR: ${{ steps.verify-registry.outputs.use_ghcr }}
           USE_IDENTITY: ${{ needs.build-and-deploy.outputs.deploy_use_identity }}
-          PULL_IDENTITY_ID: ${{ needs.build-and-deploy.outputs.deploy_pull_identity_id }}
+          # Read the identity id from the same source as the deploy job, not from a job
+          # output: GitHub drops job outputs whose value matches a secret, so the
+          # secrets.ACI_PULL_IDENTITY_ID fallback would arrive here empty.
+          PULL_IDENTITY_ID: ${{ vars.ACI_PULL_IDENTITY_ID || secrets.ACI_PULL_IDENTITY_ID }}
           ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
           ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
         run: |
@@ -1059,7 +1061,11 @@ jobs:
           # credentials shape) so the generated policy is the same. No GITHUB_TOKEN here
           # either -- the GHCR image is public.
           IDENTITY_JSON=""
-          if [ "$USE_IDENTITY" = "true" ] && [ -n "$PULL_IDENTITY_ID" ]; then
+          if [ "$USE_IDENTITY" = "true" ] && [ -z "$PULL_IDENTITY_ID" ]; then
+            echo "❌ deploy job used identity-based pull but ACI_PULL_IDENTITY_ID is not visible to the verify job"
+            exit 1
+          fi
+          if [ "$USE_IDENTITY" = "true" ]; then
             CREDS_JSON=$(jq -cn --arg server "${{ env.ACR_REGISTRY }}" --arg id "$PULL_IDENTITY_ID" '[{server: $server, identity: $id}]')
             IDENTITY_OBJ=$(jq -cn --arg id "$PULL_IDENTITY_ID" '{type: "UserAssigned", userAssignedIdentities: {($id): {}}}')
             IDENTITY_JSON="\"identity\": ${IDENTITY_OBJ},"

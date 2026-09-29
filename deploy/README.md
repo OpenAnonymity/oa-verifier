@@ -80,7 +80,7 @@ SP_OBJECT_ID=$(az ad sp list --display-name oa-verifier-deploy --query "[0].id" 
 az role assignment create --assignee-object-id "$SP_OBJECT_ID" \
   --assignee-principal-type ServicePrincipal --role "Managed Identity Operator" --scope "$ID"
 
-# Tell the workflow to use it (repository variable; a secret with the same name also works)
+# Tell the workflow to use it (repository variable; a secret with the same name also works, both jobs read it directly)
 gh variable set ACI_PULL_IDENTITY_ID --body "$ID"
 ```
 

@@ -34,6 +34,8 @@ env:
   # a deploy that is still settling does not trigger a redeploy.
   SAMPLES: '3'
   SAMPLE_INTERVAL_SECONDS: '30'
+  # Do not redispatch the deploy while its most recent run failed less than this long ago.
+  FAILED_DEPLOY_BACKOFF_SECONDS: '10800'
 
 jobs:
   check:
@@ -57,9 +59,34 @@ jobs:
               echo ""
               echo "A \`$DEPLOY_WORKFLOW\` run is already queued or in progress (in_progress=$IN_PROGRESS, queued=$QUEUED). Not checking the group and not triggering another deploy."
             } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "inflight=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          # Backoff: if the most recent deploy run (any trigger) failed less than
+          # FAILED_DEPLOY_BACKOFF_SECONDS ago, do not dispatch another one. A deploy that
+          # fails outright leaves the group missing, and re-running it every 15 minutes
+          # would loop on the same error while burning one Let's Encrypt issuance (plus one
+          # for the recovery test) per attempt against the 5-per-week duplicate limit.
+          LAST=$(gh run list --workflow "$DEPLOY_WORKFLOW" --limit 1 --json conclusion,createdAt,url --jq '.[0] // empty')
+          if [ -n "$LAST" ]; then
+            LAST_CONCLUSION=$(echo "$LAST" | jq -r '.conclusion // ""')
+            LAST_CREATED=$(echo "$LAST" | jq -r '.createdAt // ""')
+            LAST_URL=$(echo "$LAST" | jq -r '.url // ""')
+            if [ "$LAST_CONCLUSION" = "failure" ] && [ -n "$LAST_CREATED" ]; then
+              AGE=$(( $(date -u +%s) - $(date -u -d "$LAST_CREATED" +%s) ))
+              if [ "$AGE" -lt "$FAILED_DEPLOY_BACKOFF_SECONDS" ]; then
+                echo "::warning title=Self-heal backoff::The last deploy failed ${AGE}s ago ($LAST_URL); not redeploying until it is ${FAILED_DEPLOY_BACKOFF_SECONDS}s old. Fix the deploy or run it manually."
+                echo "inflight=true" >> "$GITHUB_OUTPUT"
+                {
+                  echo "## Self-heal: skipped (backoff)"
+                  echo ""
+                  echo "The most recent \`$DEPLOY_WORKFLOW\` run [failed]($LAST_URL) ${AGE}s ago. Self-heal waits ${FAILED_DEPLOY_BACKOFF_SECONDS}s after a failed deploy before dispatching another so a broken deploy does not loop and exhaust the Let's Encrypt duplicate-certificate quota. Fix the deploy or dispatch it manually."
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+            fi
+          fi
+          echo "inflight=false" >> "$GITHUB_OUTPUT"
 
       - name: Azure Login
         if: steps.inflight.outputs.inflight != 'true'
