@@ -1,7 +1,9 @@
 """Regressions for the ACR/GHCR policy-hash mismatch and read-only reruns."""
 import base64
+import fnmatch
 import importlib.util
 import json
+import re
 from pathlib import Path
 import unittest
 
@@ -87,6 +89,28 @@ class SignedClaimTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_main_verification_fix_does_not_deploy_but_runtime_changes_do(self):
+        workflow = (ROOT / ".github/workflows/build-and-sign.yml").read_text()
+        push = workflow.split("  push:\n", 1)[1].split("  pull_request:", 1)[0]
+        patterns = re.findall(r"^      - '([^']+)'$", push, re.M)
+        self.assertTrue(patterns)
+
+        def triggers(paths):
+            return any(not any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+                       for path in paths)
+
+        fix_paths = [".github/workflows/build-and-sign.yml", ".github/workflows/verify-attestation.yml",
+                     "scripts/deployed_image.py", "scripts/attestation_claim.py",
+                     "tests/deployment/test_attestation_handoff.py", "README.md"]
+        self.assertFalse(triggers(fix_paths))
+        for path in ["internal/server/handlers.go", "cmd/verifier/main.go", "go.mod",
+                     "go.sum", "flake.nix", "flake.lock", "deploy/main.json",
+                     ".github/workflows/self-heal.yml", "scripts/self_heal.py"]:
+            with self.subTest(path=path):
+                self.assertTrue(triggers(fix_paths + [path]))
+        self.assertIn("  workflow_dispatch:", workflow)
+        self.assertIn("  pull_request:\n    branches: [main]", workflow)
+
     def test_manual_verification_cannot_redeploy(self):
         workflow = (ROOT / ".github/workflows/verify-attestation.yml").read_text()
         for mutation in ["az container delete", "az container create", "az container restart",

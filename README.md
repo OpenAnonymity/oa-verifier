@@ -81,6 +81,14 @@ current main commit, so a deployment that lags main can report a mismatch.
 The previous arbitrary `service_url` input is removed because other deployments
 can have different policies and need their own verification configuration.
 
+Main-branch pushes touching only the verification helpers, these two workflows,
+deployment tests, or this README do not trigger Build, Sign, and Deploy. A mixed
+push that also changes application or other deployment files still triggers it.
+Pull-request checks and explicit manual deployments (including self-heal) remain
+enabled. To deploy a workflow-only deployment change intentionally, use the
+manual deployment action. To check the current service, use the verification-only
+action with the actual deployed source revision instead.
+
 ## Trust Chain
 
 ```
