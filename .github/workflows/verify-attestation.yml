@@ -86,7 +86,23 @@ jobs:
               print(json.dumps({'staging_registry_http_status': response.status,
                                 'staging_registry_station_count': len(payload.get('stations', []))}))
           except HTTPError as error:
-              print(json.dumps({'staging_registry_http_status': error.code}))
+              raw = error.read(65536)
+              try:
+                  body = json.loads(raw)
+              except ValueError:
+                  body = {}
+              detail = body.get('detail') if isinstance(body, dict) else None
+              safe_details = {'Invalid token', 'Authorization header required',
+                              'Invalid authorization format', 'Verifier authentication not configured'}
+              print(json.dumps({'staging_registry_http_status': error.code,
+                                'content_type': error.headers.get('content-type'),
+                                'server': error.headers.get('server'),
+                                'cloudflare_mitigated': error.headers.get('cf-mitigated'),
+                                'known_auth_error': detail if detail in safe_details else None,
+                                'is_cloudflare_page': b'cloudflare' in raw.lower(),
+                                'is_access_page': b'cloudflareaccess' in raw.lower(),
+                                'aws_waf_page': b'awswaf' in raw.lower()}))
+              error.close()
           logs = subprocess.run([
               'az', 'container', 'logs', '--resource-group', 'oa-verifier',
               '--name', 'oa-verifier-2', '--container-name', 'oa-verifier',
