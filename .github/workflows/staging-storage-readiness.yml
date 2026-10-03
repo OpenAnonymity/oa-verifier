@@ -21,6 +21,8 @@ jobs:
               if p.returncode:
                   return None
               return json.loads(p.stdout)
+          account = az('account', 'show')
+          permissions = az('rest', '--method', 'get', '--url', 'https://management.azure.com/subscriptions/' + account['id'] + '/resourceGroups/oa-verifier/providers/Microsoft.Authorization/permissions?api-version=2022-04-01')
           vault = az('keyvault', 'show', '-g', 'oa-verifier', '-n', 'oa-verifier2-sealed')
           group = az('container', 'show', '-g', 'oa-verifier', '-n', 'oa-verifier-2')
           assert group and group['name'] == 'oa-verifier-2'
@@ -34,6 +36,7 @@ jobs:
               'vault_purge_protection': vault['properties'].get('enablePurgeProtection') if vault else None,
               'identity_exists': identity is not None,
               'role_names_at_resource_group': sorted({r['roleDefinitionName'] for r in roles or []}),
+              'management_permissions': (permissions or {}).get('value', []),
               'mutations': False
           }))
           PY
