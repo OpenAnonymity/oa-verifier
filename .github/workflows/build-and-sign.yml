@@ -47,6 +47,44 @@ jobs:
       - name: Test deployment safeguards
         run: python3 -m unittest discover -s tests/deployment -p 'test_*.py'
 
+      - name: Verify staging registry authorization before deployment
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          REGISTRY_BASE_URL: ${{ secrets.STATION_REGISTRY_URL }}
+          REGISTRY_AUTH: ${{ secrets.STATION_REGISTRY_SECRET }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+          from urllib.error import HTTPError, URLError
+
+          # This workflow deploys oa-verifier-2, which belongs to staging.
+          base = os.environ.get('REGISTRY_BASE_URL', '').rstrip('/')
+          if base != 'https://org-staging.openanonymity.ai':
+              raise SystemExit('Verifier2 must use the staging registry; deployment stopped')
+          credential = os.environ.get('REGISTRY_AUTH', '')
+          if not credential:
+              raise SystemExit('Registry credential missing; deployment stopped')
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          request = Request(base + '/verifier/registered_stations',
+                            headers={'Authorization': 'Bearer ' + credential})
+          try:
+              with build_opener(NoRedirect()).open(request, timeout=15) as response:
+                  payload = json.load(response)
+          except HTTPError as error:
+              status = error.code
+              error.close()
+              raise SystemExit('Registry authorization check returned HTTP ' + str(status))
+          except (URLError, TimeoutError, ValueError):
+              raise SystemExit('Registry unavailable or invalid response; deployment stopped')
+          stations = payload.get('stations') if isinstance(payload, dict) else None
+          if not isinstance(stations, list) or not stations:
+              raise SystemExit('Registry has no authorized stations; deployment stopped')
+          print('Staging registry authorization passed; station count=' + str(len(stations)))
+          PY
+
       - name: Check for code changes
         id: changes
         uses: dorny/paths-filter@v3
