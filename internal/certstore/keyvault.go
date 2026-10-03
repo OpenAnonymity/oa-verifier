@@ -16,7 +16,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Managed identity tokens (ACI MSI endpoint, IMDS fallback)
+// Managed identity tokens (Linux ACI IMDS, explicit App Service endpoint)
 // ---------------------------------------------------------------------------
 
 // IMDSTokenURL is the classic Azure Instance Metadata Service token endpoint.
@@ -29,20 +29,22 @@ type TokenSource interface {
 
 // MSITokenSource obtains tokens for the container group's managed identity.
 //
-// In Azure Container Instances the platform injects IDENTITY_ENDPOINT and
-// IDENTITY_HEADER; the token request is
+// Linux Azure Container Instances uses IMDS (Metadata: true,
+// api-version=2018-02-01), as does the SKR sidecar. An injected
+// IDENTITY_HEADER alone does not select a different endpoint or protocol.
+// If both IDENTITY_ENDPOINT and IDENTITY_HEADER are configured, use the
+// App Service-style token request instead:
 //
 //	GET $IDENTITY_ENDPOINT?resource=<resource>&api-version=2019-08-01[&client_id=...]
 //	X-IDENTITY-HEADER: $IDENTITY_HEADER
 //
-// When those variables are absent it falls back to IMDS
-// (Metadata: true, api-version=2018-02-01), which is what the SKR sidecar
-// itself uses (upstream pkg/common/token.go). Tokens are cached until five
-// minutes before expiry.
+// These protocols are selected before the request, never as a retry after
+// an authentication error. Tokens are cached until five minutes before expiry.
 type MSITokenSource struct {
 	// Endpoint overrides the token endpoint (IDENTITY_ENDPOINT or IMDS).
 	Endpoint string
-	// Header is the value for X-IDENTITY-HEADER; empty means IMDS style.
+	// Header is X-IDENTITY-HEADER only with an explicit Endpoint. Otherwise
+	// it is ignored and is never forwarded to IMDS.
 	Header string
 	// ClientID selects a user-assigned identity when the group has several.
 	ClientID string
@@ -82,18 +84,17 @@ func (m *MSITokenSource) Token(ctx context.Context, resource string) (string, er
 	}
 	m.mu.Unlock()
 
-	// Header present => ACI/App Service identity endpoint (2019-08-01).
-	// Otherwise IMDS style (Metadata: true, 2018-02-01), possibly at an
-	// overridden endpoint in tests.
+	// Only a complete endpoint/header pair selects App Service-style auth.
+	// Linux ACI can inject a header without an endpoint; it still uses IMDS.
+	// Never send that unrelated header to the IMDS endpoint.
 	endpoint := m.Endpoint
-	apiVersion := "2019-08-01"
-	if m.Header == "" {
-		apiVersion = "2018-02-01"
-		if endpoint == "" {
-			endpoint = IMDSTokenURL
-		}
-	} else if endpoint == "" {
-		return "", errors.New("certstore: IDENTITY_HEADER set without IDENTITY_ENDPOINT")
+	useIdentityHeader := endpoint != "" && m.Header != ""
+	apiVersion := "2018-02-01"
+	if endpoint == "" {
+		endpoint = IMDSTokenURL
+	}
+	if useIdentityHeader {
+		apiVersion = "2019-08-01"
 	}
 	u, err := url.Parse(endpoint)
 	if err != nil {
@@ -111,7 +112,7 @@ func (m *MSITokenSource) Token(ctx context.Context, resource string) (string, er
 	if err != nil {
 		return "", err
 	}
-	if m.Header != "" {
+	if useIdentityHeader {
 		req.Header.Set("X-IDENTITY-HEADER", m.Header)
 	} else {
 		req.Header.Set("Metadata", "true")

@@ -109,10 +109,14 @@ both interfaces.
 ### Key Vault secret backend
 
 `KeyVaultSecretStore` talks REST directly (`GET/PUT https://<vault>.vault.azure.net/secrets/<name>?api-version=7.4`),
-authenticated with the container group's managed identity:
-`GET $IDENTITY_ENDPOINT?resource=https://vault.azure.net&api-version=2019-08-01`
-with `X-IDENTITY-HEADER: $IDENTITY_HEADER` (ACI), falling back to IMDS
-(`Metadata: true`, `api-version=2018-02-01`) when those variables are absent.
+authenticated with the container group's managed identity. Linux ACI uses
+`GET http://169.254.169.254/metadata/identity/oauth2/token?resource=https://vault.azure.net&api-version=2018-02-01`
+with `Metadata: true`. An injected `IDENTITY_HEADER` without an endpoint is
+ignored and is never sent to IMDS. A complete `IDENTITY_ENDPOINT` and
+`IDENTITY_HEADER` pair selects App Service-style authentication instead
+(`api-version=2019-08-01`, `X-IDENTITY-HEADER`). This is protocol selection,
+not a fallback after an authentication failure. Windows ACI's different
+identity protocol is not implemented by this Linux deployment.
 `TLS_CERT_MSI_CLIENT_ID` selects a user-assigned identity. Tokens are cached
 until 5 minutes before expiry. No third-party dependency was added; `go.mod` is
 unchanged. Each save creates a new secret version (Key Vault keeps history).

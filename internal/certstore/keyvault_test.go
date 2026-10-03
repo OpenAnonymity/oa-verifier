@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,7 +13,7 @@ import (
 	"time"
 )
 
-// fakeAzure serves both the ACI MSI token endpoint and a Key Vault secret API.
+// fakeAzure serves an App Service-style MSI endpoint and Key Vault secret API.
 type fakeAzure struct {
 	t          *testing.T
 	mu         sync.Mutex
@@ -172,6 +173,66 @@ func TestMSITokenSourceIMDSFallbackAndErrors(t *testing.T) {
 	bad := &MSITokenSource{Endpoint: srv.URL, ClientID: "boom"}
 	if _, err := bad.Token(context.Background(), KeyVaultResource); err == nil || !strings.Contains(err.Error(), "HTTP 400") {
 		t.Fatalf("expected HTTP 400 error, got %v", err)
+	}
+}
+
+type tokenRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f tokenRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestMSITokenSourceLinuxACIHeaderWithoutEndpoint(t *testing.T) {
+	// Linux ACI may inject IDENTITY_HEADER without IDENTITY_ENDPOINT. A fake
+	// transport checks the real destination without contacting Azure metadata.
+	for _, header := range []string{"", "unpaired-platform-header"} {
+		t.Run(header, func(t *testing.T) {
+			source := NewMSITokenSourceFromEnv(func(key string) string {
+				if key == "IDENTITY_HEADER" {
+					return header
+				}
+				return ""
+			}, "staging-identity")
+			calls := 0
+			source.HTTPClient = &http.Client{Transport: tokenRoundTripper(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if r.URL.Scheme != "http" || r.URL.Host != "169.254.169.254" || r.URL.Path != "/metadata/identity/oauth2/token" {
+					t.Fatalf("unexpected metadata destination: %s", r.URL.Redacted())
+				}
+				q := r.URL.Query()
+				if q.Get("resource") != KeyVaultResource || q.Get("client_id") != "staging-identity" || q.Get("api-version") != "2018-02-01" {
+					t.Fatal("incorrect IMDS audience, identity, or API version")
+				}
+				if r.Header.Get("Metadata") != "true" || r.Header.Get("X-IDENTITY-HEADER") != "" {
+					t.Fatal("IMDS must use Metadata:true without the unrelated identity header")
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"access_token":"test-token","expires_in":3600}`))}, nil
+			})}
+			for range 2 {
+				if token, err := source.Token(context.Background(), KeyVaultResource); err != nil || token != "test-token" {
+					t.Fatalf("token retrieval failed: %v", err)
+				}
+			}
+			if calls != 1 {
+				t.Fatalf("expected one request and cached reuse, got %d", calls)
+			}
+		})
+	}
+}
+
+func TestMSITokenSourceExplicitIdentityRejectionDoesNotFallBack(t *testing.T) {
+	calls := 0
+	source := &MSITokenSource{Endpoint: "http://localhost:1234/token", Header: "test-header"}
+	source.HTTPClient = &http.Client{Transport: tokenRoundTripper(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.URL.Host != "localhost:1234" || r.Header.Get("X-IDENTITY-HEADER") != "test-header" || r.Header.Get("Metadata") != "" {
+			t.Fatal("explicit identity request changed destination or protocol")
+		}
+		return &http.Response{StatusCode: 401, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"error":"unauthorized"}`))}, nil
+	})}
+	if _, err := source.Token(context.Background(), KeyVaultResource); err == nil || !strings.Contains(err.Error(), "HTTP 401") {
+		t.Fatalf("expected identity rejection, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("identity rejection must not fall back to another source: %d requests", calls)
 	}
 }
 
