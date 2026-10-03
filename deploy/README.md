@@ -103,6 +103,36 @@ is deliberate: the server binds `:443` only after the ACME DNS-01 issuance has f
 loop and burn the Let's Encrypt duplicate-certificate quota. The probe is in both the
 policy template and the deploy template so the generated CCE policy matches the deployed spec.
 
+## Sealed persistence (station registry and TLS certificate)
+
+By default the verifier forgets everything on restart: its station registry and
+its Let's Encrypt certificate. Since OpenRouter requires a fresh MFA login to
+mint a station's management key, a forgotten registry means a person has to log
+in on every station after every restart. `docs/STATION_STATE.md` and
+`docs/CERT_PERSISTENCE.md` describe the fix: both are saved as AES-256-GCM
+ciphertext in Key Vault secrets, under a key the SKR sidecar releases only to
+an enclave running an allowed CCE policy hash.
+
+Turning it on for `oa-verifier-2`:
+
+1. Run `scripts/setup-sealed-state.sh` once in Azure Cloud Shell (Premium RBAC
+   vault, exportable RSA-HSM key with a placeholder release policy, roles for
+   the group identity and the deploy principal). It prints the variables below.
+2. Set repository **variables** (names, not secrets): `STATION_STATE_STORE`,
+   `TLS_CERT_STORE` (both `keyvault-sealed`), `SEALED_KEK_VAULT`,
+   `SEALED_KEK_NAME`, `SEALED_SECRET_VAULT`, `SEALED_MSI_CLIENT_ID`,
+   `ACI_PULL_IDENTITY_ID` (the same identity) and optionally
+   `KEK_RELEASE_KEEP_HASHES` (default 4). Unset = off, the previous behaviour.
+3. Every deploy from `main` then runs "Authorize this build's policy hash for
+   sealed-state key release" *before* deleting the old group: it adds the new
+   build's `x-ms-sevsnpvm-hostdata` to the key's release policy
+   (`scripts/release_policy.py`, keeping the last few hashes so a rollback still
+   unseals) and verifies the write. If Key Vault refuses, the deploy stops with
+   the current verifier untouched.
+4. The first deploy with persistence still starts empty (it is a restart), so
+   each station needs one operator login afterwards. After that, restarts and
+   redeploys keep the registry and no login is needed.
+
 ## Diagnostics (Log Analytics)
 
 If the secrets `LOG_ANALYTICS_WORKSPACE_ID` and `LOG_ANALYTICS_WORKSPACE_KEY` are set, the
@@ -152,6 +182,11 @@ az monitor log-analytics workspace get-shared-keys -g oa-verifier -n oa-verifier
 | `LOG_ANALYTICS_WORKSPACE_ID` (secret) | Log Analytics workspace (customer) id for container group diagnostics |
 | `LOG_ANALYTICS_WORKSPACE_KEY` (secret) | Log Analytics workspace shared key |
 | `ACI_SKIP_RECOVERY_TEST` (variable) | Set to `true` to prohibit even an explicitly requested recovery restart. Normal deploys already skip it. |
+| `STATION_STATE_STORE`, `TLS_CERT_STORE` (variables) | `keyvault-sealed` to persist the station registry / TLS certificate (see "Sealed persistence"). Unset = off. |
+| `SEALED_KEK_VAULT`, `SEALED_KEK_NAME` (variables) | Key Vault URL and key name of the sealing key, from `scripts/setup-sealed-state.sh` |
+| `SEALED_SECRET_VAULT` (variable) | Vault URL for the sealed secrets; defaults to `SEALED_KEK_VAULT` |
+| `SEALED_MSI_CLIENT_ID` (variable) | Client id of the group's user-assigned identity (the one `ACI_PULL_IDENTITY_ID` names) |
+| `KEK_RELEASE_KEEP_HASHES` (variable) | How many recent policy hashes stay allowed on the sealing key (default 4; 1 = only the current build) |
 
 ### Optional (for custom TLS domain)
 

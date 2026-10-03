@@ -203,6 +203,9 @@ See [deploy/README.md](deploy/README.md) for details.
 | `ATTEST_GLOBAL_RPS` | Global limit for `/attestation*` across all clients (default 5 rps) |
 | `FAILURE_TRACK_MAX` | Max tracked `<identity>\|<operation>` consecutive-failure counters (default 10000, LRU eviction) |
 | `FAILURE_TRACK_TTL` | Idle expiry of those counters, Go duration or seconds (default `24h`) |
+| `STATION_STATE_STORE` | Persist the station registry across restarts: `none` (default) / `file` / `file-sealed` / `keyvault-sealed`; see [docs/STATION_STATE.md](docs/STATION_STATE.md) |
+| `STATION_STATE_STORE_DIR` / `STATION_STATE_SECRET_NAME` | Location for the file modes / Key Vault secret name (default `oa-verifier-station-state`) |
+| `TLS_CERT_STORE` and `TLS_CERT_*` | Persist the Let's Encrypt certificate and the shared sealing key configuration; see [docs/CERT_PERSISTENCE.md](docs/CERT_PERSISTENCE.md) |
 
 Every variable the container reads must also appear in `required_env_vars` or
 `optional_env_vars` of the "Generate CCE policy" step in
@@ -214,6 +217,8 @@ any other environment variable and the container will not start.
 - [Trust Model](docs/TRUST_MODEL.md) - Role boundaries, data flow, guarantees/non-goals, unlinkability model
 - [Attestation Deep Dive](docs/ATTESTATION.md) - How zero-trust verification works
 - [Deployment Guide](deploy/README.md) - CI/CD and Azure setup
+- [Certificate Persistence](docs/CERT_PERSISTENCE.md) - Keeping the Let's Encrypt certificate across restarts, sealed to the attested image
+- [Station Registry Persistence](docs/STATION_STATE.md) - Keeping registered stations and their OpenRouter management keys across restarts, so an unattended restart no longer needs an operator login
 
 ## License
 

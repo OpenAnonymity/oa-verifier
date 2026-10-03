@@ -28,6 +28,7 @@ import (
 	"github.com/openanonymity/oa-verifier/internal/certstore"
 	"github.com/openanonymity/oa-verifier/internal/challenge"
 	"github.com/openanonymity/oa-verifier/internal/models"
+	"github.com/openanonymity/oa-verifier/internal/stationstore"
 )
 
 // Server holds all server state.
@@ -53,6 +54,10 @@ type Server struct {
 	tlsCertMu     sync.RWMutex
 	tlsCert       *tls.Certificate
 	tlsPubKeyHash string
+
+	// Station registry persistence (state.go). Always non-nil; NoopStore by
+	// default so tests and local runs behave exactly as before.
+	state *stationState
 }
 
 const orgPKTTL = 10 * time.Minute
@@ -66,6 +71,7 @@ func New(attestationEnabled bool) *Server {
 		opFailures:         newOpFailureTrackerFromEnv(),
 		banned:             banned.NewManager(),
 		attestationEnabled: attestationEnabled,
+		state:              newStationState(stationstore.NoopStore{}, "none"),
 	}
 }
 

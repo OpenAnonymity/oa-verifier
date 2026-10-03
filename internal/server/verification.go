@@ -118,6 +118,7 @@ func (s *Server) challengeOneStation(_ context.Context, pk string, station model
 			slog.Info("removed banned station from registry", "station_id", stationID)
 		}
 		s.mu.Unlock()
+		s.requestPersist()
 		return
 	}
 
@@ -288,6 +289,7 @@ func (s *Server) challengeOneStation(_ context.Context, pk string, station model
 		}
 	}
 	s.mu.Unlock()
+	s.requestPersist()
 
 	// Ban if necessary (outside lock)
 	if !passed && challenge.ShouldBan(reason) {

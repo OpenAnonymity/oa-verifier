@@ -36,13 +36,15 @@ type ReleasedKey struct {
 }
 
 // envelope is the sealed on-disk / in-vault format. Ciphertext is the
-// AES-256-GCM encryption of the JSON bundle; AAD binds version and kid so a
-// blob cannot be silently re-labelled.
+// AES-256-GCM encryption of the JSON payload; AAD binds version, kid and
+// purpose so a blob cannot be silently re-labelled or replayed into a store
+// with a different purpose.
 type envelope struct {
 	Version    int    `json:"v"`
 	Alg        string `json:"alg"`
 	KDF        string `json:"kdf"`
 	KID        string `json:"kid"`
+	Purpose    string `json:"purpose,omitempty"`
 	Nonce      string `json:"nonce"`
 	Ciphertext string `json:"ciphertext"`
 }
@@ -55,22 +57,39 @@ const (
 	hkdfInfoPrefix  = "oa-verifier/certstore/aes-256-gcm/"
 )
 
-// SealedStore encrypts bundles before handing them to an untrusted BlobStore.
-type SealedStore struct {
+// SealedBlobStore seals arbitrary payloads before handing them to an
+// untrusted BlobStore, and unseals them on the way back.
+//
+// Purpose is a short label naming what the blob holds ("" for the TLS
+// certificate bundle, "stationstore" for the station registry, ...). It is
+// mixed into the HKDF info string and into the AEAD associated data, so two
+// stores sharing one Key Vault key still use unrelated AES keys, and a blob
+// saved by one store is rejected by the other instead of being decrypted and
+// misinterpreted. The empty purpose keeps the exact pre-existing derivation
+// and AAD, so bundles sealed before this field existed still open.
+type SealedBlobStore struct {
 	Blobs    BlobStore
 	Releaser KeyReleaser
+	Purpose  string
 }
 
-// NewSealedStore wraps blobs with AES-256-GCM sealing keyed from releaser.
-func NewSealedStore(blobs BlobStore, releaser KeyReleaser) (*SealedStore, error) {
+// NewSealedBlobStore wraps blobs with AES-256-GCM sealing keyed from releaser
+// and domain-separated by purpose.
+func NewSealedBlobStore(blobs BlobStore, releaser KeyReleaser, purpose string) (*SealedBlobStore, error) {
 	if blobs == nil || releaser == nil {
 		return nil, errors.New("certstore: sealed store needs a blob store and a key releaser")
 	}
-	return &SealedStore{Blobs: blobs, Releaser: releaser}, nil
+	if strings.ContainsAny(purpose, "/ \t\r\n") || strings.EqualFold(purpose, "certstore") {
+		// "/" and whitespace would blur the HKDF info / AAD strings; "certstore"
+		// is the name of the empty (TLS bundle) purpose and is reserved.
+		return nil, fmt.Errorf("certstore: invalid sealing purpose %q", purpose)
+	}
+	return &SealedBlobStore{Blobs: blobs, Releaser: releaser, Purpose: purpose}, nil
 }
 
-// Load implements Store.
-func (s *SealedStore) Load(ctx context.Context) (*Bundle, error) {
+// LoadBlob implements BlobStore: it loads the sealed envelope from the
+// underlying store and returns the decrypted payload.
+func (s *SealedBlobStore) LoadBlob(ctx context.Context) ([]byte, error) {
 	raw, err := s.Blobs.LoadBlob(ctx)
 	if err != nil {
 		return nil, err
@@ -82,6 +101,9 @@ func (s *SealedStore) Load(ctx context.Context) (*Bundle, error) {
 	if env.Version != envelopeVersion || env.Alg != envelopeAlg || env.KDF != envelopeKDF {
 		return nil, fmt.Errorf("certstore: unsupported envelope v=%d alg=%q kdf=%q", env.Version, env.Alg, env.KDF)
 	}
+	if env.Purpose != s.Purpose {
+		return nil, fmt.Errorf("certstore: envelope sealed for purpose %q, this store is %q", env.Purpose, s.Purpose)
+	}
 	key, err := s.Releaser.ReleaseKey(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("certstore: key release: %w", err)
@@ -89,7 +111,7 @@ func (s *SealedStore) Load(ctx context.Context) (*Bundle, error) {
 	if env.KID != "" && key.KID != "" && env.KID != key.KID {
 		return nil, fmt.Errorf("certstore: envelope sealed under kid %q but released key is %q", env.KID, key.KID)
 	}
-	aead, err := aeadFor(key)
+	aead, err := aeadFor(key, s.Purpose)
 	if err != nil {
 		return nil, err
 	}
@@ -104,24 +126,20 @@ func (s *SealedStore) Load(ctx context.Context) (*Bundle, error) {
 	if len(nonce) != aead.NonceSize() {
 		return nil, errors.New("certstore: bad nonce length")
 	}
-	plain, err := aead.Open(nil, nonce, ct, aad(env.KID))
+	plain, err := aead.Open(nil, nonce, ct, aad(env.KID, s.Purpose))
 	if err != nil {
 		return nil, fmt.Errorf("certstore: unseal bundle: %w", err)
 	}
-	return Unmarshal(plain)
+	return plain, nil
 }
 
-// Save implements Store.
-func (s *SealedStore) Save(ctx context.Context, b *Bundle) error {
-	plain, err := Marshal(b)
-	if err != nil {
-		return err
-	}
+// SaveBlob implements BlobStore: it seals plain and stores the envelope.
+func (s *SealedBlobStore) SaveBlob(ctx context.Context, plain []byte) error {
 	key, err := s.Releaser.ReleaseKey(ctx)
 	if err != nil {
 		return fmt.Errorf("certstore: key release: %w", err)
 	}
-	aead, err := aeadFor(key)
+	aead, err := aeadFor(key, s.Purpose)
 	if err != nil {
 		return err
 	}
@@ -129,12 +147,13 @@ func (s *SealedStore) Save(ctx context.Context, b *Bundle) error {
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return fmt.Errorf("certstore: nonce: %w", err)
 	}
-	ct := aead.Seal(nil, nonce, plain, aad(key.KID))
+	ct := aead.Seal(nil, nonce, plain, aad(key.KID, s.Purpose))
 	env := envelope{
 		Version:    envelopeVersion,
 		Alg:        envelopeAlg,
 		KDF:        envelopeKDF,
 		KID:        key.KID,
+		Purpose:    s.Purpose,
 		Nonce:      base64.StdEncoding.EncodeToString(nonce),
 		Ciphertext: base64.StdEncoding.EncodeToString(ct),
 	}
@@ -145,19 +164,71 @@ func (s *SealedStore) Save(ctx context.Context, b *Bundle) error {
 	return s.Blobs.SaveBlob(ctx, raw)
 }
 
-func aad(kid string) []byte {
-	return []byte(fmt.Sprintf("%s/v%d/%s", envelopeAlg, envelopeVersion, kid))
+// SealedStore encrypts certificate bundles before handing them to an
+// untrusted BlobStore. It is SealedBlobStore with the empty (certificate)
+// purpose plus Bundle encoding.
+type SealedStore struct {
+	Blobs    BlobStore
+	Releaser KeyReleaser
+}
+
+// NewSealedStore wraps blobs with AES-256-GCM sealing keyed from releaser.
+func NewSealedStore(blobs BlobStore, releaser KeyReleaser) (*SealedStore, error) {
+	if blobs == nil || releaser == nil {
+		return nil, errors.New("certstore: sealed store needs a blob store and a key releaser")
+	}
+	return &SealedStore{Blobs: blobs, Releaser: releaser}, nil
+}
+
+func (s *SealedStore) sealed() *SealedBlobStore {
+	return &SealedBlobStore{Blobs: s.Blobs, Releaser: s.Releaser}
+}
+
+// Load implements Store.
+func (s *SealedStore) Load(ctx context.Context) (*Bundle, error) {
+	plain, err := s.sealed().LoadBlob(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return Unmarshal(plain)
+}
+
+// Save implements Store.
+func (s *SealedStore) Save(ctx context.Context, b *Bundle) error {
+	plain, err := Marshal(b)
+	if err != nil {
+		return err
+	}
+	return s.sealed().SaveBlob(ctx, plain)
+}
+
+func aad(kid, purpose string) []byte {
+	if purpose == "" {
+		return []byte(fmt.Sprintf("%s/v%d/%s", envelopeAlg, envelopeVersion, kid))
+	}
+	return []byte(fmt.Sprintf("%s/v%d/%s/%s", envelopeAlg, envelopeVersion, kid, purpose))
+}
+
+// hkdfInfo is the HKDF info string for a purpose. The empty purpose keeps the
+// historical certificate string; any other purpose gets its own namespace
+// ("oa-verifier/purpose/<p>/...", which no value of <p> can turn into the
+// certificate string) so the derived AES keys are independent.
+func hkdfInfo(kid, purpose string) []byte {
+	if purpose == "" {
+		return []byte(hkdfInfoPrefix + kid)
+	}
+	return []byte("oa-verifier/purpose/" + purpose + "/aes-256-gcm/" + kid)
 }
 
 // aeadFor derives the 256-bit AES key from the released material with
 // HKDF-SHA256. The released JWK is an asymmetric or symmetric key whose raw
 // secret is not shaped like an AES key, so it is treated as HKDF input keying
 // material rather than used directly.
-func aeadFor(key *ReleasedKey) (cipher.AEAD, error) {
+func aeadFor(key *ReleasedKey, purpose string) (cipher.AEAD, error) {
 	if key == nil || len(key.Material) == 0 {
 		return nil, errors.New("certstore: released key has no secret material")
 	}
-	aesKey := hkdfSHA256(key.Material, []byte(hkdfSalt), []byte(hkdfInfoPrefix+key.KID), 32)
+	aesKey := hkdfSHA256(key.Material, []byte(hkdfSalt), hkdfInfo(key.KID, purpose), 32)
 	block, err := aes.NewCipher(aesKey)
 	if err != nil {
 		return nil, fmt.Errorf("certstore: aes: %w", err)
@@ -217,6 +288,12 @@ type SKRReleaser struct {
 	AKVEndpoint string
 	// KID is the key name.
 	KID string
+	// Tokens, when set, supplies the Key Vault access token that is passed to
+	// the sidecar as "access_token". The sidecar then uses it instead of
+	// fetching one itself, which pins the call to a specific user-assigned
+	// identity (TLS_CERT_MSI_CLIENT_ID). When nil the sidecar uses the
+	// group's identity on its own, exactly as before.
+	Tokens TokenSource
 	// HTTPClient defaults to a client with a 60s timeout.
 	HTTPClient *http.Client
 }
@@ -225,6 +302,18 @@ type skrRequest struct {
 	MAAEndpoint string `json:"maa_endpoint"`
 	AKVEndpoint string `json:"akv_endpoint"`
 	KID         string `json:"kid"`
+	AccessToken string `json:"access_token,omitempty"`
+}
+
+// ManagedHSMResource is the token audience for Azure Managed HSM (public cloud).
+const ManagedHSMResource = "https://managedhsm.azure.net"
+
+// vaultResourceFor picks the token audience for a vault or managed HSM URL.
+func vaultResourceFor(akvEndpoint string) string {
+	if strings.Contains(strings.ToLower(akvEndpoint), ".managedhsm.") {
+		return ManagedHSMResource
+	}
+	return KeyVaultResource
 }
 
 type skrResponse struct {
@@ -245,7 +334,18 @@ func (r *SKRReleaser) ReleaseKey(ctx context.Context) (*ReleasedKey, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 60 * time.Second}
 	}
-	body, err := json.Marshal(skrRequest{MAAEndpoint: r.MAAEndpoint, AKVEndpoint: r.AKVEndpoint, KID: r.KID})
+	// The sidecar wants bare hosts ("mykv.vault.azure.net"), exactly like
+	// maa_endpoint; it prepends https:// itself. AKVEndpoint is kept as a URL
+	// for logging and token-audience selection.
+	reqBody := skrRequest{MAAEndpoint: r.MAAEndpoint, AKVEndpoint: bareHost(r.AKVEndpoint), KID: r.KID}
+	if r.Tokens != nil {
+		tok, err := r.Tokens.Token(ctx, vaultResourceFor(r.AKVEndpoint))
+		if err != nil {
+			return nil, fmt.Errorf("certstore: key vault token for skr: %w", err)
+		}
+		reqBody.AccessToken = tok
+	}
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
 	}
@@ -317,6 +417,14 @@ func ParseReleasedJWK(jwk []byte, fallbackKID string) (*ReleasedKey, error) {
 		kid = fallbackKID
 	}
 	return &ReleasedKey{KID: kid, Material: material, KeyType: k.Kty}, nil
+}
+
+// bareHost strips the scheme and any trailing slash from a vault URL.
+func bareHost(endpoint string) string {
+	e := strings.TrimSpace(endpoint)
+	e = strings.TrimPrefix(e, "https://")
+	e = strings.TrimPrefix(e, "http://")
+	return strings.TrimRight(e, "/")
 }
 
 func decodeB64URL(s string) ([]byte, error) {

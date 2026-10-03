@@ -20,6 +20,7 @@ func (s *Server) unregisterStation(stationID, publicKey, email, reason string, s
 		delete(s.stationIDToPK, stationID)
 	}
 	s.mu.Unlock()
+	s.requestPersist()
 
 	s.notifyOrgEvent(orgEvent{
 		event:                   "station_unregistered",
@@ -71,6 +72,7 @@ func (s *Server) refreshProvisioningKey(stationID, publicKey, email string, cook
 		current.ProvisioningKey = key
 	}
 	s.mu.Unlock()
+	s.requestPersist()
 
 	return key, nil
 }

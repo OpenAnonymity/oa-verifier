@@ -72,10 +72,16 @@ both interfaces.
 
 ### Sealing
 
-* Envelope: `{"v":1,"alg":"A256GCM","kdf":"HKDF-SHA256","kid":…,"nonce":…,"ciphertext":…}`.
-  The AAD binds `alg/v/kid`, so a blob cannot be re-labelled or replayed under a
+* Envelope: `{"v":1,"alg":"A256GCM","kdf":"HKDF-SHA256","kid":…,"purpose":…,"nonce":…,"ciphertext":…}`.
+  The AAD binds `alg/v/kid[/purpose]`, so a blob cannot be re-labelled or replayed under a
   different key without detection. A kid mismatch between envelope and released
-  key is refused before decryption (helps during KEK rotation).
+  key is refused before decryption (helps during KEK rotation). `purpose` names
+  what the blob holds (omitted for the TLS bundle, `stationstore` for the station
+  registry, see `docs/STATION_STATE.md`); it is also mixed into the HKDF info
+  string, so blobs of different purposes are encrypted under unrelated AES keys
+  even when they share one Key Vault key, and `SealedBlobStore` refuses an
+  envelope whose purpose is not its own. Envelopes written before the field
+  existed have the empty purpose and still open.
 * The key-encryption key is **released by the Microsoft SKR sidecar** already in
   the container group (`mcr.microsoft.com/aci/skr`, port 8080):
 
@@ -89,6 +95,9 @@ both interfaces.
   (`internal/httpginendpoints/httpginendpoints.go`, `PostKeyRelease`). The
   sidecar attests the UVM with MAA and asks Key Vault to release the key; Key
   Vault only does so when the MAA token satisfies the key's *release policy*.
+  When `TLS_CERT_MSI_CLIENT_ID` is set the verifier also passes the optional
+  `access_token` (a Key Vault token for that user-assigned identity) so the
+  sidecar does not have to choose an identity itself.
 * The released JWK is an asymmetric key (`kty: RSA` — the only exportable type
   in Key Vault Premium; Managed HSM can also release `EC` and `oct-HSM`). Its
   private material (`d`, or `k` for `oct`) is not an AES key, so the 256-bit
@@ -177,9 +186,15 @@ captured) or the confidential container will not start.
      {"claim":"x-ms-sevsnpvm-is-debuggable","equals":"false"},
      {"claim":"x-ms-sevsnpvm-hostdata","equals":"<sha256 of the deployed CCE policy>"}]}]}
    ```
-   `az keyvault key create --vault-name <kv> --name <TLS_CERT_KEK_NAME> --kty RSA-HSM --exportable --policy release-policy.json`.
+   `az keyvault key create --vault-name <kv> --name <TLS_CERT_KEK_NAME> --kty RSA-HSM --exportable true --policy @release-policy.json`.
    The `hostdata` value changes with every image, so the release policy (or an
-   additional `anyOf` entry) must be updated as part of each deploy.
+   additional `anyOf` entry) must be updated as part of each deploy. The shared
+   deployment does this automatically: `build-and-sign.yml` runs "Authorize this
+   build's policy hash for sealed-state key release" (`scripts/release_policy.py`)
+   between generating the policy and deleting the old group, keeping the last
+   `KEK_RELEASE_KEEP_HASHES` hashes so a rollback still unseals.
+   `scripts/setup-sealed-state.sh` creates the vault, the key (with a placeholder
+   policy) and the role assignments.
 3. **Roles** for the group's identity: `Key Vault Crypto Service Release User`
    on the KEK (release), and `Key Vault Secrets Officer` (get + set) on the
    vault/secret that holds the bundle. With access-policy vaults: key `release`

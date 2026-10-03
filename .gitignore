@@ -39,3 +39,6 @@ banned_stations.json
 .context/
 result
 *.tar.gz
+
+# Python test caches
+__pycache__/

@@ -43,6 +43,7 @@ func (s *Server) markTransientFailure(pk, reason string, statusCode int, detail 
 
 	first := station.FailureFirstAt
 	s.mu.Unlock()
+	s.requestPersist()
 
 	if graceWindow <= 0 || first == nil {
 		return false
@@ -61,6 +62,7 @@ func (s *Server) clearTransientFailure(pk string) {
 		station.FailureCount = 0
 	}
 	s.mu.Unlock()
+	s.requestPersist()
 }
 
 func (s *Server) getFailureCount(pk string) int {

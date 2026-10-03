@@ -334,8 +334,45 @@ jobs:
           ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
           LOG_ANALYTICS_WORKSPACE_ID: ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
           LOG_ANALYTICS_WORKSPACE_KEY: ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}
+          # Sealed persistence (repository *variables*, not secrets: these are names).
+          # Empty = off: the registry and certificate are not persisted, as before.
+          TLS_CERT_STORE: ${{ vars.TLS_CERT_STORE }}
+          STATION_STATE_STORE: ${{ vars.STATION_STATE_STORE }}
+          SEALED_KEK_VAULT: ${{ vars.SEALED_KEK_VAULT }}
+          SEALED_KEK_NAME: ${{ vars.SEALED_KEK_NAME }}
+          SEALED_SECRET_VAULT: ${{ vars.SEALED_SECRET_VAULT }}
+          SEALED_MSI_CLIENT_ID: ${{ vars.SEALED_MSI_CLIENT_ID }}
         run: |
           echo "Generating CCE policy..."
+
+          # Sealed persistence needs a managed identity on the group (the SKR
+          # sidecar and the Key Vault secret client both authenticate with it)
+          # and a vault + key to release from. Fail here, before anything is
+          # touched, rather than start a verifier that cannot open its state.
+          SEALED_MODES=0
+          for mode in "$TLS_CERT_STORE" "$STATION_STATE_STORE"; do
+            case "$mode" in
+              ""|none) ;;
+              keyvault-sealed) SEALED_MODES=$((SEALED_MODES+1)) ;;
+              file|file-sealed) echo "❌ store mode '$mode' needs a mounted directory, which this container group does not have; use none or keyvault-sealed"; exit 1 ;;
+              *) echo "❌ unknown store mode '$mode' (none|keyvault-sealed)"; exit 1 ;;
+            esac
+          done
+          if [ "$SEALED_MODES" -gt 0 ]; then
+            if [ "$USE_IDENTITY" != "true" ]; then
+              echo "❌ sealed persistence requires ACI_PULL_IDENTITY_ID (the group's user-assigned identity)"; exit 1
+            fi
+            if [ -z "$SEALED_KEK_VAULT" ] || [ -z "$SEALED_KEK_NAME" ]; then
+              echo "❌ sealed persistence requires SEALED_KEK_VAULT and SEALED_KEK_NAME"; exit 1
+            fi
+            if [ -z "$SEALED_SECRET_VAULT" ]; then
+              SEALED_SECRET_VAULT="$SEALED_KEK_VAULT"
+            fi
+            echo "Sealed persistence: tls_cert=$TLS_CERT_STORE station_state=$STATION_STATE_STORE kek=$SEALED_KEK_VAULT/$SEALED_KEK_NAME secrets=$SEALED_SECRET_VAULT"
+          else
+            echo "Sealed persistence: off"
+          fi
+          echo "sealed_modes=$SEALED_MODES" >> $GITHUB_OUTPUT
           echo "Registry: $DEPLOY_REGISTRY"
           echo "Digest: $DEPLOY_DIGEST"
           echo "Pull auth: identity=$USE_IDENTITY ghcr-anonymous=$USE_GHCR"
@@ -494,13 +531,33 @@ jobs:
                       "RATE_LIMIT_RPS",
                       "RATE_LIMIT_BURST",
                       "SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS",
+                      "STATION_FAILURE_GRACE_SECONDS",
                       "TLS_DOMAIN",
                       "ACME_EMAIL",
                       "ACME_DNS_PROVIDER",
                       "CF_DNS_API_TOKEN",
                       "CF_ZONE_API_TOKEN",
                       "REKOR_LOG_INDEX",
-                      "SIGSTORE_PAYLOAD_HASH"
+                      "SIGSTORE_PAYLOAD_HASH",
+                      # Sealed persistence (docs/CERT_PERSISTENCE.md, docs/STATION_STATE.md).
+                      # Names and modes only; the sealing key never leaves Key Vault/SKR.
+                      "TLS_CERT_STORE",
+                      "TLS_CERT_STORE_DIR",
+                      "TLS_CERT_KEK_VAULT",
+                      "TLS_CERT_KEK_NAME",
+                      "TLS_CERT_SKR_URL",
+                      "TLS_CERT_SECRET_VAULT",
+                      "TLS_CERT_SECRET_NAME",
+                      "TLS_CERT_MSI_CLIENT_ID",
+                      "STATION_STATE_STORE",
+                      "STATION_STATE_STORE_DIR",
+                      "STATION_STATE_SECRET_NAME",
+                      # Injected by ACI when the group has a managed identity; the
+                      # verifier's Key Vault client reads them (certstore.MSITokenSource).
+                      "IDENTITY_ENDPOINT",
+                      "IDENTITY_HEADER",
+                      "IDENTITY_API_VERSION",
+                      "IDENTITY_SERVER_THUMBPRINT"
                   ]
                   for env_var in required_env_vars:
                       containers[0]["env_rules"].append({
@@ -562,7 +619,13 @@ jobs:
                       {"name": "ACME_DNS_PROVIDER", "value": "${{ secrets.ACME_DNS_PROVIDER }}"},
                       {"name": "CF_DNS_API_TOKEN", "secureValue": "${{ secrets.CF_API_TOKEN }}"},
                       {"name": "REKOR_LOG_INDEX", "value": "${REKOR_LOG_INDEX}"},
-                      {"name": "SIGSTORE_PAYLOAD_HASH", "value": "${SIGSTORE_PAYLOAD_HASH}"}
+                      {"name": "SIGSTORE_PAYLOAD_HASH", "value": "${SIGSTORE_PAYLOAD_HASH}"},
+                      {"name": "TLS_CERT_STORE", "value": "${TLS_CERT_STORE}"},
+                      {"name": "TLS_CERT_KEK_VAULT", "value": "${SEALED_KEK_VAULT}"},
+                      {"name": "TLS_CERT_KEK_NAME", "value": "${SEALED_KEK_NAME}"},
+                      {"name": "TLS_CERT_SECRET_VAULT", "value": "${SEALED_SECRET_VAULT}"},
+                      {"name": "TLS_CERT_MSI_CLIENT_ID", "value": "${SEALED_MSI_CLIENT_ID}"},
+                      {"name": "STATION_STATE_STORE", "value": "${STATION_STATE_STORE}"}
                     ],
                     "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
                   }
@@ -670,6 +733,69 @@ jobs:
             exit 1
           fi
           echo "✅ Pull credentials are durable (identity, anonymous, or long-lived ACR credential)."
+
+      # Sealed persistence: the verifier's saved state (TLS bundle, station registry)
+      # is encrypted under a Key Vault key that the SKR sidecar releases only to an
+      # enclave whose attestation carries THIS build's CCE policy hash
+      # (x-ms-sevsnpvm-hostdata). A new build therefore has to be allowed on the
+      # key's release policy before it starts, or it cannot open the state the
+      # previous build saved and every station has to register again -- which
+      # now needs a person at the station (OpenRouter strict-MFA).
+      #
+      # The policy keeps a short window of recent hashes (KEK_RELEASE_KEEP_HASHES,
+      # default 4) so rolling back to the previous build still unseals; older
+      # hashes are dropped. scripts/release_policy.py does the merge and is
+      # unit-tested in tests/deployment. The write is verified by reading back.
+      #
+      # Runs BEFORE the existing group is deleted: if Key Vault refuses or is
+      # unreachable, the running verifier is left untouched and the deploy stops.
+      - name: Authorize this build's policy hash for sealed-state key release
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main') && steps.policy.outputs.sealed_modes != '0'
+        env:
+          POLICY_HASH: ${{ steps.policy.outputs.policy_hash }}
+          KEK_VAULT: ${{ vars.SEALED_KEK_VAULT }}
+          KEK_NAME: ${{ vars.SEALED_KEK_NAME }}
+          KEEP: ${{ vars.KEK_RELEASE_KEEP_HASHES || '4' }}
+          AUTHORITY: https://sharedeus.eus.attest.azure.net
+        run: |
+          set -euo pipefail
+          # Vault name, not URL (az wants the name; the app wants the URL).
+          VAULT_NAME="${KEK_VAULT#https://}"; VAULT_NAME="${VAULT_NAME%%.*}"
+          echo "KEK: $VAULT_NAME/$KEK_NAME  new hash: $POLICY_HASH  keep: $KEEP"
+
+          CURRENT=$(az keyvault key show --vault-name "$VAULT_NAME" --name "$KEK_NAME" \
+            --query "releasePolicy.encodedPolicy" -o tsv 2>/dev/null || true)
+          if [ -z "$CURRENT" ] || [ "$CURRENT" = "None" ]; then
+            echo "❌ key $VAULT_NAME/$KEK_NAME has no release policy (is it exportable with a policy?), or the deploy identity cannot read it"
+            exit 1
+          fi
+          printf '%s' "$CURRENT" > /tmp/kek-release-current.txt
+
+          # merge prints the policy to install; exit 3 means the installed policy
+          # already equals it (same hashes in the same order), so nothing to write.
+          set +e
+          python3 scripts/release_policy.py merge --current /tmp/kek-release-current.txt \
+            --new-hash "$POLICY_HASH" --keep "$KEEP" --authority "$AUTHORITY" > /tmp/kek-release-new.json
+          MERGE_RC=$?
+          set -e
+          case "$MERGE_RC" in
+            0) ;;
+            3) echo "✅ release policy already current (allows $POLICY_HASH)"; exit 0 ;;
+            *) echo "❌ could not compute the release policy (exit $MERGE_RC)"; exit 1 ;;
+          esac
+          echo "Installing release policy:"; cat /tmp/kek-release-new.json
+
+          az keyvault key set-attributes --vault-name "$VAULT_NAME" --name "$KEK_NAME" \
+            --policy @/tmp/kek-release-new.json --only-show-errors -o none
+
+          # Read back and verify; never trust the write silently.
+          AFTER=$(az keyvault key show --vault-name "$VAULT_NAME" --name "$KEK_NAME" --query "releasePolicy.encodedPolicy" -o tsv)
+          printf '%s' "$AFTER" > /tmp/kek-release-after.txt
+          if ! python3 scripts/release_policy.py check --current /tmp/kek-release-after.txt --hash "$POLICY_HASH" --authority "$AUTHORITY"; then
+            echo "❌ release policy was written but does not allow $POLICY_HASH; aborting before the group is touched"
+            exit 1
+          fi
+          echo "✅ release policy allows $POLICY_HASH"
 
       - name: Delete existing container group
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')

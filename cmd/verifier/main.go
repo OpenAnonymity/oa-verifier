@@ -55,6 +55,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/openanonymity/oa-verifier/internal/server"
 )
@@ -84,6 +85,15 @@ func main() {
 	// Setup graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Restore the station registry saved by a previous run (STATION_STATE_STORE;
+	// default none = start empty, the historical behaviour) and start the writer
+	// that keeps it current. Must happen before any request is served.
+	if err := srv.InitStationState(ctx); err != nil {
+		slog.Error("invalid station state store configuration", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("station registry persistence", "store", srv.StationStateDescription())
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -116,6 +126,10 @@ func main() {
 		slog.Info("starting Enclave Verifier with TLS", "addr", addr, "attestation", *attestation)
 		err = srv.RunTLS(ctx, addr)
 	}
+
+	// Give the station registry writer a moment to finish its shutdown flush.
+	cancel()
+	srv.WaitStationState(15 * time.Second)
 
 	if err != nil && err != http.ErrServerClosed {
 		slog.Error("server error", "error", err)

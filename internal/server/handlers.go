@@ -85,6 +85,7 @@ func (s *Server) banStationForKeyNotOwned(w http.ResponseWriter, stationID, publ
 	}
 	delete(s.stationIDToPK, stationID)
 	s.mu.Unlock()
+	s.requestPersist()
 
 	writeJSON(w, http.StatusForbidden, map[string]any{
 		"error":  "Key not owned by station account. Station banned.",
@@ -104,8 +105,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":   "healthy",
-		"stations": stationCount,
+		"status":      "healthy",
+		"stations":    stationCount,
+		"persistence": s.stationStateHealth(),
 	})
 }
 
@@ -485,6 +487,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		s.stationIDToPK[stationID] = req.PublicKey
 	}
 	s.mu.Unlock()
+	s.requestPersist()
 
 	slog.Info("station registered successfully",
 		"station_id", stationID,

@@ -63,7 +63,8 @@ func (f *fakeSKR) handler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if req["maa_endpoint"] != f.wantMAA || req["akv_endpoint"] != f.wantAKV || req["kid"] != f.wantKID {
+	// The sidecar receives bare hosts; the test fixtures may be written as URLs.
+	if req["maa_endpoint"] != f.wantMAA || req["akv_endpoint"] != bareHost(f.wantAKV) || req["kid"] != f.wantKID {
 		f.t.Errorf("unexpected key release request: %v", req)
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid request format"})
