@@ -1,0 +1,39 @@
+name: Staging encrypted storage readiness
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Read staging storage configuration only
+        run: |
+          python3 - <<'PY'
+          import json, subprocess
+          def az(*args):
+              p = subprocess.run(['az', *args, '-o', 'json'], capture_output=True, text=True, timeout=60)
+              if p.returncode:
+                  return None
+              return json.loads(p.stdout)
+          vault = az('keyvault', 'show', '-g', 'oa-verifier', '-n', 'oa-verifier2-sealed')
+          group = az('container', 'show', '-g', 'oa-verifier', '-n', 'oa-verifier-2')
+          assert group and group['name'] == 'oa-verifier-2'
+          identity = az('identity', 'show', '-g', 'oa-verifier', '-n', 'oa-verifier-pull')
+          roles = az('role', 'assignment', 'list', '-g', 'oa-verifier', '--include-inherited')
+          print(json.dumps({
+              'target': 'verifier2 only',
+              'vault_readable': vault is not None,
+              'vault_sku': vault['properties']['sku']['name'] if vault else None,
+              'vault_rbac': vault['properties'].get('enableRbacAuthorization') if vault else None,
+              'vault_purge_protection': vault['properties'].get('enablePurgeProtection') if vault else None,
+              'identity_exists': identity is not None,
+              'role_names_at_resource_group': sorted({r['roleDefinitionName'] for r in roles or []}),
+              'mutations': False
+          }))
+          PY

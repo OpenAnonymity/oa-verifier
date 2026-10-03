@@ -10,6 +10,7 @@ on:
       - '.github/workflows/build-and-sign.yml'
       - '.github/workflows/verify-attestation.yml'
       - '.github/workflows/restart-staging-verifier.yml'
+      - '.github/workflows/staging-storage-readiness.yml'
       - 'scripts/deployed_image.py'
       - 'scripts/attestation_claim.py'
       - 'tests/deployment/**'
