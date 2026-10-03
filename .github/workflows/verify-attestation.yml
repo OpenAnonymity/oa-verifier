@@ -50,10 +50,14 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
       - name: Inspect verifier2 registry configuration and sanitized errors
+        env:
+          STAGING_REGISTRY_AUTH: ${{ secrets.STATION_REGISTRY_SECRET }}
         run: |
           python3 - <<'PY'
-          import collections, json, re, subprocess
+          import collections, json, os, re, subprocess
           from urllib.parse import urlsplit
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+          from urllib.error import HTTPError
           result = subprocess.run([
               'az', 'container', 'show', '--resource-group', 'oa-verifier',
               '--name', 'oa-verifier-2', '--output', 'json',
@@ -65,7 +69,24 @@ jobs:
           url = urlsplit(values.get('STATION_REGISTRY_URL') or '')
           print(json.dumps({'registry_scheme': url.scheme, 'registry_host': url.hostname,
                             'registry_port': url.port, 'registry_path': url.path,
-                            'registry_secret_configured': bool(values.get('STATION_REGISTRY_SECRET'))}))
+                            'registry_secret_readable_in_azure_metadata': bool(values.get('STATION_REGISTRY_SECRET'))}))
+          # Only the established staging endpoint receives this service credential.
+          # Never follow a redirect, export the credential, or print station records.
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+          credential = os.environ.get('STAGING_REGISTRY_AUTH', '')
+          if not credential:
+              raise SystemExit('Staging registry credential unavailable to diagnostic job')
+          request = Request('https://org-staging.openanonymity.ai/verifier/registered_stations',
+                            headers={'Authorization': 'Bearer ' + credential})
+          try:
+              response = build_opener(NoRedirect()).open(request, timeout=15)
+              payload = json.load(response)
+              print(json.dumps({'staging_registry_http_status': response.status,
+                                'staging_registry_station_count': len(payload.get('stations', []))}))
+          except HTTPError as error:
+              print(json.dumps({'staging_registry_http_status': error.code}))
           logs = subprocess.run([
               'az', 'container', 'logs', '--resource-group', 'oa-verifier',
               '--name', 'oa-verifier-2', '--container-name', 'oa-verifier',
