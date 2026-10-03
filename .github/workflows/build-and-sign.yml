@@ -557,7 +557,7 @@ jobs:
                       # Registry readiness signal (docs/STATION_STATE.md, "Readiness signal").
                       "REGISTRY_WARMUP_SECONDS",
                       # Injected by ACI when the group has a managed identity; the
-                      # verifier's Key Vault client reads them (certstore.MSITokenSource).
+                      # the verifier Key Vault client reads them (certstore.MSITokenSource).
                       "IDENTITY_ENDPOINT",
                       "IDENTITY_HEADER",
                       "IDENTITY_API_VERSION",
