@@ -79,7 +79,8 @@ jobs:
           if not credential:
               raise SystemExit('Staging registry credential unavailable to diagnostic job')
           request = Request('https://org-staging.openanonymity.ai/verifier/registered_stations',
-                            headers={'Authorization': 'Bearer ' + credential})
+                            headers={'Authorization': 'Bearer ' + credential,
+                                     'User-Agent': 'Go-http-client/1.1'})
           try:
               response = build_opener(NoRedirect()).open(request, timeout=15)
               payload = json.load(response)
@@ -99,6 +100,7 @@ jobs:
                                 'server': error.headers.get('server'),
                                 'cloudflare_mitigated': error.headers.get('cf-mitigated'),
                                 'known_auth_error': detail if detail in safe_details else None,
+                                'cloudflare_error_code': next(iter(re.findall(rb'error code: (\d+)', raw)), b'').decode(),
                                 'is_cloudflare_page': b'cloudflare' in raw.lower(),
                                 'is_access_page': b'cloudflareaccess' in raw.lower(),
                                 'aws_waf_page': b'awswaf' in raw.lower()}))
