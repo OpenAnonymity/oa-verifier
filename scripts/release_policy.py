@@ -67,10 +67,18 @@ def decode_policy(raw: str | bytes | None) -> dict[str, Any] | None:
     text = raw.strip()
     if not text or text.lower() in {"null", "none"}:
         return None
-    try:
-        return _as_policy(json.loads(text))
-    except ValueError:
-        pass
+    # Use az -o json for lossless transport. Depending on CLI version,
+    # encodedPolicy is itself JSON text or base64 inside that JSON string.
+    # Unwrap only bounded JSON string layers; never evaluate Python literals.
+    for _ in range(3):
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            break
+        if isinstance(obj, str):
+            text = obj.strip()
+            continue
+        return _as_policy(obj)
     padded = text + "=" * (-len(text) % 4)
     for decoder in (base64.urlsafe_b64decode, base64.b64decode):
         try:

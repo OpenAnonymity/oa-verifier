@@ -14,6 +14,7 @@ on:
       - '.github/workflows/staging-storage-readiness.yml'
       - '.github/workflows/apply-staging-controls.yml'
       - 'scripts/staging_controls.py'
+      - 'scripts/release_policy.py'
       - 'scripts/setup_staging_encrypted_storage.sh'
       - 'scripts/deployed_image.py'
       - 'scripts/attestation_claim.py'
@@ -831,8 +832,8 @@ jobs:
           echo "KEK: $VAULT_NAME/$KEK_NAME  new hash: $POLICY_HASH  keep: $KEEP"
 
           CURRENT=$(az keyvault key show --vault-name "$VAULT_NAME" --name "$KEK_NAME" \
-            --query "releasePolicy.encodedPolicy" -o tsv 2>/dev/null || true)
-          if [ -z "$CURRENT" ] || [ "$CURRENT" = "None" ]; then
+            --query "releasePolicy.encodedPolicy" -o json 2>/dev/null || true)
+          if [ -z "$CURRENT" ] || [ "$CURRENT" = "None" ] || [ "$CURRENT" = "null" ]; then
             echo "❌ key $VAULT_NAME/$KEK_NAME has no release policy (is it exportable with a policy?), or the deploy identity cannot read it"
             exit 1
           fi
@@ -856,7 +857,7 @@ jobs:
             --policy @/tmp/kek-release-new.json --only-show-errors -o none
 
           # Read back and verify; never trust the write silently.
-          AFTER=$(az keyvault key show --vault-name "$VAULT_NAME" --name "$KEK_NAME" --query "releasePolicy.encodedPolicy" -o tsv)
+          AFTER=$(az keyvault key show --vault-name "$VAULT_NAME" --name "$KEK_NAME" --query "releasePolicy.encodedPolicy" -o json)
           printf '%s' "$AFTER" > /tmp/kek-release-after.txt
           if ! python3 scripts/release_policy.py check --current /tmp/kek-release-after.txt --hash "$POLICY_HASH" --authority "$AUTHORITY"; then
             echo "❌ release policy was written but does not allow $POLICY_HASH; aborting before the group is touched"

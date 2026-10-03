@@ -33,6 +33,15 @@ class DecodeTests(unittest.TestCase):
         self.assertEqual(subject.decode_policy(base64.b64encode(text.encode()).decode()), policy)
         self.assertEqual(subject.decode_policy(base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")), policy)
 
+    def test_azure_json_output_preserves_nested_policy_text(self):
+        policy = subject.build_policy([H1], subject.DEFAULT_AUTHORITY)
+        text = json.dumps(policy)
+        # -o json encodes the CLI string instead of applying TSV escaping.
+        self.assertEqual(subject.decode_policy(json.dumps(text)), policy)
+        self.assertEqual(subject.decode_policy(json.dumps(base64.b64encode(text.encode()).decode())), policy)
+        with self.assertRaises(ValueError):
+            subject.decode_policy(json.dumps(json.dumps("not a policy")))
+
     def test_garbage_fails_closed(self):
         with self.assertRaises(ValueError):
             subject.decode_policy("not a policy")
@@ -145,6 +154,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(authorise, delete)
         self.assertIn("python3 scripts/release_policy.py merge", workflow)
         self.assertIn("python3 scripts/release_policy.py check", workflow)
+        self.assertEqual(workflow.count('--query "releasePolicy.encodedPolicy" -o json'), 2)
+        self.assertNotIn('--query "releasePolicy.encodedPolicy" -o tsv', workflow)
         self.assertIn('3) echo "✅ release policy already current', workflow)
         # Only Key Vault-backed modes can be deployed to the group (no volume).
         self.assertIn("file|file-sealed) echo", workflow)
