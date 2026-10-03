@@ -1,0 +1,112 @@
+name: Controlled Staging Verifier Restart
+
+# Manual only. No build, deploy, delete, credential change, or production target.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_restart:
+        description: 'Restart verifier2 once after staging guards pass'
+        type: boolean
+        default: false
+      expected_image:
+        description: 'Exact immutable image from the read-only preflight (required for restart)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: controlled-verifier2-restart
+  cancel-in-progress: false
+
+jobs:
+  restart:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test restart and deployment safeguards
+        run: python3 -m unittest discover -s tests/deployment -p 'test_*.py'
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Guard and optionally restart only verifier2
+        env:
+          CONFIRM_RESTART: ${{ inputs.confirm_restart }}
+          EXPECTED_IMAGE: ${{ inputs.expected_image }}
+          SKIP_RECOVERY_TEST: ${{ vars.ACI_SKIP_RECOVERY_TEST }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess
+
+          def validate(group, expected_image='', requested=False):
+              if group.get('name') != 'oa-verifier-2':
+                  raise ValueError('Unexpected container group')
+              if '/resourceGroups/oa-verifier/providers/Microsoft.ContainerInstance/containerGroups/oa-verifier-2'.lower() not in group.get('id', '').lower():
+                  raise ValueError('Unexpected resource group or container identity')
+              if group.get('location') != 'eastus' or group.get('provisioningState') != 'Succeeded':
+                  raise ValueError('Container group is not stable in the expected region')
+              if (group.get('ipAddress') or {}).get('dnsNameLabel') != 'oa-verifier-2':
+                  raise ValueError('Unexpected DNS target')
+              containers = group.get('containers') or []
+              if not containers or any((c.get('instanceView') or {}).get('currentState', {}).get('state') != 'Running' for c in containers):
+                  raise ValueError('All containers must be running before the test')
+              matches = [c for c in containers if c.get('name') == 'oa-verifier']
+              if len(matches) != 1:
+                  raise ValueError('Ambiguous verifier container')
+              c = matches[0]
+              values = {v['name']: v.get('value') or v.get('secureValue') for v in c.get('environmentVariables', [])}
+              if values.get('STATION_REGISTRY_URL', '').rstrip('/') != 'https://org-staging.openanonymity.ai':
+                  raise ValueError('Registry must be staging')
+              if values.get('TLS_DOMAIN') != 'verifier2.openanonymity.ai':
+                  raise ValueError('TLS domain must be verifier2')
+              if values.get('STATION_STATE_STORE') not in (None, '', 'none'):
+                  raise ValueError('This test expects persistence disabled')
+              image = c.get('image', '')
+              if not re.fullmatch(r'(oaverifieracr\.azurecr\.io|ghcr\.io/openanonymity)/oa-verifier@sha256:[0-9a-f]{64}', image):
+                  raise ValueError('Image must have an approved immutable digest')
+              if requested and (not expected_image or image != expected_image):
+                  raise ValueError('Deployed image changed or was not pinned')
+              return image
+
+          def main():
+              requested = os.environ.get('CONFIRM_RESTART') == 'true'
+              if requested and os.environ.get('SKIP_RECOVERY_TEST') == 'true':
+                  raise SystemExit('Existing recovery-test guard prohibits restart')
+              query = ['az', 'container', 'show', '--resource-group', 'oa-verifier', '--name', 'oa-verifier-2', '--output', 'json']
+              group = json.loads(subprocess.run(query, capture_output=True, text=True, check=True, timeout=60).stdout)
+              image = validate(group, os.environ.get('EXPECTED_IMAGE', ''), requested)
+              print(json.dumps({'preflight': 'passed', 'target': 'oa-verifier-2', 'image': image, 'restart_requested': requested}), flush=True)
+              if not requested:
+                  return
+              # Exactly one restart call; never retry a possibly accepted mutation.
+              subprocess.run(['az', 'container', 'restart', '--resource-group', 'oa-verifier', '--name', 'oa-verifier-2', '--output', 'none'], check=True, timeout=360)
+              print(json.dumps({'restart_command': 'completed', 'target': 'oa-verifier-2'}), flush=True)
+
+          if __name__ == '__main__':
+              main()
+          PY
+      - name: Observe TLS health after requested restart
+        if: inputs.confirm_restart == true
+        run: |
+          python3 - <<'PY'
+          import json, time
+          from urllib.request import urlopen
+          deadline = time.monotonic() + 300
+          while time.monotonic() < deadline:
+              try:
+                  with urlopen('https://verifier2.openanonymity.ai/health', timeout=10) as response:
+                      data = json.load(response)
+                      if response.status == 200 and data.get('status') == 'healthy':
+                          print(json.dumps({'tls_health': 'passed', 'stations': data.get('stations'), 'registry_ready': data.get('registry_ready')}))
+                          break
+              except Exception:
+                  pass
+              time.sleep(10)
+          else:
+              raise SystemExit('TLS health did not recover; no second restart will be attempted')
+          PY
