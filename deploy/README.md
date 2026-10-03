@@ -187,6 +187,7 @@ az monitor log-analytics workspace get-shared-keys -g oa-verifier -n oa-verifier
 | `SEALED_SECRET_VAULT` (variable) | Vault URL for the sealed secrets; defaults to `SEALED_KEK_VAULT` |
 | `SEALED_MSI_CLIENT_ID` (variable) | Client id of the group's user-assigned identity (the one `ACI_PULL_IDENTITY_ID` names) |
 | `KEK_RELEASE_KEEP_HASHES` (variable) | How many recent policy hashes stay allowed on the sealing key (default 4; 1 = only the current build) |
+| `REGISTRY_WARMUP_SECONDS` (variable) | Not-ready window after a start that restored nothing (default 72 h). The org keeps last-known stations for its own grace window while the verifier is not ready. |
 
 ### Optional (for custom TLS domain)
 

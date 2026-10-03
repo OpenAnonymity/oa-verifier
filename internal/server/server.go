@@ -58,6 +58,9 @@ type Server struct {
 	// Station registry persistence (state.go). Always non-nil; NoopStore by
 	// default so tests and local runs behave exactly as before.
 	state *stationState
+
+	// startedAt feeds the registry-readiness signal (ready.go).
+	startedAt time.Time
 }
 
 const orgPKTTL = 10 * time.Minute
@@ -72,6 +75,7 @@ func New(attestationEnabled bool) *Server {
 		banned:             banned.NewManager(),
 		attestationEnabled: attestationEnabled,
 		state:              newStationState(stationstore.NoopStore{}, "none"),
+		startedAt:          time.Now(),
 	}
 }
 

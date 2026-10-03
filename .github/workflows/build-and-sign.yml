@@ -342,6 +342,8 @@ jobs:
           SEALED_KEK_NAME: ${{ vars.SEALED_KEK_NAME }}
           SEALED_SECRET_VAULT: ${{ vars.SEALED_SECRET_VAULT }}
           SEALED_MSI_CLIENT_ID: ${{ vars.SEALED_MSI_CLIENT_ID }}
+          # Empty = the code default (72 h); see docs/STATION_STATE.md.
+          REGISTRY_WARMUP_SECONDS: ${{ vars.REGISTRY_WARMUP_SECONDS }}
         run: |
           echo "Generating CCE policy..."
 
@@ -552,6 +554,8 @@ jobs:
                       "STATION_STATE_STORE",
                       "STATION_STATE_STORE_DIR",
                       "STATION_STATE_SECRET_NAME",
+                      # Registry readiness signal (docs/STATION_STATE.md, "Readiness signal").
+                      "REGISTRY_WARMUP_SECONDS",
                       # Injected by ACI when the group has a managed identity; the
                       # verifier's Key Vault client reads them (certstore.MSITokenSource).
                       "IDENTITY_ENDPOINT",
@@ -625,7 +629,8 @@ jobs:
                       {"name": "TLS_CERT_KEK_NAME", "value": "${SEALED_KEK_NAME}"},
                       {"name": "TLS_CERT_SECRET_VAULT", "value": "${SEALED_SECRET_VAULT}"},
                       {"name": "TLS_CERT_MSI_CLIENT_ID", "value": "${SEALED_MSI_CLIENT_ID}"},
-                      {"name": "STATION_STATE_STORE", "value": "${STATION_STATE_STORE}"}
+                      {"name": "STATION_STATE_STORE", "value": "${STATION_STATE_STORE}"},
+                      {"name": "REGISTRY_WARMUP_SECONDS", "value": "${REGISTRY_WARMUP_SECONDS}"}
                     ],
                     "resources": {"requests": {"cpu": 1.0, "memoryInGB": 2.0}}
                   }

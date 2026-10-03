@@ -104,10 +104,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	stationCount := len(s.stations)
 	s.mu.RUnlock()
 
+	ready, _ := s.registryReadiness()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":      "healthy",
-		"stations":    stationCount,
-		"persistence": s.stationStateHealth(),
+		"status":         "healthy",
+		"stations":       stationCount,
+		"persistence":    s.stationStateHealth(),
+		"registry_ready": ready,
 	})
 }
 
@@ -552,6 +554,18 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	if publicKey == "" || stationData == nil {
+		if !s.registryReady() {
+			// The registry may still be incomplete after a start. This is
+			// "not yet", not "no": the client treats 503/unavailable as a
+			// verifier outage with bounded retries (see ready.go).
+			w.Header().Set("Retry-After", "30")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"status": "unavailable",
+				"detail": "registry_warming",
+				"error":  "Station registry is still being restored after a verifier restart; retry shortly",
+			})
+			return
+		}
 		writeError(w, http.StatusNotFound, "Station not registered")
 		return
 	}
@@ -922,9 +936,14 @@ func (s *Server) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 
 	banned := s.banned.GetAll()
 
+	ready, _ := s.registryReadiness()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"verified_stations": verified,
 		"banned_stations":   banned,
+		// false = this list may be incomplete (fresh start, nothing restored
+		// yet): merge, don't replace. Bans are complete and apply regardless.
+		"registry_ready": ready,
+		"registry":       s.registryStatus(),
 	})
 }
 

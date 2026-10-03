@@ -203,6 +203,44 @@ After that, a person is needed only for a brand-new station's first
 registration, and for account-level events (the operator's OpenRouter login
 revoked or expired, the management key deleted) that would need one today too.
 
+## Readiness signal (`registry_ready`)
+
+Persistence removes the usual cause of an empty registry, but not every one:
+a store that cannot be read yet, a build whose policy hash was not authorised,
+a verifier that has no persistence at all. In those cases the verifier used to
+be *up and wrong*: it answered `/broadcast` with an empty list, which the org
+took as authoritative and dropped every station key within 30 seconds, and it
+answered `/submit_key` with `404 Station not registered`, a verdict. A verifier
+that is *down* was handled more gracefully than one that had merely forgotten.
+
+So the verifier now says when it cannot judge yet. `registryReadiness()`
+(`internal/server/ready.go`) is **ready** as soon as a persisted snapshot was
+restored (the registry is complete as of its save), and otherwise only after
+`REGISTRY_WARMUP_SECONDS` of uptime (default 72 h; `0` restores the historical
+behaviour) and only if the state store is loaded. While not ready:
+
+* `/broadcast` carries `"registry_ready": false` and a `registry` status block
+  (`reason`, `started_at`, `uptime_seconds`, `warmup_seconds`). The org
+  (`station_manager/services/verifier_sync.py`) then **merges** the stations
+  that are listed instead of replacing its set, keeps the rest for its grace
+  window (`VERIFIER_GRACE_PERIOD`), and still applies bans at once.
+* `/submit_key` for a station the verifier does not know answers
+  `503 {"status":"unavailable","detail":"registry_warming"}` with
+  `Retry-After`, which the client already classifies as a verifier outage
+  (bounded background retries, outage policy) rather than a verdict. Known
+  stations are checked exactly as before.
+* `/health` carries `"registry_ready"`.
+
+The default of 72 hours is deliberate: it gives the team days, not minutes, to
+repair a verifier that lost its state, while the org's own grace window (set to
+match) keeps stations online and the client's advisory policy keeps users
+informed that verification is unavailable. Nothing is marked verified without
+evidence during that time — the verifier declines to answer, it does not say
+yes — and bans are never delayed. Readers of the trust model should note that
+this is the same bounded tolerance the client already extended to a verifier
+that is unreachable, now applied consistently to one that is reachable but
+not yet complete.
+
 ### If the snapshot cannot be read
 
 A `load_error` on `/health` that does not clear means the saved secret exists

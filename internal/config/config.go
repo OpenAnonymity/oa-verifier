@@ -212,6 +212,28 @@ func StationFailureGraceSeconds() int {
 	return v
 }
 
+// RegistryWarmupSeconds returns REGISTRY_WARMUP_SECONDS (default 259200 = 72 h).
+//
+// After a start that did NOT restore a persisted station registry, the
+// verifier reports its registry as "not ready" for this long: its list of
+// stations may be incomplete, so /broadcast tells the org not to drop
+// stations on its account and /submit_key answers "unavailable" (503) rather
+// than "not registered" (404) for stations it does not know. Set to 0 to
+// report ready immediately (the historical behaviour).
+func RegistryWarmupSeconds() int {
+	mu.RLock()
+	defer mu.RUnlock()
+	s := os.Getenv("REGISTRY_WARMUP_SECONDS")
+	if s == "" {
+		return 259200
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil || v < 0 {
+		return 259200
+	}
+	return v
+}
+
 // BannedStationsFile returns BANNED_STATIONS_FILE (default "banned_stations.json").
 func BannedStationsFile() string {
 	mu.RLock()

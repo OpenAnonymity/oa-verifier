@@ -54,6 +54,7 @@ type stationState struct {
 
 	mu              sync.Mutex
 	loaded          bool   // Load succeeded or found nothing: saving is allowed
+	snapshotLoaded  bool   // a saved snapshot was restored: the registry is complete as of its save
 	lastLoadErr     error  // last non-NotFound load error, for /health and logs
 	lastSaveErr     error  // last failed write (cleared by the next success), for /health
 	lastSavedDigest string // Digest of the snapshot last written
@@ -88,7 +89,12 @@ func newStationState(store stationstore.Store, desc string) *stationState {
 	if i := strings.IndexByte(mode, ':'); i >= 0 {
 		mode = mode[:i]
 	}
-	return &stationState{store: store, desc: desc, mode: mode, changed: make(chan struct{}, 1), done: make(chan struct{})}
+	st := &stationState{store: store, desc: desc, mode: mode, changed: make(chan struct{}, 1), done: make(chan struct{})}
+	if _, isNoop := store.(stationstore.NoopStore); isNoop {
+		// Nothing to load: the registry is as complete as it will ever be.
+		st.loaded = true
+	}
+	return st
 }
 
 // InitStationState configures persistence from the environment, restores the
@@ -165,6 +171,7 @@ func (s *Server) loadStationState(ctx context.Context) {
 		restored, skipped := s.restoreSnapshot(snap)
 		s.state.mu.Lock()
 		s.state.loaded = true
+		s.state.snapshotLoaded = true
 		s.state.lastLoadErr = nil
 		s.state.lastSavedDigest = stationstore.Digest(s.snapshot())
 		s.state.mu.Unlock()
@@ -354,6 +361,9 @@ func (s *Server) persistOnce(ctx context.Context) error {
 		switch {
 		case err == nil:
 			restored, skipped := s.restoreSnapshot(snap)
+			s.state.mu.Lock()
+			s.state.snapshotLoaded = true
+			s.state.mu.Unlock()
 			slog.Info("late load of persisted station registry succeeded", "merged", restored, "skipped_banned", skipped)
 		case errors.Is(err, stationstore.ErrNotFound):
 		default:
