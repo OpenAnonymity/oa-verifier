@@ -167,7 +167,8 @@ class WorkflowTests(unittest.TestCase):
         for name in ["TLS_CERT_STORE", "STATION_STATE_STORE", "TLS_CERT_KEK_VAULT", "TLS_CERT_MSI_CLIENT_ID"]:
             self.assertNotIn(name, policy_template, name)
             self.assertIn(f'"name": "{name}"', deploy_template, name)
-        for var in ["vars.TLS_CERT_STORE", "vars.STATION_STATE_STORE", "vars.SEALED_KEK_VAULT", "vars.SEALED_KEK_NAME"]:
+        self.assertIn('${{ env.DASHBOARD_STATION_STATE_STORE || vars.STATION_STATE_STORE }}', workflow)
+        for var in ["vars.TLS_CERT_STORE", "vars.SEALED_KEK_VAULT", "vars.SEALED_KEK_NAME"]:
             self.assertIn("${{ " + var + " }}", workflow)
         self.assertNotIn("secrets.SEALED_", workflow)
 

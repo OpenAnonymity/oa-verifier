@@ -1,4 +1,5 @@
 name: Build, Sign, and Deploy
+run-name: Verifier2 control ${{ inputs.controls_revision || 'release' }}
 
 on:
   push:
@@ -11,6 +12,8 @@ on:
       - '.github/workflows/verify-attestation.yml'
       - '.github/workflows/restart-staging-verifier.yml'
       - '.github/workflows/staging-storage-readiness.yml'
+      - '.github/workflows/apply-staging-controls.yml'
+      - 'scripts/staging_controls.py'
       - 'scripts/deployed_image.py'
       - 'scripts/attestation_claim.py'
       - 'tests/deployment/**'
@@ -19,6 +22,10 @@ on:
     branches: [main]
   workflow_dispatch:
     inputs:
+      controls_revision:
+        description: 'Expected staging dashboard settings revision (blank for normal release)'
+        type: string
+        default: ''
       run_recovery_test:
         description: 'Restart after this deployment to validate recovery (extra certificate issuance and station reauthentication may be required)'
         type: boolean
@@ -37,6 +44,10 @@ permissions:
   contents: read
   packages: write
   id-token: write
+
+concurrency:
+  group: verifier2-runtime-mutation
+  cancel-in-progress: false
 
 jobs:
   build-and-deploy:
@@ -87,6 +98,15 @@ jobs:
               raise SystemExit('Registry has no authorized stations; deployment stopped')
           print('Staging registry authorization passed; station count=' + str(len(stations)))
           PY
+
+      - name: Read requested staging storage setting
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          DASHBOARD_CONTROLS: ${{ vars.STAGING_DASHBOARD_CONTROLS }}
+          REGISTRY_BASE_URL: ${{ secrets.STATION_REGISTRY_URL }}
+          REGISTRY_AUTH: ${{ secrets.STATION_REGISTRY_SECRET }}
+          EXPECTED_CONTROLS_REVISION: ${{ inputs.controls_revision }}
+        run: python3 scripts/staging_controls.py
 
       - name: Check for code changes
         id: changes
@@ -378,7 +398,7 @@ jobs:
           # Sealed persistence (repository *variables*, not secrets: these are names).
           # Empty = off: the registry and certificate are not persisted, as before.
           TLS_CERT_STORE: ${{ vars.TLS_CERT_STORE }}
-          STATION_STATE_STORE: ${{ vars.STATION_STATE_STORE }}
+          STATION_STATE_STORE: ${{ env.DASHBOARD_STATION_STATE_STORE || vars.STATION_STATE_STORE }}
           SEALED_KEK_VAULT: ${{ vars.SEALED_KEK_VAULT }}
           SEALED_KEK_NAME: ${{ vars.SEALED_KEK_NAME }}
           SEALED_SECRET_VAULT: ${{ vars.SEALED_SECRET_VAULT }}
@@ -851,6 +871,16 @@ jobs:
             az container delete --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --yes
             sleep 30
           fi
+
+      - name: Refuse a stale dashboard deployment request
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          DASHBOARD_CONTROLS: ${{ vars.STAGING_DASHBOARD_CONTROLS }}
+          REGISTRY_BASE_URL: ${{ secrets.STATION_REGISTRY_URL }}
+          REGISTRY_AUTH: ${{ secrets.STATION_REGISTRY_SECRET }}
+          EXPECTED_CONTROLS_REVISION: ${{ inputs.controls_revision }}
+          CONTROL_MODE: check
+        run: python3 scripts/staging_controls.py
 
       - name: Deploy to Azure
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')

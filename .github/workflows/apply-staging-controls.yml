@@ -1,0 +1,49 @@
+name: Apply staging dashboard storage request
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: staging-control-dispatch
+  cancel-in-progress: false
+jobs:
+  dispatch:
+    if: vars.STAGING_DASHBOARD_CONTROLS == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Apply only a new request, at most once per settings revision
+        env:
+          REGISTRY_BASE_URL: ${{ secrets.STATION_REGISTRY_URL }}
+          REGISTRY_AUTH: ${{ secrets.STATION_REGISTRY_SECRET }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json, subprocess, sys
+          from urllib.request import urlopen
+          sys.path.insert(0, 'scripts')
+          from staging_controls import read, claim
+          revision, requested = read()
+          with urlopen('https://verifier2.openanonymity.ai/health', timeout=15) as response:
+              current = json.load(response).get('persistence', {}).get('store')
+          if current not in ('none', 'keyvault-sealed'):
+              raise SystemExit('Running storage state is unknown; no deployment requested')
+          if requested == current:
+              print('Requested storage matches the running verifier; no action')
+              raise SystemExit(0)
+          runs = json.loads(subprocess.check_output(['gh', 'run', 'list', '-R', 'OpenAnonymity/oa-verifier', '--workflow', 'build-and-sign.yml', '--limit', '100', '--json', 'displayTitle,status'], text=True))
+          if any(r['status'] != 'completed' for r in runs):
+              print('Another deployment is running; no duplicate dispatch')
+              raise SystemExit(0)
+          if not claim(revision):
+              print('Request already attempted or changed; no duplicate dispatch')
+              raise SystemExit(0)
+          subprocess.run(['gh', 'workflow', 'run', 'build-and-sign.yml', '-R', 'OpenAnonymity/oa-verifier', '--ref', 'main', '-f', 'controls_revision=' + str(revision)], check=True)
+          print('Dispatched staging storage deployment for revision ' + str(revision))
+          PY
