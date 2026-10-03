@@ -212,7 +212,7 @@ func StationFailureGraceSeconds() int {
 	return v
 }
 
-// RegistryWarmupSeconds returns REGISTRY_WARMUP_SECONDS (default 259200 = 72 h).
+// RegistryWarmupSeconds returns REGISTRY_WARMUP_SECONDS (default 604800 = 7 days).
 //
 // After a start that did NOT restore a persisted station registry, the
 // verifier reports its registry as "not ready" for this long: its list of
@@ -225,11 +225,11 @@ func RegistryWarmupSeconds() int {
 	defer mu.RUnlock()
 	s := os.Getenv("REGISTRY_WARMUP_SECONDS")
 	if s == "" {
-		return 259200
+		return 604800
 	}
 	v, err := strconv.Atoi(s)
 	if err != nil || v < 0 {
-		return 259200
+		return 604800
 	}
 	return v
 }

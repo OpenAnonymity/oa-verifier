@@ -216,7 +216,7 @@ that is *down* was handled more gracefully than one that had merely forgotten.
 So the verifier now says when it cannot judge yet. `registryReadiness()`
 (`internal/server/ready.go`) is **ready** as soon as a persisted snapshot was
 restored (the registry is complete as of its save), and otherwise only after
-`REGISTRY_WARMUP_SECONDS` of uptime (default 72 h; `0` restores the historical
+`REGISTRY_WARMUP_SECONDS` of uptime (default 7 days; `0` restores the historical
 behaviour) and only if the state store is loaded. While not ready:
 
 * `/broadcast` carries `"registry_ready": false` and a `registry` status block
@@ -231,10 +231,13 @@ behaviour) and only if the state store is loaded. While not ready:
   stations are checked exactly as before.
 * `/health` carries `"registry_ready"`.
 
-The default of 72 hours is deliberate: it gives the team days, not minutes, to
+The default of 7 days is deliberate: it gives the team days, not minutes, to
 repair a verifier that lost its state, while the org's own grace window (set to
 match) keeps stations online and the client's advisory policy keeps users
-informed that verification is unavailable. Nothing is marked verified without
+informed that verification is unavailable. The org measures its window from
+the last time the verifier was *ready*, not from each restart, so repeated
+restarts cannot stretch the total degraded time past 7 days. Stations the
+verifier does list while not ready are always kept, including after the window. Nothing is marked verified without
 evidence during that time — the verifier declines to answer, it does not say
 yes — and bans are never delayed. Readers of the trust model should note that
 this is the same bounded tolerance the client already extended to a verifier

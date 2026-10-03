@@ -206,7 +206,7 @@ See [deploy/README.md](deploy/README.md) for details.
 | `STATION_STATE_STORE` | Persist the station registry across restarts: `none` (default) / `file` / `file-sealed` / `keyvault-sealed`; see [docs/STATION_STATE.md](docs/STATION_STATE.md) |
 | `STATION_STATE_STORE_DIR` / `STATION_STATE_SECRET_NAME` | Location for the file modes / Key Vault secret name (default `oa-verifier-station-state`) |
 | `TLS_CERT_STORE` and `TLS_CERT_*` | Persist the Let's Encrypt certificate and the shared sealing key configuration; see [docs/CERT_PERSISTENCE.md](docs/CERT_PERSISTENCE.md) |
-| `REGISTRY_WARMUP_SECONDS` | How long after a start without a restored registry the verifier reports `registry_ready: false` (default 259200 = 72 h; 0 = always ready); see "Readiness signal" in [docs/STATION_STATE.md](docs/STATION_STATE.md) |
+| `REGISTRY_WARMUP_SECONDS` | How long after a start without a restored registry the verifier reports `registry_ready: false` (default 604800 = 7 days; 0 = always ready); see "Readiness signal" in [docs/STATION_STATE.md](docs/STATION_STATE.md) |
 
 Every variable the container reads must also appear in `required_env_vars` or
 `optional_env_vars` of the "Generate CCE policy" step in

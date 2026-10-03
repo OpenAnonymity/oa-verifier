@@ -342,7 +342,7 @@ jobs:
           SEALED_KEK_NAME: ${{ vars.SEALED_KEK_NAME }}
           SEALED_SECRET_VAULT: ${{ vars.SEALED_SECRET_VAULT }}
           SEALED_MSI_CLIENT_ID: ${{ vars.SEALED_MSI_CLIENT_ID }}
-          # Empty = the code default (72 h); see docs/STATION_STATE.md.
+          # Empty = the code default (7 days); see docs/STATION_STATE.md.
           REGISTRY_WARMUP_SECONDS: ${{ vars.REGISTRY_WARMUP_SECONDS }}
         run: |
           echo "Generating CCE policy..."

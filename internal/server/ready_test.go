@@ -171,3 +171,20 @@ func TestEmptySnapshotCountsAsComplete(t *testing.T) {
 		t.Fatalf("got %v %q", ready, reason)
 	}
 }
+
+func TestDefaultWarmupIsSevenDays(t *testing.T) {
+	t.Setenv("REGISTRY_WARMUP_SECONDS", "")
+	t.Setenv("BANNED_STATIONS_FILE", filepath.Join(t.TempDir(), "banned.json"))
+	s := New(false)
+	if got := s.registryStatus()["warmup_seconds"]; got != 604800 {
+		t.Fatalf("default warm-up = %v, want 604800 (7 days)", got)
+	}
+	s.startedAt = time.Now().Add(-6*24*time.Hour - 23*time.Hour)
+	if ready, _ := s.registryReadiness(); ready {
+		t.Fatal("must still be warming after 6 days 23 hours")
+	}
+	s.startedAt = time.Now().Add(-7*24*time.Hour - time.Minute)
+	if ready, _ := s.registryReadiness(); !ready {
+		t.Fatal("must be ready after 7 days")
+	}
+}
