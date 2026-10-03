@@ -14,6 +14,7 @@ on:
       - '.github/workflows/staging-storage-readiness.yml'
       - '.github/workflows/apply-staging-controls.yml'
       - 'scripts/staging_controls.py'
+      - 'scripts/setup_staging_encrypted_storage.sh'
       - 'scripts/deployed_image.py'
       - 'scripts/attestation_claim.py'
       - 'tests/deployment/**'
