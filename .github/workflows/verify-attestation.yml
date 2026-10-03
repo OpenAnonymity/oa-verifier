@@ -233,13 +233,30 @@ jobs:
                       "RATE_LIMIT_RPS",
                       "RATE_LIMIT_BURST",
                       "SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS",
+                      "STATION_FAILURE_GRACE_SECONDS",
                       "TLS_DOMAIN",
                       "ACME_EMAIL",
                       "ACME_DNS_PROVIDER",
                       "CF_DNS_API_TOKEN",
                       "CF_ZONE_API_TOKEN",
                       "REKOR_LOG_INDEX",
-                      "SIGSTORE_PAYLOAD_HASH"
+                      "SIGSTORE_PAYLOAD_HASH",
+                      "TLS_CERT_STORE",
+                      "TLS_CERT_STORE_DIR",
+                      "TLS_CERT_KEK_VAULT",
+                      "TLS_CERT_KEK_NAME",
+                      "TLS_CERT_SKR_URL",
+                      "TLS_CERT_SECRET_VAULT",
+                      "TLS_CERT_SECRET_NAME",
+                      "TLS_CERT_MSI_CLIENT_ID",
+                      "STATION_STATE_STORE",
+                      "STATION_STATE_STORE_DIR",
+                      "STATION_STATE_SECRET_NAME",
+                      "REGISTRY_WARMUP_SECONDS",
+                      "IDENTITY_ENDPOINT",
+                      "IDENTITY_HEADER",
+                      "IDENTITY_API_VERSION",
+                      "IDENTITY_SERVER_THUMBPRINT"
                   ]
                   for env_var in required_env_vars:
                       containers[0]["env_rules"].append({
