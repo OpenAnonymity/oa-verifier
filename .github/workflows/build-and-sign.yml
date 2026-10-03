@@ -69,7 +69,8 @@ jobs:
               def redirect_request(self, req, fp, code, msg, headers, newurl):
                   return None
           request = Request(base + '/verifier/registered_stations',
-                            headers={'Authorization': 'Bearer ' + credential})
+                            headers={'Authorization': 'Bearer ' + credential,
+                                     'User-Agent': 'Go-http-client/1.1'})
           try:
               with build_opener(NoRedirect()).open(request, timeout=15) as response:
                   payload = json.load(response)

@@ -32,6 +32,7 @@ class RegistryPreflightTests(unittest.TestCase):
         request = opener.open.call_args.args[0]
         self.assertEqual(request.full_url, 'https://org-staging.openanonymity.ai/verifier/registered_stations')
         self.assertEqual(request.get_header('Authorization'), 'Bearer fixture-secret')
+        self.assertEqual(request.get_header('User-agent'), 'Go-http-client/1.1')
         self.assertNotIn('fixture-secret', output.getvalue())
         self.assertNotIn('station_id', output.getvalue())
         return output.getvalue()
