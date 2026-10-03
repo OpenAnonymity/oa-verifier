@@ -52,13 +52,14 @@ type stationState struct {
 	changed chan struct{} // buffered(1); a pending-write flag
 	done    chan struct{} // closed when persistLoop returns
 
-	mu              sync.Mutex
-	loaded          bool   // Load succeeded or found nothing: saving is allowed
-	snapshotLoaded  bool   // a saved snapshot was restored: the registry is complete as of its save
-	lastLoadErr     error  // last non-NotFound load error, for /health and logs
-	lastSaveErr     error  // last failed write (cleared by the next success), for /health
-	lastSavedDigest string // Digest of the snapshot last written
-	writes          int    // successful writes, for tests and /health
+	mu               sync.Mutex
+	loaded           bool      // Load succeeded or found nothing: saving is allowed
+	snapshotComplete bool      // a COMPLETE snapshot was restored: the registry is authoritative
+	warmupSince      time.Time // start of the current warm-up (carried across restarts by incomplete snapshots)
+	lastLoadErr      error     // last non-NotFound load error, for /health and logs
+	lastSaveErr      error     // last failed write (cleared by the next success), for /health
+	lastSavedDigest  string    // Digest of the snapshot last written
+	writes           int       // successful writes, for tests and /health
 }
 
 // Tunables, variables so tests can shorten them.
@@ -75,6 +76,11 @@ var (
 	stateLoadDeadline = 2 * time.Minute
 	// stateFlushTimeout bounds the final write attempted on shutdown.
 	stateFlushTimeout = 10 * time.Second
+	// statePeriodicCheck re-runs persistOnce on a timer: it retries a start-up
+	// load that failed even if no station changes, and writes the snapshot
+	// again when the registry becomes ready (Complete flips to true). Writes
+	// stay digest-gated, so an idle tick costs no Key Vault call.
+	statePeriodicCheck = 5 * time.Minute
 	// statePersistDebounce coalesces bursts of registry changes into one write.
 	statePersistDebounce = 2 * time.Second
 	// statePersistRetry is the delay after a failed write (or a failed late load).
@@ -122,6 +128,26 @@ func (s *Server) SetStationStateStore(store stationstore.Store, desc string) {
 		desc = "none"
 	}
 	s.state = newStationState(store, desc)
+	s.state.warmupSince = s.startedAt
+}
+
+// applySnapshotMeta records what a restored snapshot says about completeness.
+// A complete snapshot makes the registry ready at once; an incomplete one
+// keeps warming from the EARLIER of its warm-up start and ours, so restarts
+// during a warm-up cannot extend it. Must not be called with s.mu held.
+func (s *Server) applySnapshotMeta(snap *stationstore.Snapshot) {
+	if snap == nil {
+		return
+	}
+	s.state.mu.Lock()
+	defer s.state.mu.Unlock()
+	if snap.Complete {
+		s.state.snapshotComplete = true
+		return
+	}
+	if !snap.WarmupSince.IsZero() && snap.WarmupSince.Before(s.state.warmupSince) {
+		s.state.warmupSince = snap.WarmupSince
+	}
 }
 
 // StationStateDescription reports the configured backend, for logs and /health.
@@ -169,14 +195,15 @@ func (s *Server) loadStationState(ctx context.Context) {
 	switch {
 	case err == nil:
 		restored, skipped := s.restoreSnapshot(snap)
+		s.applySnapshotMeta(snap)
 		s.state.mu.Lock()
 		s.state.loaded = true
-		s.state.snapshotLoaded = true
 		s.state.lastLoadErr = nil
-		s.state.lastSavedDigest = stationstore.Digest(s.snapshot())
+		// What is stored now: any difference from the live view triggers a write.
+		s.state.lastSavedDigest = stationstore.Digest(snap)
 		s.state.mu.Unlock()
 		slog.Info("station registry restored", "stations", restored, "skipped_banned", skipped,
-			"saved_at", snap.SavedAt.UTC().Format(time.RFC3339), "store", s.state.desc)
+			"complete", snap.Complete, "saved_at", snap.SavedAt.UTC().Format(time.RFC3339), "store", s.state.desc)
 	case errors.Is(err, stationstore.ErrNotFound):
 		s.state.mu.Lock()
 		s.state.loaded = true
@@ -259,7 +286,20 @@ func (s *Server) snapshot() *stationstore.Snapshot {
 	}
 	s.mu.RUnlock()
 	sort.Slice(recs, func(i, j int) bool { return recs[i].PublicKey < recs[j].PublicKey })
-	return &stationstore.Snapshot{Version: stationstore.SnapshotVersion, SavedAt: time.Now().UTC(), Stations: recs}
+	ready := s.registryReady()
+	s.state.mu.Lock()
+	since := s.state.warmupSince
+	s.state.mu.Unlock()
+	snap := &stationstore.Snapshot{
+		Version:  stationstore.SnapshotVersion,
+		SavedAt:  time.Now().UTC(),
+		Complete: ready,
+		Stations: recs,
+	}
+	if !ready {
+		snap.WarmupSince = since.UTC()
+	}
+	return snap
 }
 
 // requestPersist flags that the registry changed. It never blocks: the flag
@@ -285,11 +325,14 @@ func (s *Server) persistLoop(ctx context.Context) {
 		return
 	}
 	var retry <-chan time.Time
+	tick := time.NewTicker(statePeriodicCheck)
+	defer tick.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			s.flushOnShutdown()
 			return
+		case <-tick.C:
 		case <-s.state.changed:
 			// Debounce: let a burst of changes (register + first check) settle.
 			select {
@@ -361,10 +404,9 @@ func (s *Server) persistOnce(ctx context.Context) error {
 		switch {
 		case err == nil:
 			restored, skipped := s.restoreSnapshot(snap)
-			s.state.mu.Lock()
-			s.state.snapshotLoaded = true
-			s.state.mu.Unlock()
-			slog.Info("late load of persisted station registry succeeded", "merged", restored, "skipped_banned", skipped)
+			s.applySnapshotMeta(snap)
+			slog.Info("late load of persisted station registry succeeded", "merged", restored,
+				"skipped_banned", skipped, "complete", snap.Complete)
 		case errors.Is(err, stationstore.ErrNotFound):
 		default:
 			s.state.mu.Lock()

@@ -235,10 +235,19 @@ func TrimCookieData(cookieData map[string]any) map[string]any {
 }
 
 // Snapshot is the persisted form of the station registry.
+//
+// Complete says the registry was authoritative when saved (the verifier was
+// "ready", see internal/server/ready.go). A snapshot saved while the verifier
+// was still warming up after a start that restored nothing holds only the
+// stations that re-registered since, so restoring it must NOT make the
+// verifier ready; WarmupSince then carries the start of that warm-up so
+// restarts cannot extend it. Snapshots without the field are incomplete.
 type Snapshot struct {
-	Version  int       `json:"v"`
-	SavedAt  time.Time `json:"saved_at"`
-	Stations []Record  `json:"stations"`
+	Version     int       `json:"v"`
+	SavedAt     time.Time `json:"saved_at"`
+	Complete    bool      `json:"complete"`
+	WarmupSince time.Time `json:"warmup_since,omitempty"`
+	Stations    []Record  `json:"stations"`
 }
 
 // Store persists a Snapshot.
@@ -395,7 +404,11 @@ func Digest(s *Snapshot) string {
 		})
 	}
 	// Order is part of the fingerprint; callers sort records by public key.
-	data, err := json.Marshal(items)
+	data, err := json.Marshal(struct {
+		Complete    bool      `json:"complete"`
+		WarmupSince int64     `json:"warmup_since"`
+		Items       []durable `json:"items"`
+	}{s.Complete, s.WarmupSince.Unix(), items})
 	if err != nil {
 		return ""
 	}

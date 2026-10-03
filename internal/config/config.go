@@ -212,7 +212,15 @@ func StationFailureGraceSeconds() int {
 	return v
 }
 
-// RegistryWarmupSeconds returns REGISTRY_WARMUP_SECONDS (default 604800 = 7 days).
+// MaxRegistryWarmupSeconds caps REGISTRY_WARMUP_SECONDS in code. The variable
+// is outside the measured CCE policy (any value is allowed), so without a cap an
+// operator could keep the attested verifier answering "not yet" instead of "no"
+// for unknown stations indefinitely. Configuration can shorten the window, not
+// lengthen it.
+const MaxRegistryWarmupSeconds = 604800
+
+// RegistryWarmupSeconds returns REGISTRY_WARMUP_SECONDS (default and maximum
+// 604800 = 7 days).
 //
 // After a start that did NOT restore a persisted station registry, the
 // verifier reports its registry as "not ready" for this long: its list of
@@ -225,11 +233,14 @@ func RegistryWarmupSeconds() int {
 	defer mu.RUnlock()
 	s := os.Getenv("REGISTRY_WARMUP_SECONDS")
 	if s == "" {
-		return 604800
+		return MaxRegistryWarmupSeconds
 	}
 	v, err := strconv.Atoi(s)
 	if err != nil || v < 0 {
-		return 604800
+		return MaxRegistryWarmupSeconds
+	}
+	if v > MaxRegistryWarmupSeconds {
+		return MaxRegistryWarmupSeconds
 	}
 	return v
 }

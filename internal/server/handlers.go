@@ -487,6 +487,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	s.emailToPK[email] = req.PublicKey
 	if stationID != "" {
 		s.stationIDToPK[stationID] = req.PublicKey
+		delete(s.removed, stationID)
 	}
 	s.mu.Unlock()
 	s.requestPersist()
@@ -554,15 +555,31 @@ func (s *Server) handleSubmitKey(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	if publicKey == "" || stationData == nil {
-		if !s.registryReady() {
+		// Verdicts first: a ban or a deliberate unregistration is a "no"
+		// whatever the readiness; only a station we may simply not have
+		// restored yet gets "not yet".
+		if entry, banned := s.bannedEntry(req.StationID); banned {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error":          "Station is banned.",
+				"status":         "banned",
+				"banned_station": entry,
+			})
+			return
+		}
+		if s.wasRemoved(req.StationID) {
+			writeError(w, http.StatusNotFound, "Station not registered")
+			return
+		}
+		if ready, _ := s.registryReadiness(); !ready {
 			// The registry may still be incomplete after a start. This is
 			// "not yet", not "no": the client treats 503/unavailable as a
 			// verifier outage with bounded retries (see ready.go).
 			w.Header().Set("Retry-After", "30")
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-				"status": "unavailable",
-				"detail": "registry_warming",
-				"error":  "Station registry is still being restored after a verifier restart; retry shortly",
+				"status":   "unavailable",
+				"detail":   "registry_warming",
+				"error":    "Station registry is still being restored after a verifier restart; retry shortly",
+				"registry": s.registryStatus(),
 			})
 			return
 		}
@@ -936,15 +953,22 @@ func (s *Server) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 
 	banned := s.banned.GetAll()
 
-	ready, _ := s.registryReadiness()
-	writeJSON(w, http.StatusOK, map[string]any{
+	status := s.registryStatus()
+	ready, _ := status["ready"].(bool)
+	out := map[string]any{
 		"verified_stations": verified,
 		"banned_stations":   banned,
 		// false = this list may be incomplete (fresh start, nothing restored
-		// yet): merge, don't replace. Bans are complete and apply regardless.
+		// yet): merge, don't replace. Published bans still apply.
 		"registry_ready": ready,
-		"registry":       s.registryStatus(),
-	})
+		"registry":       status,
+	}
+	if !ready {
+		// While the org merges instead of replacing, tell it explicitly which
+		// stations this process removed so it can drop their keys.
+		out["removed_stations"] = s.removedList()
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleBannedStations(w http.ResponseWriter, r *http.Request) {

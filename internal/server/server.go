@@ -61,13 +61,20 @@ type Server struct {
 
 	// startedAt feeds the registry-readiness signal (ready.go).
 	startedAt time.Time
+
+	// removed holds stations this process deliberately unregistered (not
+	// banned), keyed by station id and guarded by mu. While the registry is
+	// not ready, /broadcast publishes them so the org drops their keys, and
+	// /submit_key keeps answering 404 for them instead of "not yet" (ready.go).
+	removed map[string]removedStation
 }
 
 const orgPKTTL = 10 * time.Minute
 
 // New creates a new Server.
 func New(attestationEnabled bool) *Server {
-	return &Server{
+	now := time.Now()
+	s := &Server{
 		stations:           make(map[string]*models.Station),
 		emailToPK:          make(map[string]string),
 		stationIDToPK:      make(map[string]string),
@@ -75,8 +82,11 @@ func New(attestationEnabled bool) *Server {
 		banned:             banned.NewManager(),
 		attestationEnabled: attestationEnabled,
 		state:              newStationState(stationstore.NoopStore{}, "none"),
-		startedAt:          time.Now(),
+		startedAt:          now,
+		removed:            make(map[string]removedStation),
 	}
+	s.state.warmupSince = now
+	return s
 }
 
 // Router returns the chi router with all routes.

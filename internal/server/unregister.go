@@ -18,6 +18,7 @@ func (s *Server) unregisterStation(stationID, publicKey, email, reason string, s
 	}
 	if stationID != "" {
 		delete(s.stationIDToPK, stationID)
+		s.recordRemovedLocked(stationID, publicKey, reason)
 	}
 	s.mu.Unlock()
 	s.requestPersist()

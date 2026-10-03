@@ -104,7 +104,7 @@ it ever is not. An oversized snapshot is logged at error level and shows as
   into the live registry (same rules as at start-up) and the union is written.
   A sidecar that is slow for a minute can therefore never cause the snapshot
   to be replaced by a smaller one.
-* **`/health`** gains `"persistence": {"store": "<mode>", "loaded": bool,
+* **`/health`** gains `"registry_ready"` (see "Readiness signal") and `"persistence": {"store": "<mode>", "loaded": bool,
   "load_error": true?, "save_error": true?}`. Only the backend name is
   exposed, never the vault or key name. `save_error` appears when the last
   write failed (Key Vault unreachable, or the snapshot over its size budget)
@@ -214,20 +214,36 @@ answered `/submit_key` with `404 Station not registered`, a verdict. A verifier
 that is *down* was handled more gracefully than one that had merely forgotten.
 
 So the verifier now says when it cannot judge yet. `registryReadiness()`
-(`internal/server/ready.go`) is **ready** as soon as a persisted snapshot was
-restored (the registry is complete as of its save), and otherwise only after
-`REGISTRY_WARMUP_SECONDS` of uptime (default 7 days; `0` restores the historical
-behaviour) and only if the state store is loaded. While not ready:
+(`internal/server/ready.go`) is **ready** when:
 
-* `/broadcast` carries `"registry_ready": false` and a `registry` status block
-  (`reason`, `started_at`, `uptime_seconds`, `warmup_seconds`). The org
+* a **complete** snapshot was restored — one saved while the verifier was
+  itself ready (`Snapshot.Complete`). A snapshot saved *during* a warm-up holds
+  only the stations that re-registered since, so restoring it does not make
+  the verifier ready; or
+* `REGISTRY_WARMUP_SECONDS` (default and maximum 7 days, capped in code
+  because the variable is outside the measured policy; `0` = ready as soon as
+  the state store is loaded) have passed since the warm-up began, and the
+  state store is loaded. The warm-up begins at this start, or earlier if an
+  incomplete snapshot carries an earlier `warmup_since`, so restarts during a
+  warm-up cannot extend it. When it ends, a periodic check writes the snapshot
+  again with `Complete: true`.
+
+While not ready:
+
+* `/broadcast` carries `"registry_ready": false`, a `registry` status block
+  (`reason`, `started_at`, `warmup_since`, `uptime_seconds`, `warmup_seconds`)
+  and `removed_stations`: stations this process deliberately unregistered
+  (not banned), with the public key they had. The org
   (`station_manager/services/verifier_sync.py`) then **merges** the stations
-  that are listed instead of replacing its set, keeps the rest for its grace
-  window (`VERIFIER_GRACE_PERIOD`), and still applies bans at once.
+  that are listed instead of replacing its set, drops the keys of removed
+  stations, keeps the rest for its grace window (`VERIFIER_GRACE_PERIOD`), and
+  applies the published bans at once.
 * `/submit_key` for a station the verifier does not know answers
   `503 {"status":"unavailable","detail":"registry_warming"}` with
-  `Retry-After`, which the client already classifies as a verifier outage
-  (bounded background retries, outage policy) rather than a verdict. Known
+  `Retry-After` and the status block, which the client classifies as a
+  verifier outage (bounded background retries, outage policy) rather than a
+  verdict. A station banned by this verifier still gets `403 banned`, and a
+  station it unregistered still gets `404`, whatever the readiness. Known
   stations are checked exactly as before.
 * `/health` carries `"registry_ready"`.
 
@@ -236,13 +252,30 @@ repair a verifier that lost its state, while the org's own grace window (set to
 match) keeps stations online and the client's advisory policy keeps users
 informed that verification is unavailable. The org measures its window from
 the last time the verifier was *ready*, not from each restart, so repeated
-restarts cannot stretch the total degraded time past 7 days. Stations the
-verifier does list while not ready are always kept, including after the window. Nothing is marked verified without
-evidence during that time — the verifier declines to answer, it does not say
-yes — and bans are never delayed. Readers of the trust model should note that
-this is the same bounded tolerance the client already extended to a verifier
-that is unreachable, now applied consistently to one that is reachable but
-not yet complete.
+restarts cannot stretch the time the org keeps unlisted stations past 7 days.
+Stations the verifier does list while not ready are always kept, including
+after the window. Nothing is marked verified without evidence during that time
+— the verifier declines to answer, it does not say yes. Readers of the trust
+model should note that this is the same bounded tolerance the client already
+extended to a verifier that is unreachable, now applied consistently to one
+that is reachable but not yet complete.
+
+Limits worth knowing:
+
+* The verifier's ban list (`BANNED_STATIONS_FILE`) and its removal tombstones
+  live in the container and are lost on restart. The org's own ban record in
+  Redis is what persists; a ban the org has already applied is not undone by a
+  verifier restart.
+* Without persistence (`STATION_STATE_STORE` unset), a verifier that restarts
+  more often than every 7 days never becomes ready on its own: every restart
+  starts a new warm-up with an empty registry. That configuration buys the
+  team a 7-day window measured from the last time the verifier was ready, not
+  a steady state; persistence is what makes restarts harmless.
+* The org's live verifier health check ignores readiness, so certified
+  stations get no shared-secret fallback while the verifier is merely not
+  ready (stricter than during an outage).
+* If saving stalls (`save_error`, e.g. an oversized snapshot), the last
+  complete snapshot stays in place and a restart restores that older list.
 
 ### If the snapshot cannot be read
 
