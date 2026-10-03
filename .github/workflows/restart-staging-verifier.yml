@@ -12,6 +12,11 @@ on:
         description: 'Exact immutable image from the read-only preflight (required for restart)'
         type: string
         default: ''
+      expected_store:
+        description: 'Expected station storage mode for this isolated restart test'
+        type: choice
+        options: [none, keyvault-sealed]
+        default: none
 
 permissions:
   contents: read
@@ -38,12 +43,13 @@ jobs:
         env:
           CONFIRM_RESTART: ${{ inputs.confirm_restart }}
           EXPECTED_IMAGE: ${{ inputs.expected_image }}
+          EXPECTED_STORE: ${{ inputs.expected_store }}
           SKIP_RECOVERY_TEST: ${{ vars.ACI_SKIP_RECOVERY_TEST }}
         run: |
           python3 - <<'PY'
           import json, os, re, subprocess
 
-          def validate(group, expected_image='', requested=False):
+          def validate(group, expected_image='', requested=False, expected_store='none'):
               if group.get('name') != 'oa-verifier-2':
                   raise ValueError('Unexpected container group')
               if '/resourceGroups/oa-verifier/providers/Microsoft.ContainerInstance/containerGroups/oa-verifier-2'.lower() not in group.get('id', '').lower():
@@ -64,8 +70,8 @@ jobs:
                   raise ValueError('Registry must be staging')
               if values.get('TLS_DOMAIN') != 'verifier2.openanonymity.ai':
                   raise ValueError('TLS domain must be verifier2')
-              if values.get('STATION_STATE_STORE') not in (None, '', 'none'):
-                  raise ValueError('This test expects persistence disabled')
+              if expected_store not in ('none', 'keyvault-sealed') or (values.get('STATION_STATE_STORE') or 'none') != expected_store:
+                  raise ValueError('Persistence mode differs from the explicitly selected test')
               image = c.get('image', '')
               if not re.fullmatch(r'(oaverifieracr\.azurecr\.io|ghcr\.io/openanonymity)/oa-verifier@sha256:[0-9a-f]{64}', image):
                   raise ValueError('Image must have an approved immutable digest')
@@ -79,7 +85,7 @@ jobs:
                   raise SystemExit('Existing recovery-test guard prohibits restart')
               query = ['az', 'container', 'show', '--resource-group', 'oa-verifier', '--name', 'oa-verifier-2', '--output', 'json']
               group = json.loads(subprocess.run(query, capture_output=True, text=True, check=True, timeout=60).stdout)
-              image = validate(group, os.environ.get('EXPECTED_IMAGE', ''), requested)
+              image = validate(group, os.environ.get('EXPECTED_IMAGE', ''), requested, os.environ.get('EXPECTED_STORE') or 'none')
               print(json.dumps({'preflight': 'passed', 'target': 'oa-verifier-2', 'image': image, 'restart_requested': requested}), flush=True)
               if not requested:
                   return

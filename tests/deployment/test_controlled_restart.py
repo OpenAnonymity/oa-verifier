@@ -32,6 +32,14 @@ def fixture():
 
 
 class RestartGuardTests(unittest.TestCase):
+    def test_encrypted_restart_requires_explicit_matching_mode(self):
+        g = fixture()
+        g['containers'][0]['environmentVariables'].append({'name':'STATION_STATE_STORE','value':'keyvault-sealed'})
+        self.assertEqual(MODULE['validate'](g, IMAGE, True, 'keyvault-sealed'), IMAGE)
+        for mode in ['none', 'file', 'unexpected']:
+            with self.assertRaises(ValueError):
+                MODULE['validate'](g, IMAGE, True, mode)
+
     def test_accepts_only_current_pinned_staging_image(self):
         self.assertEqual(MODULE['validate'](fixture(), IMAGE, True), IMAGE)
         for image in ['', IMAGE[:-1] + 'b']:
