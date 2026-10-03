@@ -24,6 +24,10 @@ on:
         description: 'Exact source commit of the deployed shared verifier'
         type: string
         required: true
+      diagnose_registry:
+        description: 'Read only: report registry endpoint and sanitized registration error categories'
+        type: boolean
+        default: false
   schedule:
     - cron: '0 0 * * *'
 
@@ -37,7 +41,58 @@ env:
   IMAGE_NAME: oa-verifier
 
 jobs:
+  diagnose-registry:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnose_registry == true }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure login for read-only registration diagnostics
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Inspect verifier2 registry configuration and sanitized errors
+        run: |
+          python3 - <<'PY'
+          import collections, json, re, subprocess
+          from urllib.parse import urlsplit
+          result = subprocess.run([
+              'az', 'container', 'show', '--resource-group', 'oa-verifier',
+              '--name', 'oa-verifier-2', '--output', 'json',
+          ], capture_output=True, text=True, check=True)
+          group = json.loads(result.stdout)
+          container = next(c for c in group['containers'] if c['name'] == 'oa-verifier')
+          values = {item['name']: item.get('value') or item.get('secureValue')
+                    for item in container.get('environmentVariables', [])}
+          url = urlsplit(values.get('STATION_REGISTRY_URL') or '')
+          print(json.dumps({'registry_scheme': url.scheme, 'registry_host': url.hostname,
+                            'registry_port': url.port, 'registry_path': url.path,
+                            'registry_secret_configured': bool(values.get('STATION_REGISTRY_SECRET'))}))
+          logs = subprocess.run([
+              'az', 'container', 'logs', '--resource-group', 'oa-verifier',
+              '--name', 'oa-verifier-2', '--container-name', 'oa-verifier',
+          ], capture_output=True, text=True, check=True).stdout
+          allowed = {
+              'registry fetch failed', 'registry fetch error', 'registry parse error',
+              'fetched stations from registry',
+              'registration rejected: failed to fetch registry',
+              'registration rejected: registry not configured or returned no stations',
+              'registration rejected: unable to verify privacy toggles',
+          }
+          counts = collections.Counter()
+          for line in logs.splitlines():
+              match = re.search(r'msg="([^"]+)"', line)
+              if match and match.group(1) in allowed:
+                  status = re.search(r'\bstatus=(\d{3})\b', line)
+                  count = re.search(r'\bcount=(\d+)\b', line)
+                  label = match.group(1)
+                  if status:
+                      label += ' HTTP ' + status.group(1)
+                  if count:
+                      label += ' count=' + count.group(1)
+                  counts[label] += 1
+          print(json.dumps({'sanitized_error_counts_in_available_logs': dict(counts)}))
+          PY
   verify:
+    if: ${{ inputs.diagnose_registry != true }}
     name: Verify Attestation
     runs-on: ubuntu-latest
     permissions:
