@@ -1,0 +1,134 @@
+name: Prepare or deploy production verifier resilience
+run-name: Production verifier ${{ inputs.operation || 'prepare' }} ${{ inputs.controls_revision }}
+on:
+  push:
+    branches: [release/verifier-resilience-production-20261004]
+    paths:
+      - 'deploy/production/**'
+      - '.github/workflows/deploy-production-verifier.yml'
+      - 'tests/deployment/test_production_rollout.py'
+  workflow_dispatch:
+    inputs:
+      operation:
+        type: choice
+        options: [prepare, deploy]
+        default: prepare
+        required: true
+      controls_revision:
+        description: 'Exact pending org-live dashboard revision; required for deploy'
+        type: string
+        default: ''
+      station_store:
+        type: choice
+        options: [keyvault-sealed, none]
+        default: keyvault-sealed
+        required: true
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: oa-verifier-production-20260917
+  cancel-in-progress: false
+env:
+  APP_REVISION: 4299cfa136c90550737dd46c89dba586c213159b
+  STATION_STORE: ${{ inputs.station_store || 'keyvault-sealed' }}
+  CONTROLS_REVISION: ${{ inputs.controls_revision }}
+  ACR_REGISTRY: oaverifieracr.azurecr.io
+  IMAGE_NAME: oa-verifier-production-20260917
+jobs:
+  prepare-or-deploy:
+    if: github.ref == 'refs/heads/release/verifier-resilience-production-20261004' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: oa-production-20260917
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: automation
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 4299cfa136c90550737dd46c89dba586c213159b
+          path: app
+          persist-credentials: false
+      - name: Test fixed-target deployment and rollback safeguards
+        working-directory: automation
+        run: python3 -m unittest discover -s tests/deployment -p 'test_*.py'
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Check live baseline and production registry authorization
+        env:
+          PRODUCTION_REGISTRY_SECRET: ${{ secrets.PRODUCTION_REGISTRY_SECRET }}
+        run: python3 automation/deploy/production/rollout.py preflight
+      - uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-24.05
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Test and build the exact staging-tested application
+        working-directory: app
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$APP_REVISION"
+          nix develop --no-update-lock-file --command go test ./...
+          nix build --no-update-lock-file .#container --print-build-logs
+          docker load < result
+      - uses: sigstore/cosign-installer@v3.7.0
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - name: Publish and verify the production image signature
+        run: |
+          set -euo pipefail
+          umask 077
+          IMAGE_TAG="$ACR_REGISTRY/$IMAGE_NAME:$APP_REVISION-$GITHUB_RUN_ID"
+          docker tag oa-verifier:latest "$IMAGE_TAG"
+          docker push "$IMAGE_TAG"
+          IMAGE_REF=$(docker inspect "$IMAGE_TAG" --format '{{index .RepoDigests 0}}')
+          printf '%s\n' "$IMAGE_REF" > image-ref.txt
+          cosign sign --yes "$IMAGE_REF" > cosign.log 2>&1
+          python3 automation/deploy/production/rollout.py provenance
+          cosign verify "$IMAGE_REF" \
+            --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/deploy-production-verifier.yml@$GITHUB_REF" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com > cosign-verification.json
+      - name: Validate new confidential policy and existing rollback configuration
+        env:
+          PRODUCTION_REGISTRY_SECRET: ${{ secrets.PRODUCTION_REGISTRY_SECRET }}
+          CF_DNS_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          az extension add --name confcom --yes --only-show-errors
+          python3 automation/deploy/production/rollout.py prepare
+      - name: Deploy only the claimed production request and verify hardware attestation
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'deploy'
+        env:
+          PRODUCTION_REGISTRY_SECRET: ${{ secrets.PRODUCTION_REGISTRY_SECRET }}
+          PRODUCTION_RESILIENCE_WORKER_SECRET: ${{ secrets.PRODUCTION_RESILIENCE_WORKER_SECRET }}
+        run: |
+          python3 -m pip install --quiet 'PyJWT[crypto]==2.10.1' 'requests==2.32.5'
+          python3 automation/deploy/production/rollout.py deploy
+      - name: Record failure only for this run's claim
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.operation == 'deploy'
+        env:
+          PRODUCTION_RESILIENCE_WORKER_SECRET: ${{ secrets.PRODUCTION_RESILIENCE_WORKER_SECRET }}
+        run: python3 automation/deploy/production/rollout.py finish
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-verifier-resilience-${{ github.run_id }}
+          path: |
+            production-record.json
+            verification-result.json
+            policy.rego
+            cosign-verification.json
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Remove private deployment inputs
+        if: always()
+        run: python3 automation/deploy/production/rollout.py cleanup
