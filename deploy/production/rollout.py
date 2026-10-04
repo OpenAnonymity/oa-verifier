@@ -212,14 +212,28 @@ def base_template(image, public):
                     'confidentialComputeProperties': {'ccePolicy': ''}}}]}
 
 
-def protect_policy(policy):
+def protect_policy(policy, expected_image, expected_public):
     match = re.search(r'containers := (\[.*?\])(?=\s*\n\n|\s*$)', policy, re.S)
     if not match:
         raise ValueError('Unrecognized confidential policy format')
     containers = json.loads(match.group(1))
-    if len(containers) != 2 or 'env_rules' not in containers[0]:
-        raise ValueError('Unexpected measured containers; public structure=' + json.dumps([
-            {'id': c.get('id'), 'keys': sorted(c)} for c in containers]))
+    if (len(containers) not in (2, 3) or containers[0].get('id') != expected_image
+            or containers[0].get('name') != 'oa-verifier'
+            or containers[1].get('id') != SIDECAR or containers[1].get('name') != 'skr-sidecar'):
+        raise ValueError('Unexpected application or attestation container measurement')
+    if len(containers) == 3:
+        pause = containers[2]
+        if pause.get('name') != 'pause-container' or pause.get('command') != ['/pause'] or pause.get('id') is not None:
+            raise ValueError('Unexpected platform container measurement')
+    rules = containers[0]['env_rules']
+    for name, value in expected_public.items():
+        matches = [rule for rule in rules if rule.get('pattern') == name + '=' + value and rule.get('strategy') == 'string']
+        if len(matches) != 1:
+            raise ValueError('Missing fixed production environment policy: ' + name)
+        matches[0]['required'] = True
+    # Keep confidential application/sidecar output inaccessible to host logs.
+    for container in containers[:2]:
+        container['allow_stdio_access'] = False
     for name in ['STATION_REGISTRY_SECRET', 'CF_DNS_API_TOKEN', 'ACME_EMAIL', 'CCE_POLICY_B64']:
         containers[0]['env_rules'].append({'pattern': name + '=.+', 'strategy': 're2', 'required': True})
     # Platform-injected identity settings contain short-lived authentication data.
@@ -287,7 +301,7 @@ def prepare():
     base_policy = base64.b64decode(encoded).decode()
     # Generated only from fixed public env and identity-based image pull.
     Path('base-policy.rego').write_text(base_policy)
-    policy = protect_policy(base_policy)
+    policy = protect_policy(base_policy, record['image_ref'], public_environment(record))
     protected = [os.environ[k] for k in ('PRODUCTION_REGISTRY_SECRET', 'CF_DNS_API_TOKEN', 'ACME_EMAIL', 'ACR_PASSWORD')]
     if any(value and value in policy for value in protected):
         raise ValueError('Protected value embedded in measured policy')

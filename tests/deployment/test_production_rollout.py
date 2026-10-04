@@ -93,12 +93,17 @@ class ProductionRolloutTests(unittest.TestCase):
         self.assertEqual(env['TLS_CERT_SECRET_VAULT'], r.VAULT_URL)
 
     def test_policy_binds_public_values_and_only_secrets_are_dynamic(self):
-        text = 'containers := ' + json.dumps([{'env_rules': [{'pattern': 'TLS_DOMAIN=' + r.DOMAIN, 'strategy': 'string'}]}, {'env_rules': []}]) + '\n\nallow_properties := true'
-        result = r.protect_policy(text)
+        text = 'containers := ' + json.dumps([{'name':'oa-verifier', 'id':r.BASE_IMAGE, 'env_rules': [{'pattern': 'TLS_DOMAIN=' + r.DOMAIN, 'strategy': 'string'}]}, {'name':'skr-sidecar', 'id':r.SIDECAR, 'env_rules': []}, {'name':'pause-container','command':['/pause']}]) + '\n\nallow_properties := true'
+        result = r.protect_policy(text, r.BASE_IMAGE, {'TLS_DOMAIN':r.DOMAIN})
         self.assertIn('TLS_DOMAIN=' + r.DOMAIN, result)
         self.assertNotIn('TLS_DOMAIN=.+', result)
         self.assertIn('STATION_REGISTRY_SECRET=.+', result)
         self.assertNotIn('STATION_REGISTRY_URL=.+', result)
+        self.assertIn('"allow_stdio_access":false', result)
+        with self.assertRaises(ValueError):
+            r.protect_policy(text.replace('pause-container','unknown-container'), r.BASE_IMAGE, {'TLS_DOMAIN':r.DOMAIN})
+        with self.assertRaises(ValueError):
+            r.protect_policy(text, 'wrong-image', {'TLS_DOMAIN':r.DOMAIN})
 
     def test_fingerprint_ignores_status_but_detects_configuration_change(self):
         b = baseline(); other = copy.deepcopy(b)
