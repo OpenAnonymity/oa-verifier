@@ -33,6 +33,10 @@ def desired(phase='pending', revision=1, enabled=True):
 
 
 class ProductionControlsTests(unittest.TestCase):
+    def test_failed_preclaim_attempt_is_not_repeated_automatically(self):
+        with patch.object(controls, 'read', return_value=desired()['desired']), patch.object(dispatch.subprocess, 'check_output', return_value='[{"status":"completed","displayTitle":"Production verifier deploy 1"}]'), patch.object(dispatch.subprocess, 'run') as run:
+            dispatch.main()
+            run.assert_not_called()
     def test_dispatch_does_not_claim_and_blocks_duplicate_run(self):
         with patch.object(controls, 'read', return_value=desired()['desired']), patch.object(controls, 'claim') as claim, patch.object(dispatch.subprocess, 'check_output', return_value='[{"status":"in_progress"}]'), patch.object(dispatch.subprocess, 'run') as run:
             dispatch.main()
@@ -71,6 +75,12 @@ class ProductionControlsTests(unittest.TestCase):
 
 
 class ProductionRolloutTests(unittest.TestCase):
+    def test_failed_build_finishes_claim_even_without_preflight_record(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(r,'CLAIM',Path(directory)/'claim.json'), patch.object(r,'RECORD',Path(directory)/'missing.json'):
+            r.CLAIM.write_text(json.dumps({'revision':1,'run_id':'123','station_store':'keyvault-sealed'}))
+            with patch.dict(os.environ,GITHUB_RUN_ID='123'),patch.object(controls,'complete') as complete:
+                r.finish()
+                complete.assert_called_once_with(1,False)
     def test_baseline_rejects_wrong_target_image_and_sidecar(self):
         r.validate_baseline(baseline())
         for field in ('target', 'image', 'sidecar', 'tls'):

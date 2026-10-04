@@ -16,9 +16,12 @@ def main():
         raise ValueError('Grace must be enabled before a production verifier deployment')
     runs = json.loads(subprocess.check_output([
         'gh', 'run', 'list', '-R', REPO, '--workflow', WORKFLOW,
-        '--limit', '100', '--json', 'status'], text=True))
+        '--limit', '100', '--json', 'status,displayTitle'], text=True))
     if any(run['status'] != 'completed' for run in runs):
         print('Production preparation/deployment already running; no duplicate dispatch')
+        return
+    if any(run.get('displayTitle') == 'Production verifier deploy ' + str(desired['revision']) for run in runs):
+        print('This revision already had a deployment attempt; operator review required')
         return
     subprocess.run(['gh', 'workflow', 'run', WORKFLOW, '-R', REPO, '--ref', 'main',
                     '-f', 'operation=deploy', '-f', 'controls_revision=' + str(desired['revision']),

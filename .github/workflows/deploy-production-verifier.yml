@@ -51,6 +51,11 @@ jobs:
           ref: 4299cfa136c90550737dd46c89dba586c213159b
           path: app
           persist-credentials: false
+      - name: Claim the exact production request before any preparation work
+        if: github.event_name == 'workflow_dispatch' && inputs.operation == 'deploy'
+        env:
+          PRODUCTION_RESILIENCE_WORKER_SECRET: ${{ secrets.PRODUCTION_RESILIENCE_WORKER_SECRET }}
+        run: python3 automation/deploy/production/rollout.py begin
       - name: Test fixed-target deployment and rollback safeguards
         working-directory: automation
         run: python3 -m unittest discover -s tests/deployment -p 'test_*.py'
@@ -124,6 +129,7 @@ jobs:
           name: production-verifier-resilience-${{ github.run_id }}
           path: |
             production-record.json
+            production-claim.json
             verification-result.json
             policy.rego
             base-policy.rego

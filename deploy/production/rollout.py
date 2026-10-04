@@ -37,6 +37,7 @@ API = '2023-05-01'
 RESOURCE_ID = '/subscriptions/' + SUB + '/resourceGroups/' + GROUP + '/providers/Microsoft.ContainerInstance/containerGroups/' + TARGET
 PRIVATE = Path('.production-private')
 RECORD = Path('production-record.json')
+CLAIM = Path('production-claim.json')
 os.umask(0o077)
 
 
@@ -163,6 +164,16 @@ def preflight():
                  'workflow_run_id': os.environ['GITHUB_RUN_ID'], 'prepared_at': int(time.time()),
                  'station_store': os.environ.get('STATION_STORE', 'keyvault-sealed')})
     print('Production resource, registry authorization, and separate vault preflight passed')
+
+
+def begin():
+    import controls
+    revision = int(os.environ['CONTROLS_REVISION'])
+    store = os.environ.get('STATION_STORE', '')
+    if store not in ('none', 'keyvault-sealed'):
+        raise ValueError('Unknown production storage request')
+    controls.claim(revision, store)
+    CLAIM.write_text(json.dumps({'revision': revision, 'run_id': controls.run_id(), 'station_store': store}))
 
 
 def provenance():
@@ -365,7 +376,7 @@ def deploy():
     if resource_fingerprint(current_resource()) != record['baseline_fingerprint']:
         raise ValueError('Production changed during build; no deployment')
     check_registry()
-    controls.claim(revision, record['station_store'])
+    controls.check(revision, record['station_store'])
     record['claimed_revision'] = revision
     save_record(record)
     authorize_policy()
@@ -408,11 +419,14 @@ def deploy():
 
 def finish():
     import controls
-    if not RECORD.exists():
+    if not CLAIM.exists():
         return
-    record = read_record()
-    if 'claimed_revision' in record and not record.get('deployed'):
-        controls.complete(record['claimed_revision'], False)
+    claim = json.loads(CLAIM.read_text())
+    if claim['run_id'] != controls.run_id():
+        raise ValueError('Cannot finish another run claim')
+    record = read_record() if RECORD.exists() else {}
+    if not record.get('deployed'):
+        controls.complete(claim['revision'], False)
 
 
 def cleanup():
@@ -424,7 +438,7 @@ def cleanup():
 
 if __name__ == '__main__':
     action = sys.argv[1]
-    if action not in ('preflight', 'provenance', 'prepare', 'deploy', 'finish', 'cleanup'):
+    if action not in ('begin', 'preflight', 'provenance', 'prepare', 'deploy', 'finish', 'cleanup'):
         raise SystemExit('Unknown production action')
     try:
         globals()[action]()
