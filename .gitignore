@@ -42,4 +42,3 @@ result
 
 # Python test caches
 __pycache__/
-.production-private/

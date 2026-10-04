@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'deploy/production'))
 import controls
 import rollout as r
+import dispatch
 
 
 def baseline():
@@ -32,6 +33,20 @@ def desired(phase='pending', revision=1, enabled=True):
 
 
 class ProductionControlsTests(unittest.TestCase):
+    def test_dispatch_does_not_claim_and_blocks_duplicate_run(self):
+        with patch.object(controls, 'read', return_value=desired()['desired']), patch.object(controls, 'claim') as claim, patch.object(dispatch.subprocess, 'check_output', return_value='[{"status":"in_progress"}]'), patch.object(dispatch.subprocess, 'run') as run:
+            dispatch.main()
+            claim.assert_not_called()
+            run.assert_not_called()
+
+    def test_dispatch_uses_only_production_workflow_and_exact_revision(self):
+        with patch.object(controls, 'read', return_value=desired()['desired']), patch.object(controls, 'claim') as claim, patch.object(dispatch.subprocess, 'check_output', return_value='[]'), patch.object(dispatch.subprocess, 'run') as run:
+            dispatch.main()
+            claim.assert_not_called()
+            self.assertIn('controls_revision=1', run.call_args.args[0])
+            self.assertIn('station_store=keyvault-sealed', run.call_args.args[0])
+            self.assertIn('deploy-production-verifier.yml', run.call_args.args[0])
+
     def test_wrong_environment_and_verifier_rejected(self):
         for change in ({'environment': 'staging'}, {'verifier_url': 'https://verifier2.openanonymity.ai'}):
             value = desired(); value.update(change)

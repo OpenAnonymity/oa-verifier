@@ -1,0 +1,26 @@
+name: Apply guarded production dashboard request
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: production-control-dispatch
+  cancel-in-progress: false
+jobs:
+  dispatch:
+    if: vars.PRODUCTION_DASHBOARD_CONTROLS == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: oa-production-20260917
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Dispatch only a pending production request
+        env:
+          PRODUCTION_RESILIENCE_WORKER_SECRET: ${{ secrets.PRODUCTION_RESILIENCE_WORKER_SECRET }}
+          GH_TOKEN: ${{ github.token }}
+        run: python3 deploy/production/dispatch.py
