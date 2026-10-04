@@ -250,9 +250,14 @@ While not ready:
 The default of 7 days is deliberate: it gives the team days, not minutes, to
 repair a verifier that lost its state, while the org's own grace window (set to
 match) keeps stations online and the client's advisory policy keeps users
-informed that verification is unavailable. The org measures its window from
-the last time the verifier was *ready*, not from each restart, so repeated
-restarts cannot stretch the time the org keeps unlisted stations past 7 days.
+informed that verification is unavailable. Each verified `/broadcast` row also
+carries `registered_at`, the successful registration time already saved in the
+encrypted station record. The updated org measures each station's window from
+the later of its last successful registration and the last complete registry
+sync. Re-registration renews only that station. Restoring a snapshot, repeating
+a broadcast, or running a background verification does not change registration
+time, so restarts cannot extend grace for stations that have not re-registered.
+Org consumers that do not yet read this field retain their prior behavior.
 Stations the verifier does list while not ready are always kept, including
 after the window. Nothing is marked verified without evidence during that time
 — the verifier declines to answer, it does not say yes. Readers of the trust

@@ -946,6 +946,9 @@ func (s *Server) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 				"station_id":   data.StationID,
 				"public_key":   pk,
 				"display_name": data.DisplayName,
+				// Successful registration time is persisted with the station.
+				// Restoring or polling this record must not restart org grace.
+				"registered_at": data.RegisteredAt,
 			})
 		}
 	}

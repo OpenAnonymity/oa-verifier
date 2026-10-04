@@ -48,6 +48,35 @@ func broadcastReady(t *testing.T, s *Server) (bool, map[string]any) {
 	return ready, data
 }
 
+func TestBroadcastRegistrationTimeDoesNotRenewOnRestoreOrBackgroundCheck(t *testing.T) {
+	store := &memStore{}
+	first := newTestServer(t, store)
+	pk := addStation(first, "a")
+	registered := time.Now().Add(-48 * time.Hour).UTC().Format(time.RFC3339)
+	first.stations[pk].RegisteredAt = registered
+	first.stations[pk].LastVerified = &registered
+	if err := first.persistOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second := newTestServer(t, store)
+	second.loadStationState(context.Background())
+	for i := 0; i < 2; i++ {
+		rows := broadcastOf(t, second)["verified_stations"].([]any)
+		if len(rows) != 1 || rows[0].(map[string]any)["registered_at"] != registered {
+			t.Fatal("restoring or observing a station renewed its registration time")
+		}
+		now := utcNow()
+		second.stations[pk].LastVerified = &now
+	}
+	// Only a successful new registration replaces RegisteredAt.
+	newRegistration := utcNow()
+	second.stations[pk].RegisteredAt = newRegistration
+	rows := broadcastOf(t, second)["verified_stations"].([]any)
+	if rows[0].(map[string]any)["registered_at"] != newRegistration {
+		t.Fatal("new registration time missing from broadcast")
+	}
+}
+
 func setWarmupSince(s *Server, at time.Time) {
 	s.state.mu.Lock()
 	s.state.warmupSince = at
