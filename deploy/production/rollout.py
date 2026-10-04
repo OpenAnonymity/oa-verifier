@@ -218,7 +218,8 @@ def protect_policy(policy):
         raise ValueError('Unrecognized confidential policy format')
     containers = json.loads(match.group(1))
     if len(containers) != 2 or 'env_rules' not in containers[0]:
-        raise ValueError('Unexpected measured containers')
+        raise ValueError('Unexpected measured containers; public structure=' + json.dumps([
+            {'id': c.get('id'), 'keys': sorted(c)} for c in containers]))
     for name in ['STATION_REGISTRY_SECRET', 'CF_DNS_API_TOKEN', 'ACME_EMAIL', 'CCE_POLICY_B64']:
         containers[0]['env_rules'].append({'pattern': name + '=.+', 'strategy': 're2', 'required': True})
     # Platform-injected identity settings contain short-lived authentication data.
@@ -283,7 +284,10 @@ def prepare():
     path = private_write('policy-template.json', template)
     run(['az', 'confcom', 'acipolicygen', '-a', str(path), '--approve-wildcards'])
     encoded = json.loads(path.read_text())['resources'][0]['properties']['confidentialComputeProperties']['ccePolicy']
-    policy = protect_policy(base64.b64decode(encoded).decode())
+    base_policy = base64.b64decode(encoded).decode()
+    # Generated only from fixed public env and identity-based image pull.
+    Path('base-policy.rego').write_text(base_policy)
+    policy = protect_policy(base_policy)
     protected = [os.environ[k] for k in ('PRODUCTION_REGISTRY_SECRET', 'CF_DNS_API_TOKEN', 'ACME_EMAIL', 'ACR_PASSWORD')]
     if any(value and value in policy for value in protected):
         raise ValueError('Protected value embedded in measured policy')

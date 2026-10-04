@@ -126,6 +126,7 @@ jobs:
             production-record.json
             verification-result.json
             policy.rego
+            base-policy.rego
             cosign-verification.json
           if-no-files-found: ignore
           retention-days: 30
