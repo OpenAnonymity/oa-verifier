@@ -26,6 +26,7 @@ DOMAIN = 'verifier-production-20260917.openanonymity.ai'
 REGISTRY = 'https://org-live.openanonymity.ai'
 REVISION = '4299cfa136c90550737dd46c89dba586c213159b'
 BASE_IMAGE = 'oaverifieracr.azurecr.io/oa-verifier-production-20260917@sha256:55250fe5d9458f763231eb9867c8695f4b6cd508ac8d97551dbba5e1c5710791'
+APP_IMAGE = 'oaverifieracr.azurecr.io/oa-verifier-production-20260917@sha256:60f9892bc9ac0c9feafea867d8bc7c519aa359874320a3a66bd0f0b4b21c3ab2'
 SIDECAR = 'mcr.microsoft.com/aci/skr@sha256:baa6acf093c011cb26799187b6a535e32bd8248f52dd2cd9c606732b8a23c112'
 VAULT = 'oa-verifier-prod-sealed'
 VAULT_URL = 'https://' + VAULT + '.vault.azure.net'
@@ -107,13 +108,18 @@ def validate_baseline(resource):
     if [c['name'] for c in containers] != ['oa-verifier', 'skr-sidecar']:
         raise ValueError('Unexpected container set')
     image = containers[0]['properties']['image']
-    if image != BASE_IMAGE and resource.get('tags', {}).get('ResilienceRevision') != REVISION:
+    if image not in (BASE_IMAGE, APP_IMAGE) or (image == APP_IMAGE and resource.get('tags', {}).get('ResilienceRevision') != REVISION):
         raise ValueError('Unreviewed production source; stop before replacement')
     if containers[1]['properties']['image'] != SIDECAR:
         raise ValueError('Unexpected attestation sidecar')
     env = {e['name']: e.get('value') for e in containers[0]['properties']['environmentVariables']}
     if env.get('TLS_DOMAIN') != DOMAIN or env.get('STATION_REGISTRY_URL') not in (REGISTRY, 'https://18-211-179-1.sslip.io'):
         raise ValueError('Unexpected trust address or registry')
+    for name, value in {'CHALLENGE_MIN_INTERVAL':'300', 'CHALLENGE_MAX_INTERVAL':'600',
+                        'MAX_CONCURRENT_REQUESTS':'20', 'RATE_LIMIT_RPS':'10', 'RATE_LIMIT_BURST':'20',
+                        'SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS':'60', 'STATION_FAILURE_GRACE_SECONDS':'600'}.items():
+        if env.get(name) != value:
+            raise ValueError('Production operating setting changed: ' + name)
     if p['ipAddress']['dnsNameLabel'] != TARGET or p['ipAddress']['ports'] != [{'port': 443, 'protocol': 'TCP'}]:
         raise ValueError('Unexpected public network configuration')
     if p.get('volumes') or p.get('subnetIds'):
@@ -168,6 +174,8 @@ def provenance():
     record = read_record()
     record.update(image_ref=Path('image-ref.txt').read_text().strip(), rekor_log_index=matches[0],
                   signing_payload_hash=h['algorithm'] + ':' + h['value'])
+    if record['image_ref'] != APP_IMAGE:
+        raise ValueError('Build digest differs from the prepared application')
     save_record(record)
 
 
