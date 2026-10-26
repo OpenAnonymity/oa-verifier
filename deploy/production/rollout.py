@@ -24,9 +24,9 @@ TARGET = 'oa-verifier-production-20260917'
 STAGING = 'oa-verifier-2'
 DOMAIN = 'verifier-production-20260917.openanonymity.ai'
 REGISTRY = 'https://org-live.openanonymity.ai'
-REVISION = '4299cfa136c90550737dd46c89dba586c213159b'
-BASE_IMAGE = 'oaverifieracr.azurecr.io/oa-verifier-production-20260917@sha256:55250fe5d9458f763231eb9867c8695f4b6cd508ac8d97551dbba5e1c5710791'
-APP_IMAGE = 'oaverifieracr.azurecr.io/oa-verifier-production-20260917@sha256:60f9892bc9ac0c9feafea867d8bc7c519aa359874320a3a66bd0f0b4b21c3ab2'
+REVISION = 'a2916c6af618ee46a851af28dee201606de895d8'
+BASE_IMAGE = 'oaverifieracr.azurecr.io/oa-verifier-production-20260917@sha256:60f9892bc9ac0c9feafea867d8bc7c519aa359874320a3a66bd0f0b4b21c3ab2'
+APP_IMAGE = 'UNPREPARED'  # Pin after the build-only run, before preparation or deployment.
 SIDECAR = 'mcr.microsoft.com/aci/skr@sha256:baa6acf093c011cb26799187b6a535e32bd8248f52dd2cd9c606732b8a23c112'
 VAULT = 'oa-verifier-prod-sealed'
 VAULT_URL = 'https://' + VAULT + '.vault.azure.net'
@@ -185,6 +185,12 @@ def provenance():
     record = read_record()
     record.update(image_ref=Path('image-ref.txt').read_text().strip(), rekor_log_index=matches[0],
                   signing_payload_hash=h['algorithm'] + ':' + h['value'])
+    if os.environ.get('RELEASE_OPERATION') == 'build':
+        if not re.fullmatch(r'oaverifieracr\.azurecr\.io/oa-verifier-production-20260917@sha256:[a-f0-9]{64}', record['image_ref']):
+            raise ValueError('Invalid production build digest')
+        record['build_only'] = True
+        save_record(record)
+        return
     if record['image_ref'] != APP_IMAGE:
         raise ValueError('Build digest differs from the prepared application')
     save_record(record)
@@ -198,7 +204,7 @@ def public_environment(record):
         'MAA_ENDPOINT': 'http://localhost:8080/attest/maa', 'MAA_PROVIDER_URL': 'sharedeus.eus.attest.azure.net',
         'STATION_REGISTRY_URL': REGISTRY, 'CHALLENGE_MIN_INTERVAL': '300', 'CHALLENGE_MAX_INTERVAL': '600',
         'MAX_CONCURRENT_REQUESTS': '20', 'RATE_LIMIT_RPS': '10', 'RATE_LIMIT_BURST': '20',
-        'SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS': '60', 'STATION_FAILURE_GRACE_SECONDS': '600',
+        'SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS': '60', 'STATION_FAILURE_GRACE_SECONDS': '604800',
         'TLS_DOMAIN': DOMAIN, 'ACME_DNS_PROVIDER': 'cloudflare', 'REGISTRY_WARMUP_SECONDS': '604800',
         'REKOR_LOG_INDEX': record['rekor_log_index'], 'SIGSTORE_PAYLOAD_HASH': record['signing_payload_hash'],
         'STATION_STATE_STORE': store, 'STATION_STATE_SECRET_NAME': 'oa-verifier-station-state',
@@ -313,6 +319,8 @@ def write_parameters(name, values):
 
 def prepare():
     record = read_record()
+    if record.get('build_only') or record.get('image_ref') != APP_IMAGE:
+        raise ValueError('Preparation requires the reviewed immutable build digest')
     template = base_template(record['image_ref'], public_environment(record))
     path = private_write('policy-template.json', template)
     run(['az', 'confcom', 'acipolicygen', '-a', str(path), '--approve-wildcards'])
