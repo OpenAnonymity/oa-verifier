@@ -19,6 +19,7 @@ assert resource['properties']['confidentialComputeProperties']['ccePolicy']
 identity = resource['identity']
 assert identity['type'] == 'UserAssigned' and set(identity['userAssignedIdentities']) == {r.IDENTITY}
 resource['identity'] = {'type':'UserAssigned','userAssignedIdentities':{r.IDENTITY:{}}}
+resource['properties'].pop('provisioningTimeoutInSeconds', None)
 values = {'registrySecret':os.environ['PRODUCTION_REGISTRY_SECRET'],
  'cfDnsToken':os.environ['CF_DNS_API_TOKEN'],'acmeEmail':os.environ['ACME_EMAIL'],
  'acrUsername':os.environ['ACR_USERNAME'],'acrPassword':os.environ['ACR_PASSWORD']}
