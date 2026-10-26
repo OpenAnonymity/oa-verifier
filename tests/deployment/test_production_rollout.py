@@ -136,6 +136,15 @@ class ProductionRolloutTests(unittest.TestCase):
             self.assertNotIn(private, json.dumps(result))
         self.assertEqual(values['acrPassword'], 'acr-private')
 
+    def test_rollback_removes_read_only_azure_identity_fields(self):
+        b = baseline()
+        b['identity'].update(tenantId='tenant', principalId=None)
+        b['identity']['userAssignedIdentities'][r.IDENTITY] = {'principalId':'principal','clientId':'client'}
+        with patch.dict(os.environ, PRODUCTION_REGISTRY_SECRET='registry-private', CF_DNS_API_TOKEN='cf-private', ACME_EMAIL='email-private'):
+            result, _ = r.rollback_template(b)
+        self.assertEqual(result['resources'][0]['identity'], {'type':'UserAssigned','userAssignedIdentities':{r.IDENTITY:{}}})
+        self.assertEqual(b['identity']['tenantId'], 'tenant')
+
     def test_stale_control_stops_before_any_container_mutation(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(r, 'RECORD', Path(directory) / 'record.json'):
             b = baseline()

@@ -289,6 +289,13 @@ def rollback_template(resource):
     for k in ('tags', 'identity'):
         if resource.get(k):
             result[k] = copy.deepcopy(resource[k])
+    if result.get('identity'):
+        identity = result['identity']
+        if identity.get('type') != 'UserAssigned' or set(identity.get('userAssignedIdentities', {})) != {IDENTITY}:
+            raise ValueError('Unexpected rollback identity')
+        # GET responses contain tenant/principal/client IDs that Azure rejects
+        # when supplied on recreation. Keep only the assigned identity binding.
+        result['identity'] = {'type': 'UserAssigned', 'userAssignedIdentities': {IDENTITY: {}}}
     p = result['properties']
     for k in ('provisioningState', 'instanceView', 'isCreatedFromStandbyPool'):
         p.pop(k, None)

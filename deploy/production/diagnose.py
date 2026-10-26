@@ -10,6 +10,8 @@ def errors(obj):
     if isinstance(obj, dict):
         if obj.get('code'):
             result.append({'code': obj['code']})
+            if obj['code'] in ('FailedIdentityOperation', 'InvalidResourceIdentityTenantId'):
+                result[-1]['message'] = str(obj.get('message',''))[:2500]
         for value in obj.values():
             result.extend(errors(value))
     elif isinstance(obj, list):
@@ -23,6 +25,8 @@ def errors(obj):
     return result
 
 deployment = az('deployment', 'group', 'show', '-g', 'oa-verifier', '-n', 'prod-resilience-40347482903')
+recovery = az('deployment','group','show','-g','oa-verifier','-n','prod-recover-40348872804')
+print(json.dumps({'recovery_errors':errors((recovery or {}).get('properties',{}).get('error'))}))
 operations = az('deployment', 'operation', 'group', 'list', '-g', 'oa-verifier', '-n', 'prod-resilience-40347482903')
 resource = az('container', 'show', '-g', 'oa-verifier', '-n', 'oa-verifier-production-20260917')
 activity = az('monitor', 'activity-log', 'list', '--resource-group', 'oa-verifier', '--offset', '1h', '--status', 'Failed')
