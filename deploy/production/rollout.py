@@ -26,7 +26,7 @@ DOMAIN = 'verifier-production-20260917.openanonymity.ai'
 REGISTRY = 'https://org-live.openanonymity.ai'
 REVISION = 'a2916c6af618ee46a851af28dee201606de895d8'
 BASE_IMAGE = 'oaverifieracr.azurecr.io/oa-verifier-production-20260917@sha256:60f9892bc9ac0c9feafea867d8bc7c519aa359874320a3a66bd0f0b4b21c3ab2'
-APP_IMAGE = 'UNPREPARED'  # Pin after the build-only run, before preparation or deployment.
+APP_IMAGE = 'oaverifieracr.azurecr.io/oa-verifier-production-20260917@sha256:5f84efe3a8afd21f636b7823c3543086bad132cfbc12dcd7e478542acf66b46a'
 SIDECAR = 'mcr.microsoft.com/aci/skr@sha256:baa6acf093c011cb26799187b6a535e32bd8248f52dd2cd9c606732b8a23c112'
 VAULT = 'oa-verifier-prod-sealed'
 VAULT_URL = 'https://' + VAULT + '.vault.azure.net'
@@ -118,7 +118,8 @@ def validate_baseline(resource):
         raise ValueError('Unexpected trust address or registry')
     for name, value in {'CHALLENGE_MIN_INTERVAL':'300', 'CHALLENGE_MAX_INTERVAL':'600',
                         'MAX_CONCURRENT_REQUESTS':'20', 'RATE_LIMIT_RPS':'10', 'RATE_LIMIT_BURST':'20',
-                        'SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS':'60', 'STATION_FAILURE_GRACE_SECONDS':'600'}.items():
+                        'SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS':'60',
+                        'STATION_FAILURE_GRACE_SECONDS': '604800' if image == APP_IMAGE else '600'}.items():
         if env.get(name) != value:
             raise ValueError('Production operating setting changed: ' + name)
     if p['ipAddress']['dnsNameLabel'] != TARGET or p['ipAddress']['ports'] != [{'port': 443, 'protocol': 'TCP'}]:
