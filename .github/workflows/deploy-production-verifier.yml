@@ -11,7 +11,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [build, prepare, deploy]
+        options: [build, prepare, deploy, inspect]
         default: prepare
         required: true
       controls_revision:
@@ -38,7 +38,7 @@ env:
   IMAGE_NAME: oa-verifier-production-20260917
 jobs:
   prepare-or-deploy:
-    if: github.ref == 'refs/heads/release/verifier-provider-grace-20261026'
+    if: github.ref == 'refs/heads/release/verifier-provider-grace-20261026' && inputs.operation != 'inspect'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     environment: oa-production-20260917
@@ -141,3 +141,15 @@ jobs:
       - name: Remove private deployment inputs
         if: always()
         run: python3 automation/deploy/production/rollout.py cleanup
+
+  inspect:
+    if: inputs.operation == 'inspect' && github.ref == 'refs/heads/release/verifier-provider-grace-20261026'
+    runs-on: ubuntu-latest
+    environment: oa-production-20260917
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Read sanitized production deployment diagnostics
+        run: python3 deploy/production/diagnose.py
