@@ -43,6 +43,16 @@ os.umask(0o077)
 
 def run(args):
     result = subprocess.run(args, text=True, capture_output=True)
+    # ACI deletion can finish before its managed-identity deletion propagates.
+    # Retry only the provider's explicit pending-delete conflict, without
+    # printing its raw response or recreating/deleting anything else.
+    for _ in range(6):
+        if (not result.returncode or args[:4] != ['az', 'deployment', 'group', 'create']
+                or 'FailedIdentityOperation' not in result.stderr
+                or 'pending delete operation' not in result.stderr):
+            break
+        time.sleep(20)
+        result = subprocess.run(args, text=True, capture_output=True)
     if result.returncode:
         # Provider errors can echo submitted values. Keep them private.
         raise RuntimeError('Command failed: ' + ' '.join(args[:3]))
@@ -289,8 +299,15 @@ def rollback_template(resource):
     for k in ('tags', 'identity'):
         if resource.get(k):
             result[k] = copy.deepcopy(resource[k])
+    if result.get('identity'):
+        identity = result['identity']
+        if identity.get('type') != 'UserAssigned' or set(identity.get('userAssignedIdentities', {})) != {IDENTITY}:
+            raise ValueError('Unexpected rollback identity')
+        # GET responses contain tenant/principal/client IDs that Azure rejects
+        # when supplied on recreation. Keep only the assigned identity binding.
+        result['identity'] = {'type': 'UserAssigned', 'userAssignedIdentities': {IDENTITY: {}}}
     p = result['properties']
-    for k in ('provisioningState', 'instanceView', 'isCreatedFromStandbyPool'):
+    for k in ('provisioningState', 'instanceView', 'isCreatedFromStandbyPool', 'provisioningTimeoutInSeconds'):
         p.pop(k, None)
     for k in ('ip', 'fqdn'):
         p['ipAddress'].pop(k, None)

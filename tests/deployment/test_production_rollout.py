@@ -136,6 +136,30 @@ class ProductionRolloutTests(unittest.TestCase):
             self.assertNotIn(private, json.dumps(result))
         self.assertEqual(values['acrPassword'], 'acr-private')
 
+    def test_rollback_removes_read_only_azure_identity_fields(self):
+        b = baseline()
+        b['properties']['provisioningTimeoutInSeconds'] = 1800
+        b['identity'].update(tenantId='tenant', principalId=None)
+        b['identity']['userAssignedIdentities'][r.IDENTITY] = {'principalId':'principal','clientId':'client'}
+        with patch.dict(os.environ, PRODUCTION_REGISTRY_SECRET='registry-private', CF_DNS_API_TOKEN='cf-private', ACME_EMAIL='email-private'):
+            result, _ = r.rollback_template(b)
+        self.assertEqual(result['resources'][0]['identity'], {'type':'UserAssigned','userAssignedIdentities':{r.IDENTITY:{}}})
+        self.assertEqual(b['identity']['tenantId'], 'tenant')
+        self.assertNotIn('provisioningTimeoutInSeconds', result['resources'][0]['properties'])
+
+    def test_create_retries_only_explicit_pending_identity_delete(self):
+        failed = subprocess.CompletedProcess([],1,'','FailedIdentityOperation: pending delete operation')
+        ok = subprocess.CompletedProcess([],0,'{}','')
+        with patch.object(r.subprocess,'run',side_effect=[failed,ok]) as run, patch.object(r.time,'sleep') as sleep:
+            self.assertEqual(r.run(['az','deployment','group','create']), '{}')
+            self.assertEqual(run.call_count,2)
+            sleep.assert_called_once_with(20)
+        other = subprocess.CompletedProcess([],1,'','AuthorizationFailed')
+        with patch.object(r.subprocess,'run',return_value=other) as run, patch.object(r.time,'sleep') as sleep:
+            with self.assertRaises(RuntimeError): r.run(['az','deployment','group','create'])
+            self.assertEqual(run.call_count,1)
+            sleep.assert_not_called()
+
     def test_stale_control_stops_before_any_container_mutation(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(r, 'RECORD', Path(directory) / 'record.json'):
             b = baseline()
