@@ -197,17 +197,22 @@ func SubmitKeyOwnershipGraceSeconds() int {
 }
 
 // StationFailureGraceSeconds returns STATION_FAILURE_GRACE_SECONDS.
-// Grace window before unregistering on transient failures (default 600).
+// Grace window before unregistering on transient failures (at most seven days).
+const MaxStationFailureGraceSeconds = 7 * 24 * 60 * 60
+
 func StationFailureGraceSeconds() int {
 	mu.RLock()
 	defer mu.RUnlock()
 	s := os.Getenv("STATION_FAILURE_GRACE_SECONDS")
 	if s == "" {
-		return 600
+		return MaxStationFailureGraceSeconds
 	}
 	v, err := strconv.Atoi(s)
 	if err != nil || v < 0 {
-		return 600
+		return MaxStationFailureGraceSeconds
+	}
+	if v > MaxStationFailureGraceSeconds {
+		return MaxStationFailureGraceSeconds
 	}
 	return v
 }
