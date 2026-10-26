@@ -11,7 +11,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [build, prepare, deploy, inspect]
+        options: [build, prepare, deploy, inspect, recover]
         default: prepare
         required: true
       controls_revision:
@@ -38,7 +38,7 @@ env:
   IMAGE_NAME: oa-verifier-production-20260917
 jobs:
   prepare-or-deploy:
-    if: github.ref == 'refs/heads/release/verifier-provider-grace-20261026' && inputs.operation != 'inspect'
+    if: github.ref == 'refs/heads/release/verifier-provider-grace-20261026' && inputs.operation != 'inspect' && inputs.operation != 'recover'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     environment: oa-production-20260917
@@ -153,3 +153,21 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
       - name: Read sanitized production deployment diagnostics
         run: python3 deploy/production/diagnose.py
+
+  recover:
+    if: inputs.operation == 'recover' && github.ref == 'refs/heads/release/verifier-provider-grace-20261026'
+    runs-on: ubuntu-latest
+    environment: oa-production-20260917
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Restore exact prior production image with valid identity properties
+        env:
+          PRODUCTION_REGISTRY_SECRET: ${{ secrets.PRODUCTION_REGISTRY_SECRET }}
+          CF_DNS_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          ACME_EMAIL: ${{ secrets.ACME_EMAIL }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: python3 deploy/production/recover.py
