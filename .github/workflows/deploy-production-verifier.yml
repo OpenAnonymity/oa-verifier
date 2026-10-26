@@ -11,7 +11,7 @@ on:
     inputs:
       operation:
         type: choice
-        options: [prepare, deploy]
+        options: [build, prepare, deploy]
         default: prepare
         required: true
       controls_revision:
@@ -30,14 +30,15 @@ concurrency:
   group: oa-verifier-production-20260917
   cancel-in-progress: false
 env:
-  APP_REVISION: 4299cfa136c90550737dd46c89dba586c213159b
+  RELEASE_OPERATION: ${{ inputs.operation || 'prepare' }}
+  APP_REVISION: a2916c6af618ee46a851af28dee201606de895d8
   STATION_STORE: ${{ inputs.station_store || 'keyvault-sealed' }}
   CONTROLS_REVISION: ${{ inputs.controls_revision }}
   ACR_REGISTRY: oaverifieracr.azurecr.io
   IMAGE_NAME: oa-verifier-production-20260917
 jobs:
   prepare-or-deploy:
-    if: github.ref == 'refs/heads/release/verifier-resilience-production-20261004' || github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/release/verifier-provider-grace-20261026' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     environment: oa-production-20260917
@@ -48,7 +49,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v4
         with:
-          ref: 4299cfa136c90550737dd46c89dba586c213159b
+          ref: a2916c6af618ee46a851af28dee201606de895d8
           path: app
           persist-credentials: false
       - name: Claim the exact production request before any preparation work
@@ -71,7 +72,7 @@ jobs:
           nix_path: nixpkgs=channel:nixos-24.05
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - name: Test and build the exact staging-tested application
+      - name: Test and build the exact pinned application
         working-directory: app
         run: |
           set -euo pipefail
@@ -100,6 +101,7 @@ jobs:
             --certificate-identity "https://github.com/$GITHUB_REPOSITORY/.github/workflows/deploy-production-verifier.yml@$GITHUB_REF" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com > cosign-verification.json
       - name: Validate new confidential policy and existing rollback configuration
+        if: inputs.operation != 'build'
         env:
           PRODUCTION_REGISTRY_SECRET: ${{ secrets.PRODUCTION_REGISTRY_SECRET }}
           CF_DNS_API_TOKEN: ${{ secrets.CF_API_TOKEN }}

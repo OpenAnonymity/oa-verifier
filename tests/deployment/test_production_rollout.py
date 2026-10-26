@@ -20,6 +20,7 @@ def baseline():
     record = {'rekor_log_index': '123', 'signing_payload_hash': 'sha256:' + 'a' * 64,
               'station_store': 'keyvault-sealed'}
     resource = r.base_template(r.BASE_IMAGE, r.public_environment(record))['resources'][0]
+    next(e for e in resource['properties']['containers'][0]['properties']['environmentVariables'] if e['name'] == 'STATION_FAILURE_GRACE_SECONDS')['value'] = '600'
     resource['id'] = r.RESOURCE_ID
     resource['properties']['confidentialComputeProperties']['ccePolicy'] = 'b2xk'
     return resource
@@ -99,6 +100,7 @@ class ProductionRolloutTests(unittest.TestCase):
         self.assertEqual(env['TLS_CERT_STORE'], 'keyvault-sealed')
         self.assertEqual(env['STATION_STATE_STORE'], 'none')
         self.assertEqual(env['REGISTRY_WARMUP_SECONDS'], '604800')
+        self.assertEqual(env['STATION_FAILURE_GRACE_SECONDS'], '604800')
         self.assertEqual(env['STATION_REGISTRY_URL'], 'https://org-live.openanonymity.ai')
         self.assertEqual(env['TLS_CERT_SECRET_VAULT'], r.VAULT_URL)
 
