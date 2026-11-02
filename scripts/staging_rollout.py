@@ -3,6 +3,7 @@
 import base64
 import copy
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -145,13 +146,29 @@ def rollback_template(live, candidate):
             'contentVersion': '1.0.0.0', 'resources': [result]}
 
 
-def fetch(path):
+def fetch(path, address=None):
+    if address:
+        connection = http.client.HTTPSConnection(DOMAIN, timeout=15)
+        try:
+            raw = socket.create_connection((address, 443), timeout=15)
+            try:
+                connection.sock = ssl.create_default_context().wrap_socket(raw, server_hostname=DOMAIN)
+            except BaseException:
+                raw.close()
+                raise
+            connection.request('GET', path)
+            response = connection.getresponse()
+            if response.status != 200:
+                raise RuntimeError('Staging origin did not return HTTP 200')
+            return json.load(response)
+        finally:
+            connection.close()
     with urlopen('https://' + DOMAIN + path, timeout=15) as response:
         return json.load(response)
 
 
-def approved_fingerprint():
-    data = fetch('/broadcast')
+def approved_fingerprint(address=None):
+    data = fetch('/broadcast', address)
     stations = sorted((row['station_id'], row['public_key'], row['registered_at']) for row in data.get('verified_stations', []))
     if not stations:
         raise ValueError('No approved staging station; do not replace runtime')
@@ -207,18 +224,18 @@ def apply(name):
        '-n', 'staging-grace-' + os.environ['GITHUB_RUN_ID'], '--template-file', str(path))
 
 
-def wait_ready(record, timeout=240):
+def wait_ready(record, timeout=480):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            health = fetch('/health')
-            state = health.get('persistence', {})
             current = resource()
             origin_ip = current['properties']['ipAddress']['ip']
+            health = fetch('/health', origin_ip)
+            state = health.get('persistence', {})
             checks = {'healthy': health.get('status') == 'healthy',
                       'loaded': state.get('loaded') is True, 'sealed': state.get('store') == 'keyvault-sealed',
                       'no_storage_errors': not state.get('load_error') and not state.get('save_error'),
-                      'approval_preserved': approved_fingerprint() == record['approved_station_fingerprint'],
+                      'approval_preserved': approved_fingerprint(origin_ip) == record['approved_station_fingerprint'],
                       'certificate_preserved': certificate(origin_ip) == record['certificate_sha256']}
             record['readiness_checks'] = checks
             record.pop('readiness_error_type', None)

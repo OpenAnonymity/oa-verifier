@@ -99,10 +99,20 @@ class RolloutTests(unittest.TestCase):
     def test_readiness_uses_current_ip_with_existing_certificate_validation(self):
         health = {'status': 'healthy', 'persistence': {'loaded': True, 'store': 'keyvault-sealed'}}
         record = {'approved_station_fingerprint': 'approval', 'certificate_sha256': 'cert', 'origin': 'old.invalid'}
-        with patch.object(subject, 'fetch', return_value=health), patch.object(subject, 'resource', return_value=fixture()), patch.object(subject, 'approved_fingerprint', return_value='approval'), patch.object(subject, 'certificate', return_value='cert') as certificate, patch.object(subject, 'write_record'):
+        with patch.object(subject, 'fetch', return_value=health) as fetch, patch.object(subject, 'resource', return_value=fixture()), patch.object(subject, 'approved_fingerprint', return_value='approval') as approval, patch.object(subject, 'certificate', return_value='cert') as certificate, patch.object(subject, 'write_record'):
             subject.wait_ready(record, timeout=1)
+            fetch.assert_called_once_with('/health', '192.0.2.1')
+            approval.assert_called_once_with('192.0.2.1')
             certificate.assert_called_once_with('192.0.2.1')
             self.assertTrue(all(record['readiness_checks'].values()))
+
+    def test_direct_origin_transport_retains_tls_hostname_validation(self):
+        with patch.object(subject.http.client, 'HTTPSConnection') as connection, patch.object(subject.socket, 'create_connection') as socket, patch.object(subject.ssl, 'create_default_context') as context, patch.object(subject.json, 'load', return_value={'ok': True}):
+            connection.return_value.getresponse.return_value.status = 200
+            self.assertEqual(subject.fetch('/health', '192.0.2.1'), {'ok': True})
+            connection.assert_called_once_with(subject.DOMAIN, timeout=15)
+            context.return_value.wrap_socket.assert_called_once_with(socket.return_value, server_hostname=subject.DOMAIN)
+            connection.return_value.close.assert_called_once()
 
     def test_changed_baseline_does_not_delete_any_container(self):
         with tempfile.TemporaryDirectory() as directory:

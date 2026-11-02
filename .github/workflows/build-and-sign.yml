@@ -1078,15 +1078,19 @@ jobs:
           EXPECTED_HASH: ${{ steps.policy.outputs.policy_hash }}
         run: |
           FQDN=$(az container show --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query "ipAddress.fqdn" -o tsv)
-          echo "Fetching attestation from: https://$FQDN"
+          ORIGIN_IP=$(az container show --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query "ipAddress.ip" -o tsv)
+          TLS_HOST=verifier2.openanonymity.ai
+          echo "Fetching attestation from the current staging origin with hostname validation"
 
           NONCE="verify-$(date +%s)"
-          ATTESTATION=$(curl -sfk "https://$FQDN/attestation?nonce=$NONCE" 2>/dev/null || echo "{}")
+          ATTESTATION=$(curl --fail --silent --show-error --retry 4 --retry-all-errors --retry-delay 10 \
+            --connect-timeout 10 --max-time 30 --resolve "$TLS_HOST:443:$ORIGIN_IP" \
+            "https://$TLS_HOST/attestation?nonce=$NONCE")
 
           if [ -z "$ATTESTATION" ] || [ "$ATTESTATION" = "{}" ]; then
-            echo "⚠️ Could not fetch attestation - container may still be starting"
+            echo "❌ Attestation unavailable; staging cannot be accepted"
             echo "Expected hash was: $EXPECTED_HASH"
-            exit 0
+            exit 1
           fi
 
           TOKEN=$(echo "$ATTESTATION" | jq -r '.token // empty')
