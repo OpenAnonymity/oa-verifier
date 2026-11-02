@@ -80,14 +80,14 @@ def main(operation):
     null_env = [row['name'] for row in app['properties']['environmentVariables']
                 if row.get('value') is None and not row.get('secureValue')]
     error_text = json.dumps({'error': (history.get('properties') or {}).get('error'), 'operations': operations}).lower()
-    words = ('environment', 'variable', 'value', 'null', 'empty', 'required', 'password', 'username',
+    words = ('environment', 'variable', 'value', 'null', 'empty', 'required', 'password', 'username', 'configmap', 'keyvaluepairs', 'workspacekey', 'loganalytics', 'iscustomprovisioningtimeout',
              'identity', 'tenantid', 'principalid', 'provisioningtimeoutinseconds', 'iscreatedfromstandbypool',
              'dnsnamelabelreusepolicy', 'standbypoolprofile', 'subnet', 'confidential', 'security', 'policy',
              'extension', 'resource', 'cpu', 'memory', 'requests', 'limits', 'deserializ', 'unsupported',
              'invalid', 'not allowed', 'unknown', 'cannot', 'range', 'greater', 'less', 'zero')
     print(json.dumps({'diagnostic_categories': [word for word in words if word in error_text],
                       'property_names': list(props), 'null_environment_names': null_env,
-                      'container_property_names': list(app['properties']),
+                      'container_property_names': list(app['properties']), 'config_map_empty': not bool((app['properties'].get('configMap') or {}).get('keyValuePairs')), 'diagnostic_key_present': bool(((props.get('diagnostics') or {}).get('logAnalytics') or {}).get('workspaceKey')),
                       'pull_credential_shapes': [{'identity_present': bool(c.get('identity')), 'username_present': bool(c.get('username')), 'password_present': bool(c.get('password'))} for c in props.get('imageRegistryCredentials', [])]}), flush=True)
     print(json.dumps({'target': TARGET, 'operation': operation, 'group_exists': bool(group),
                       'provisioning_state': group.get('provisioningState') if group else None,
