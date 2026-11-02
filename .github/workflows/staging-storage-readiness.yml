@@ -1,59 +1,35 @@
 name: Staging encrypted storage readiness
 on:
   workflow_dispatch:
+    inputs:
+      operation:
+        type: choice
+        options: [diagnose, recover]
+        default: diagnose
+      confirm_recovery:
+        type: boolean
+        default: false
 permissions:
   contents: read
+concurrency:
+  group: verifier2-runtime-mutation
+  cancel-in-progress: false
 jobs:
   inspect:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/staging-provider-grace-20261102'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
-      - name: Read staging storage configuration only
-        run: |
-          python3 - <<'PY'
-          import json, re, subprocess
-          def az(*args):
-              p = subprocess.run(['az', *args, '-o', 'json'], capture_output=True, text=True, timeout=60)
-              if p.returncode:
-                  return None
-              return json.loads(p.stdout)
-          account = az('account', 'show')
-          permissions = az('rest', '--method', 'get', '--url', 'https://management.azure.com/subscriptions/' + account['id'] + '/resourceGroups/oa-verifier/providers/Microsoft.Authorization/permissions?api-version=2022-04-01')
-          vault = az('keyvault', 'show', '-g', 'oa-verifier', '-n', 'oa-verifier2-sealed')
-          group = az('container', 'show', '-g', 'oa-verifier', '-n', 'oa-verifier-2')
-          assert group and group['name'] == 'oa-verifier-2'
-          identity = az('identity', 'show', '-g', 'oa-verifier', '-n', 'oa-verifier2-sealed')
-          key = az('keyvault', 'key', 'show', '--vault-name', 'oa-verifier2-sealed', '-n', 'oa-verifier2-sealing-kek') if vault else None
-          log = subprocess.run(['az','container','logs','-g','oa-verifier','-n','oa-verifier-2','--container-name','oa-verifier'], capture_output=True, text=True, timeout=60)
-          # Never print raw logs: extract only storage event counts and registry sizes.
-          storage_events = []
-          for line in log.stdout.splitlines() if log.returncode == 0 else []:
-              for event in ('station registry persisted', 'station registry restored'):
-                  if 'msg="' + event + '"' in line:
-                      count = re.search(r'\bstations=(\d+)\b', line)
-                      storage_events.append({'event': event, 'stations': int(count.group(1)) if count else None})
-          roles = az('role', 'assignment', 'list', '-g', 'oa-verifier', '--include-inherited')
-          print(json.dumps({
-              'target': 'verifier2 only',
-              'vault_readable': vault is not None,
-              'vault_sku': vault['properties']['sku']['name'] if vault else None,
-              'vault_rbac': vault['properties'].get('enableRbacAuthorization') if vault else None,
-              'vault_purge_protection': vault['properties'].get('enablePurgeProtection') if vault else None,
-              'identity_exists': identity is not None,
-              'identity_resource_id': identity.get('id') if identity else None,
-              'identity_client_id': identity.get('clientId') if identity else None,
-              'key_readable': key is not None,
-              'key_type': key.get('key', {}).get('kty') if key else None,
-              'key_exportable': key.get('attributes', {}).get('exportable') if key else None,
-              'storage_event_count': len(storage_events),
-              'last_storage_events': storage_events[-3:],
-              'storage_log_coverage': 'read' if log.returncode == 0 else 'unknown',
-              'role_names_at_resource_group': sorted({r['roleDefinitionName'] for r in roles or []}),
-              'management_permissions': (permissions or {}).get('value', []),
-              'mutations': False
-          }))
-          PY
+      - name: Inspect or restore only the known staging deployment
+        env:
+          RECOVERY_OPERATION: ${{ inputs.operation || 'diagnose' }}
+          CONFIRM_RECOVERY: ${{ inputs.confirm_recovery }}
+          LOG_ANALYTICS_WORKSPACE_ID: ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+          LOG_ANALYTICS_WORKSPACE_KEY: ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}
+        run: python3 scripts/staging_recovery.py

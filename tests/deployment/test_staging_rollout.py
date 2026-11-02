@@ -72,6 +72,48 @@ class RolloutTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             subject.rollback_template(fixture(), fixture())
 
+    def test_rollback_restores_logging_credential_and_strips_empty_readback_fields(self):
+        live, candidate = fixture(), self.candidate()
+        live['properties']['isCustomProvisioningTimeout'] = False
+        live['properties']['containers'][0]['properties']['configMap'] = {'keyValuePairs': None}
+        live['properties']['diagnostics'] = {'logAnalytics': {'workspaceId': 'staging'}}
+        candidate['properties']['diagnostics'] = {'logAnalytics': {'workspaceId': 'staging', 'workspaceKey': 'test-only'}}
+        props = subject.rollback_template(live, candidate)['resources'][0]['properties']
+        self.assertEqual(props['diagnostics']['logAnalytics']['workspaceKey'], 'test-only')
+        self.assertNotIn('isCustomProvisioningTimeout', props)
+        self.assertNotIn('configMap', props['containers'][0]['properties'])
+        candidate['properties']['diagnostics']['logAnalytics']['workspaceId'] = 'different'
+        with self.assertRaises(ValueError):
+            subject.rollback_template(live, candidate)
+
+    def test_repeated_rollback_observes_restored_group_without_deleting_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / 'record.json'
+            record.write_text(json.dumps({'mutation_started': True, 'rollback_resource_restored': True}))
+            with patch.object(subject, 'RECORD', record), patch.object(subject, 'az') as az, patch.object(subject, 'apply') as apply, patch.object(subject, 'wait_ready'):
+                subject.rollback()
+                az.assert_not_called()
+                apply.assert_not_called()
+                self.assertTrue(json.loads(record.read_text())['rollback_complete'])
+
+    def test_readiness_uses_current_ip_with_existing_certificate_validation(self):
+        health = {'status': 'healthy', 'persistence': {'loaded': True, 'store': 'keyvault-sealed'}}
+        record = {'approved_station_fingerprint': 'approval', 'certificate_sha256': 'cert', 'origin': 'old.invalid'}
+        with patch.object(subject, 'fetch', return_value=health) as fetch, patch.object(subject, 'resource', return_value=fixture()), patch.object(subject, 'approved_fingerprint', return_value='approval') as approval, patch.object(subject, 'certificate', return_value='cert') as certificate, patch.object(subject, 'write_record'):
+            subject.wait_ready(record, timeout=1)
+            fetch.assert_called_once_with('/health', '192.0.2.1')
+            approval.assert_called_once_with('192.0.2.1')
+            certificate.assert_called_once_with('192.0.2.1')
+            self.assertTrue(all(record['readiness_checks'].values()))
+
+    def test_direct_origin_transport_retains_tls_hostname_validation(self):
+        with patch.object(subject.http.client, 'HTTPSConnection') as connection, patch.object(subject.socket, 'create_connection') as socket, patch.object(subject.ssl, 'create_default_context') as context, patch.object(subject.json, 'load', return_value={'ok': True}):
+            connection.return_value.getresponse.return_value.status = 200
+            self.assertEqual(subject.fetch('/health', '192.0.2.1'), {'ok': True})
+            connection.assert_called_once_with(subject.DOMAIN, timeout=15)
+            context.return_value.wrap_socket.assert_called_once_with(socket.return_value, server_hostname=subject.DOMAIN)
+            connection.return_value.close.assert_called_once()
+
     def test_changed_baseline_does_not_delete_any_container(self):
         with tempfile.TemporaryDirectory() as directory:
             record = Path(directory) / 'record.json'
