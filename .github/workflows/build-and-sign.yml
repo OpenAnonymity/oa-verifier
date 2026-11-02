@@ -120,13 +120,9 @@ jobs:
         with:
           filters: |
             code:
-              - '**/*.go'
-              - 'go.mod'
-              - 'go.sum'
-              - '**/*.nix'
-              - 'flake.lock'
-              - 'cmd/**'
-              - 'internal/**'
+              # flake.nix uses src = ./.; every tracked source input affects
+              # the derivation path and therefore the reproducible image.
+              - '**'
 
       - name: Decide whether to build
         id: should-build
@@ -960,6 +956,7 @@ jobs:
         id: origin_cert
         run: |
           FQDN=$(az container show --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query "ipAddress.fqdn" -o tsv)
+          ORIGIN_IP=$(az container show --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query "ipAddress.ip" -o tsv)
           if [ -z "$FQDN" ]; then
             echo "❌ Could not determine Azure origin FQDN"
             exit 1
@@ -980,7 +977,8 @@ jobs:
 
           for i in {1..8}; do
             echo "TLS cert fetch attempt $i/8..."
-            if echo | openssl s_client -connect "${FQDN}:443" -servername "$SNI" -showcerts 2>/dev/null \
+            if echo | timeout 20s openssl s_client -connect "${ORIGIN_IP}:443" -servername "$SNI" \
+              -verify_hostname "$SNI" -verify_return_error -CApath /etc/ssl/certs -showcerts 2>/dev/null \
               | awk '/-----BEGIN CERTIFICATE-----/{flag=1} flag{print} /-----END CERTIFICATE-----/{exit}' > "$CERT_FILE"; then
               if [ -s "$CERT_FILE" ]; then
                 FOUND_CERT=true

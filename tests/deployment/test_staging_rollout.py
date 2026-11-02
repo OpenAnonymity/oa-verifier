@@ -168,6 +168,14 @@ class RolloutTests(unittest.TestCase):
         self.assertIn("baseline = record['baseline_policy_sha256']", text)
         self.assertIn('assert allows(policy, baseline', text)
 
+    def test_build_tracks_all_nix_source_inputs_and_origin_probe_is_bounded(self):
+        text = (ROOT / '.github/workflows/build-and-sign.yml').read_text()
+        filters = text.split('filters: |', 1)[1].split('- name: Decide whether to build', 1)[0]
+        self.assertIn("- '**'", filters)
+        self.assertIn('src = ./.;', (ROOT / 'flake.nix').read_text())
+        self.assertIn('timeout 20s openssl s_client -connect "${ORIGIN_IP}:443"', text)
+        self.assertIn('-verify_hostname "$SNI" -verify_return_error', text)
+
 
 if __name__ == '__main__':
     unittest.main()
