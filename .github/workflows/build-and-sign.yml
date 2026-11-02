@@ -155,7 +155,7 @@ jobs:
 
       - name: Run Go tests
         if: steps.should-build.outputs.build == 'true'
-        run: nix develop --no-update-lock-file --command go test ./...
+        run: nix develop --no-update-lock-file --command go test -race ./...
 
       - name: Build container with Nix (reproducible)
         if: steps.should-build.outputs.build == 'true'
@@ -685,6 +685,7 @@ jobs:
                       {"name": "RATE_LIMIT_RPS", "value": "${{ secrets.RATE_LIMIT_RPS }}"},
                       {"name": "RATE_LIMIT_BURST", "value": "${{ secrets.RATE_LIMIT_BURST }}"},
                       {"name": "SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS", "value": "${{ secrets.SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS }}"},
+                      {"name": "STATION_FAILURE_GRACE_SECONDS", "value": "604800"},
                       {"name": "TLS_DOMAIN", "value": "${{ secrets.TLS_DOMAIN }}"},
                       {"name": "ACME_EMAIL", "value": "${{ secrets.ACME_EMAIL }}"},
                       {"name": "ACME_DNS_PROVIDER", "value": "${{ secrets.ACME_DNS_PROVIDER }}"},
@@ -806,6 +807,10 @@ jobs:
           fi
           echo "✅ Pull credentials are durable (identity, anonymous, or long-lived ACR credential)."
 
+      - name: Prepare validated staging replacement and private rollback
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: python3 scripts/staging_rollout.py prepare
+
       # Sealed persistence: the verifier's saved state (TLS bundle, station registry)
       # is encrypted under a Key Vault key that the SKR sidecar releases only to an
       # enclave whose attestation carries THIS build's CCE policy hash
@@ -843,18 +848,23 @@ jobs:
           fi
           printf '%s' "$CURRENT" > /tmp/kek-release-current.txt
 
-          # merge prints the policy to install; exit 3 means the installed policy
-          # already equals it (same hashes in the same order), so nothing to write.
-          set +e
-          python3 scripts/release_policy.py merge --current /tmp/kek-release-current.txt \
-            --new-hash "$POLICY_HASH" --keep "$KEEP" --authority "$AUTHORITY" > /tmp/kek-release-new.json
-          MERGE_RC=$?
-          set -e
-          case "$MERGE_RC" in
-            0) ;;
-            3) echo "✅ release policy already current (allows $POLICY_HASH)"; exit 0 ;;
-            *) echo "❌ could not compute the release policy (exit $MERGE_RC)"; exit 1 ;;
-          esac
+          # Keep the exact live policy as well as the candidate so rollback
+          # can unseal its existing station/session and TLS state.
+          python3 - <<'PY_POLICY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          from release_policy import decode_policy, merge, allows
+          record = json.loads(Path('staging-rollout.json').read_text())
+          baseline = record['baseline_policy_sha256']
+          current = decode_policy(Path('/tmp/kek-release-current.txt').read_text())
+          keep = max(2, int(os.environ['KEEP']))
+          policy = merge(merge(current, baseline, keep, os.environ['AUTHORITY']),
+                         os.environ['POLICY_HASH'], keep, os.environ['AUTHORITY'])
+          assert allows(policy, baseline, os.environ['AUTHORITY'])
+          assert allows(policy, os.environ['POLICY_HASH'], os.environ['AUTHORITY'])
+          Path('/tmp/kek-release-new.json').write_text(json.dumps(policy))
+          PY_POLICY
           echo "Installing release policy:"; cat /tmp/kek-release-new.json
 
           az keyvault key set-attributes --vault-name "$VAULT_NAME" --name "$KEK_NAME" \
@@ -869,15 +879,6 @@ jobs:
           fi
           echo "✅ release policy allows $POLICY_HASH"
 
-      - name: Delete existing container group
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
-        run: |
-          if az container show --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} &>/dev/null; then
-            echo "Deleting existing container group..."
-            az container delete --name ${{ env.CONTAINER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --yes
-            sleep 30
-          fi
-
       - name: Refuse a stale dashboard deployment request
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         env:
@@ -888,19 +889,9 @@ jobs:
           CONTROL_MODE: check
         run: python3 scripts/staging_controls.py
 
-      - name: Deploy to Azure
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
-        run: |
-          echo "Deploying to Azure..."
-          az deployment group create \
-            --resource-group ${{ env.RESOURCE_GROUP }} \
-            --template-file /tmp/aci-deploy.json
-
-      - name: Wait for container
-        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main')
-        run: |
-          echo "Waiting for container to start..."
-          sleep 90
+      - name: Deploy staging with validated automatic rollback
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: python3 scripts/staging_rollout.py deploy
 
       # Optional post-deploy recovery test. Restart once during a chosen validation
       # deployment. Running containers prove process recovery; Azure Pulling/Pulled
@@ -1125,6 +1116,26 @@ jobs:
             echo "Hashes do not match!"
             exit 1
           fi
+
+      - name: Accept the attested staging rollout
+        if: success() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: python3 scripts/staging_rollout.py accept
+
+      - name: Restore the previous staging runtime after a failed check
+        if: failure() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: python3 scripts/staging_rollout.py rollback
+
+      - uses: actions/upload-artifact@v4
+        if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        with:
+          name: staging-provider-grace-${{ github.run_id }}
+          path: staging-rollout.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Remove private staging deployment inputs
+        if: always() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: python3 scripts/staging_rollout.py cleanup
 
       - name: Summary
         if: always()

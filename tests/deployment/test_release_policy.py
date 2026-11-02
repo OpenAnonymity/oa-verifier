@@ -150,13 +150,13 @@ class WorkflowTests(unittest.TestCase):
     def test_release_policy_is_authorised_before_the_group_is_deleted(self):
         workflow = (ROOT / ".github/workflows/build-and-sign.yml").read_text()
         authorise = workflow.index("name: Authorize this build")
-        delete = workflow.index("name: Delete existing container group")
+        delete = workflow.index("name: Deploy staging with validated automatic rollback")
         self.assertLess(authorise, delete)
-        self.assertIn("python3 scripts/release_policy.py merge", workflow)
+        self.assertIn("policy = merge(merge(current, baseline", workflow)
         self.assertIn("python3 scripts/release_policy.py check", workflow)
         self.assertEqual(workflow.count('--query "releasePolicy.encodedPolicy" -o json'), 2)
         self.assertNotIn('--query "releasePolicy.encodedPolicy" -o tsv', workflow)
-        self.assertIn('3) echo "✅ release policy already current', workflow)
+        self.assertIn("assert allows(policy, baseline", workflow)
         # Only Key Vault-backed modes can be deployed to the group (no volume).
         self.assertIn("file|file-sealed) echo", workflow)
         # The step is gated on a sealed mode being configured and must not run on PRs.

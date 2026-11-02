@@ -941,15 +941,32 @@ func (s *Server) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	verified := make([]map[string]any, 0) // Initialize as empty slice, not nil
 	for pk, data := range s.stations {
-		if data.LastVerified != nil {
-			verified = append(verified, map[string]any{
+		if data.LastVerified != nil && !s.banned.IsBanned(data.StationID, pk) {
+			state := "current"
+			var graceUntil string
+			if data.FailureFirstAt != nil {
+				now := time.Now()
+				deadline, approved := stationFailureDeadline(data, now)
+				if !approved || !now.Before(deadline) {
+					continue
+				}
+				state = "grace"
+				graceUntil = deadline.UTC().Format(time.RFC3339)
+			}
+			row := map[string]any{
 				"station_id":   data.StationID,
 				"public_key":   pk,
 				"display_name": data.DisplayName,
 				// Successful registration time is persisted with the station.
 				// Restoring or polling this record must not restart org grace.
-				"registered_at": data.RegisteredAt,
-			})
+				"registered_at":      data.RegisteredAt,
+				"last_verified_at":   *data.LastVerified,
+				"verification_state": state,
+			}
+			if graceUntil != "" {
+				row["grace_until"] = graceUntil
+			}
+			verified = append(verified, row)
 		}
 	}
 	s.mu.RUnlock()
