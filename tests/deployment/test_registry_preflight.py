@@ -66,4 +66,4 @@ class RegistryPreflightTests(unittest.TestCase):
     def test_preflight_precedes_container_replacement(self):
         text = WORKFLOW.read_text()
         self.assertLess(text.index('name: Verify staging registry authorization'),
-                        text.index('az container delete'))
+                        text.index('staging_rollout.py deploy'))

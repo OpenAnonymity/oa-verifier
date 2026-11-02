@@ -196,7 +196,7 @@ See [deploy/README.md](deploy/README.md) for details.
 | `CHALLENGE_MIN_INTERVAL` | Min seconds between privacy checks |
 | `CHALLENGE_MAX_INTERVAL` | Max seconds between privacy checks |
 | `SUBMIT_KEY_OWNERSHIP_GRACE_SECONDS` | Grace window for ownership checks |
-| `STATION_FAILURE_GRACE_SECONDS` | Grace window before unregistering on transient failures |
+| `STATION_FAILURE_GRACE_SECONDS` | Grace after the last successful station verification; default and maximum 604800 seconds (7 days), 0 disables. Failed retries and restarts do not renew it. Bans and explicit revocations remain immediate. |
 | `RATE_LIMIT_RPS` / `RATE_LIMIT_BURST` | General per-IP rate limit, all routes (default 10 rps, burst 20) |
 | `MAX_CONCURRENT_REQUESTS` | Concurrent `/register` + `/submit_key` handlers (default 20) |
 | `ATTEST_RATE_LIMIT_RPS` / `ATTEST_RATE_LIMIT_BURST` | Per-IP limit for `/attestation*` (default 1 rps, burst 3); each request costs a sidecar attestation |

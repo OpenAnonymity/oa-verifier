@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/openanonymity/oa-verifier/internal/config"
+	"github.com/openanonymity/oa-verifier/internal/models"
 )
 
 // ---------------------------------------------------------------------------
@@ -21,8 +22,6 @@ import (
 // ---------------------------------------------------------------------------
 
 func (s *Server) markTransientFailure(pk, reason string, statusCode int, detail string) bool {
-	graceSeconds := config.StationFailureGraceSeconds()
-	graceWindow := time.Duration(graceSeconds) * time.Second
 	now := time.Now()
 
 	s.mu.Lock()
@@ -41,14 +40,25 @@ func (s *Server) markTransientFailure(pk, reason string, statusCode int, detail 
 	station.FailureStatus = statusCode
 	station.FailureCount++
 
-	first := station.FailureFirstAt
+	deadline, approved := stationFailureDeadline(station, now)
 	s.mu.Unlock()
 	s.requestPersist()
 
-	if graceWindow <= 0 || first == nil {
-		return false
+	return approved && now.Before(deadline)
+}
+
+// Grace is anchored to persisted successful verification. Failed retries and
+// restarts cannot renew it, and stations without approval cannot acquire it.
+func stationFailureDeadline(station *models.Station, now time.Time) (time.Time, bool) {
+	seconds := config.StationFailureGraceSeconds()
+	if seconds <= 0 || station.LastVerified == nil {
+		return time.Time{}, false
 	}
-	return now.Sub(*first) < graceWindow
+	approvedAt, err := time.Parse(time.RFC3339, *station.LastVerified)
+	if err != nil || approvedAt.IsZero() || approvedAt.After(now) {
+		return time.Time{}, false
+	}
+	return approvedAt.Add(time.Duration(seconds) * time.Second), true
 }
 
 func (s *Server) clearTransientFailure(pk string) {
