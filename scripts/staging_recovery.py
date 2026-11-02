@@ -1,5 +1,6 @@
 """Diagnose or restore one historical staging deployment; never expose its inputs."""
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -35,7 +36,7 @@ def az(*args, optional=False, retries=0):
             print(json.dumps({'operation': list(args[:3]), 'retry': attempt + 1, **diagnostic}), flush=True)
             time.sleep(20)
             continue
-        if optional:
+        if optional and 'ResourceNotFound' in diagnostic['codes']:
             return None
         print(json.dumps({'operation': list(args[:3]), **diagnostic}), flush=True)
         raise RuntimeError('Azure command failed; private response withheld')
@@ -64,6 +65,24 @@ def validate(template):
     if not re.fullmatch(r'oaverifieracr\.azurecr\.io/oa-verifier@sha256:[0-9a-f]{64}', image):
         raise ValueError('Immutable staging image required')
     return image
+
+
+def restore_write_inputs(template, environ):
+    result = copy.deepcopy(template)
+    props = result['resources'][0]['properties']
+    props.pop('isCustomProvisioningTimeout', None)
+    for container in props['containers']:
+        config = container['properties'].get('configMap')
+        if config is not None and not config.get('keyValuePairs'):
+            container['properties'].pop('configMap')
+    logging = (props.get('diagnostics') or {}).get('logAnalytics')
+    if logging is not None and not logging.get('workspaceKey'):
+        if not environ.get('LOG_ANALYTICS_WORKSPACE_KEY'):
+            raise ValueError('Existing logging credential required for restoration')
+        if logging.get('workspaceId') != environ.get('LOG_ANALYTICS_WORKSPACE_ID'):
+            raise ValueError('Logging workspace differs from configured staging workspace')
+        logging['workspaceKey'] = environ['LOG_ANALYTICS_WORKSPACE_KEY']
+    return result
 
 
 def main(operation):
@@ -99,6 +118,9 @@ def main(operation):
         raise ValueError('Explicit recovery required')
     if group and group.get('provisioningState') != 'Failed':
         raise ValueError('Existing group is not explicitly failed; leave it untouched')
+    template = restore_write_inputs(template, os.environ)
+    if validate(template) != image:
+        raise ValueError('Restoration changed historical image')
     if group:
         az('container', 'delete', '-g', GROUP, '-n', TARGET, '--yes')
     with tempfile.TemporaryDirectory(prefix='staging-recovery-') as directory:

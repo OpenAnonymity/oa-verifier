@@ -30,4 +30,6 @@ jobs:
         env:
           RECOVERY_OPERATION: ${{ inputs.operation || 'diagnose' }}
           CONFIRM_RECOVERY: ${{ inputs.confirm_recovery }}
+          LOG_ANALYTICS_WORKSPACE_ID: ${{ secrets.LOG_ANALYTICS_WORKSPACE_ID }}
+          LOG_ANALYTICS_WORKSPACE_KEY: ${{ secrets.LOG_ANALYTICS_WORKSPACE_KEY }}
         run: python3 scripts/staging_recovery.py
