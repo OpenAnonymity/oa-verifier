@@ -29,8 +29,8 @@ def run(args):
     result = subprocess.run(args, text=True, capture_output=True)
     for _ in range(6):
         if (not result.returncode or args[:4] != ['az', 'deployment', 'group', 'create']
-                or 'FailedIdentityOperation' not in result.stderr
-                or 'pending delete operation' not in result.stderr):
+                or 'failedidentityoperation' not in result.stderr.lower()
+                or 'pending' not in result.stderr.lower() or 'delet' not in result.stderr.lower()):
             break
         time.sleep(20)
         result = subprocess.run(args, text=True, capture_output=True)
@@ -109,12 +109,21 @@ def rollback_template(live, candidate):
             raise ValueError('Unexpected existing identity')
         result['identity'] = {'type': 'UserAssigned', 'userAssignedIdentities': {key: {} for key in assigned}}
     props = result['properties']
-    for key in ('provisioningState', 'instanceView', 'isCreatedFromStandbyPool', 'provisioningTimeoutInSeconds'):
+    for key in ('provisioningState', 'instanceView', 'isCreatedFromStandbyPool', 'provisioningTimeoutInSeconds', 'isCustomProvisioningTimeout'):
         props.pop(key, None)
     for key in ('ip', 'fqdn'):
         props['ipAddress'].pop(key, None)
     for container in props['containers']:
         container['properties'].pop('instanceView', None)
+        config = container['properties'].get('configMap')
+        if config is not None and not config.get('keyValuePairs'):
+            container['properties'].pop('configMap')
+    logging = (props.get('diagnostics') or {}).get('logAnalytics')
+    if logging is not None and not logging.get('workspaceKey'):
+        replacement = (candidate['properties'].get('diagnostics') or {}).get('logAnalytics') or {}
+        if not replacement.get('workspaceKey') or replacement.get('workspaceId') != logging.get('workspaceId'):
+            raise ValueError('Cannot reconstruct existing logging credential')
+        logging['workspaceKey'] = replacement['workspaceKey']
     replacements = environment(candidate)
     for item in environment(result).values():
         if 'value' in item or item.get('secureValue'):
@@ -204,13 +213,21 @@ def wait_ready(record, timeout=240):
         try:
             health = fetch('/health')
             state = health.get('persistence', {})
-            if (health.get('status') == 'healthy' and state.get('loaded') is True
-                    and state.get('store') == 'keyvault-sealed' and not state.get('load_error')
-                    and not state.get('save_error') and approved_fingerprint() == record['approved_station_fingerprint']
-                    and certificate(record['origin']) == record['certificate_sha256']):
+            current = resource()
+            origin_ip = current['properties']['ipAddress']['ip']
+            checks = {'healthy': health.get('status') == 'healthy',
+                      'loaded': state.get('loaded') is True, 'sealed': state.get('store') == 'keyvault-sealed',
+                      'no_storage_errors': not state.get('load_error') and not state.get('save_error'),
+                      'approval_preserved': approved_fingerprint() == record['approved_station_fingerprint'],
+                      'certificate_preserved': certificate(origin_ip) == record['certificate_sha256']}
+            record['readiness_checks'] = checks
+            record.pop('readiness_error_type', None)
+            write_record(record)
+            if all(checks.values()):
                 return
-        except Exception:
-            pass
+        except Exception as error:
+            record['readiness_error_type'] = type(error).__name__
+            write_record(record)
         time.sleep(5)
     raise RuntimeError('Staging approval, encrypted restore or certificate validation failed')
 
@@ -221,8 +238,11 @@ def rollback():
     record = json.loads(RECORD.read_text())
     if not record.get('mutation_started') or record.get('rollback_complete') or record.get('accepted'):
         return
-    az('container', 'delete', '-g', GROUP, '-n', TARGET, '--yes')
-    apply('rollback.json')
+    if not record.get('rollback_resource_restored'):
+        az('container', 'delete', '-g', GROUP, '-n', TARGET, '--yes')
+        apply('rollback.json')
+        record['rollback_resource_restored'] = True
+        write_record(record)
     wait_ready(record)
     record['rollback_complete'] = True
     write_record(record)
