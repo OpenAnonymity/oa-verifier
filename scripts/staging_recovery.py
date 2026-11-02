@@ -109,6 +109,8 @@ def main(operation):
                       'container_property_names': list(app['properties']), 'config_map_empty': not bool((app['properties'].get('configMap') or {}).get('keyValuePairs')), 'diagnostic_key_present': bool(((props.get('diagnostics') or {}).get('logAnalytics') or {}).get('workspaceKey')),
                       'pull_credential_shapes': [{'identity_present': bool(c.get('identity')), 'username_present': bool(c.get('username')), 'password_present': bool(c.get('password'))} for c in props.get('imageRegistryCredentials', [])]}), flush=True)
     print(json.dumps({'target': TARGET, 'operation': operation, 'group_exists': bool(group),
+                      'public_address': group.get('ipAddress') if group else None,
+                      'container_states': [{'name': c['name'], 'state': ((c.get('instanceView') or {}).get('currentState') or {}).get('state')} for c in (group or {}).get('containers', [])],
                       'provisioning_state': group.get('provisioningState') if group else None,
                       'history_error_categories': diagnostic, 'historical_image': image,
                       'historical_policy_matches': True}), flush=True)
