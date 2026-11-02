@@ -75,6 +75,20 @@ def main(operation):
     diagnostic = categories(json.dumps({'error': (history.get('properties') or {}).get('error'), 'operations': operations}))
     template = az('deployment', 'group', 'export', '-g', GROUP, '-n', SOURCE)
     image = validate(template)
+    props = template['resources'][0]['properties']
+    app = next(c for c in props['containers'] if c['name'] == 'oa-verifier')
+    null_env = [row['name'] for row in app['properties']['environmentVariables']
+                if row.get('value') is None and not row.get('secureValue')]
+    error_text = json.dumps({'error': (history.get('properties') or {}).get('error'), 'operations': operations}).lower()
+    words = ('environment', 'variable', 'value', 'null', 'empty', 'required', 'password', 'username',
+             'identity', 'tenantid', 'principalid', 'provisioningtimeoutinseconds', 'iscreatedfromstandbypool',
+             'dnsnamelabelreusepolicy', 'standbypoolprofile', 'subnet', 'confidential', 'security', 'policy',
+             'extension', 'resource', 'cpu', 'memory', 'requests', 'limits', 'deserializ', 'unsupported',
+             'invalid', 'not allowed', 'unknown', 'cannot', 'range', 'greater', 'less', 'zero')
+    print(json.dumps({'diagnostic_categories': [word for word in words if word in error_text],
+                      'property_names': list(props), 'null_environment_names': null_env,
+                      'container_property_names': list(app['properties']),
+                      'pull_credential_shapes': [{'identity_present': bool(c.get('identity')), 'username_present': bool(c.get('username')), 'password_present': bool(c.get('password'))} for c in props.get('imageRegistryCredentials', [])]}), flush=True)
     print(json.dumps({'target': TARGET, 'operation': operation, 'group_exists': bool(group),
                       'provisioning_state': group.get('provisioningState') if group else None,
                       'history_error_categories': diagnostic, 'historical_image': image,
